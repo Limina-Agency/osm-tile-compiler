@@ -1,0 +1,576 @@
+//! Reads a whole archive once: its header and metadata, the sizes of its
+//! tiles, and every problem found in its layout or its tiles' encoding.
+use super::reader::{ArchiveReader, Entry, compression_name, decompress, tile_type_name};
+use crate::CompileBounds;
+use crate::tile_stats::{TILE_WARNING_BYTES, TileStats, TileStatsBuilder};
+use pmtiles::{TileCoord, TileId};
+use serde::Serialize;
+use std::collections::BTreeSet;
+use std::path::Path;
+
+/// Problems beyond this many are counted but not listed.
+const MAX_LISTED_PROBLEMS: usize = 50;
+/// The spec keeps the header and root directory in the first 16 KiB, so one
+/// request fetches both.
+const ROOT_LIMIT: u64 = 16_384;
+
+/// What `inspect` found.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveReport {
+    pub file_bytes: u64,
+    pub tile_type: String,
+    pub tile_compression: String,
+    pub internal_compression: String,
+    pub clustered: bool,
+    pub zooms: [u8; 2],
+    /// West, south, east, north.
+    pub bounds: [f64; 4],
+    /// Longitude, latitude, zoom.
+    pub center: (f64, f64, u8),
+    pub addressed_tiles: u64,
+    pub tile_entries: u64,
+    pub tile_contents: u64,
+    /// The metadata, parsed, or `null` if it is not JSON.
+    pub metadata: serde_json::Value,
+    pub tile_stats: TileStats,
+    /// Every problem found; the archive is valid when it is empty. Only the
+    /// first ones are listed, and `problem_count` counts all of them.
+    pub problems: Vec<String>,
+    pub problem_count: u64,
+}
+
+impl ArchiveReport {
+    fn problem(&mut self, problem: String) {
+        self.problem_count += 1;
+        if self.problems.len() < MAX_LISTED_PROBLEMS {
+            self.problems.push(problem);
+        }
+    }
+}
+
+fn tile_name(tile_id: u64) -> String {
+    TileId::new(tile_id).map_or_else(
+        |_| format!("tile ID {tile_id}"),
+        |id| {
+            let coord = TileCoord::from(id);
+            format!("{}/{}/{}", coord.z(), coord.x(), coord.y())
+        },
+    )
+}
+
+/// Reads every part of the archive at `path`. Fails only when the file is
+/// not a readable PMTiles v3 archive; anything else wrong is listed in the
+/// report's problems.
+pub fn inspect(path: &Path) -> Result<ArchiveReport, String> {
+    let mut reader = ArchiveReader::open(path)?;
+    let header = reader.header.clone();
+    let mut report = ArchiveReport {
+        file_bytes: reader.file_length,
+        tile_type: tile_type_name(header.tile_type).into(),
+        tile_compression: compression_name(header.tile_compression).into(),
+        internal_compression: compression_name(header.internal_compression).into(),
+        clustered: header.clustered,
+        zooms: [header.min_zoom, header.max_zoom],
+        bounds: header.bounds,
+        center: (header.center[0], header.center[1], header.center_zoom),
+        addressed_tiles: header.addressed_tiles,
+        tile_entries: header.tile_entries,
+        tile_contents: header.tile_contents,
+        metadata: serde_json::Value::Null,
+        tile_stats: TileStats::default(),
+        problems: vec![],
+        problem_count: 0,
+    };
+    check_header(&header, reader.file_length, &mut report);
+    let layer_names = match reader.metadata() {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(metadata) => {
+                let names = check_metadata(&metadata, header.tile_type, &mut report);
+                report.metadata = metadata;
+                names
+            }
+            Err(e) => {
+                report.problem(format!("metadata is not JSON: {e}"));
+                None
+            }
+        },
+        Err(e) => {
+            report.problem(format!("metadata cannot be read: {e}"));
+            None
+        }
+    };
+
+    let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
+    let mut previous: Option<Entry> = None;
+    let (mut addressed, mut entries) = (0u64, 0u64);
+    let mut contents = BTreeSet::new();
+    // With clustered data each new tile's bytes follow the previous new one.
+    let mut data_end = 0u64;
+    let mut problems = Vec::new();
+    let walk = reader.visit_entries(|reader, entry| {
+        entries += 1;
+        addressed += u64::from(entry.run_length);
+        let name = tile_name(entry.tile_id);
+        if let Some(previous) = previous
+            && entry.tile_id < previous.tile_id + u64::from(previous.run_length)
+        {
+            problems.push(format!(
+                "{name} is out of order or overlaps the entry before it"
+            ));
+        }
+        previous = Some(entry);
+        if entry.length == 0 {
+            problems.push(format!("{name} has no bytes"));
+            return Ok(());
+        }
+        let new_content = contents.insert(entry.offset);
+        if header.clustered && new_content {
+            if entry.offset != data_end {
+                problems.push(format!(
+                    "{name} is stored at {} but the archive is marked clustered and the \
+                     previous tile ended at {data_end}",
+                    entry.offset
+                ));
+            }
+            data_end = entry.offset + u64::from(entry.length);
+        }
+        let Ok(id) = TileId::new(entry.tile_id) else {
+            problems.push(format!("tile ID {} is not valid", entry.tile_id));
+            return Ok(());
+        };
+        let coord = TileCoord::from(id);
+        if !(header.min_zoom..=header.max_zoom).contains(&coord.z()) {
+            problems.push(format!(
+                "{name} lies outside the zoom range {}-{}",
+                header.min_zoom, header.max_zoom
+            ));
+        }
+        if !tile_meets_bounds(coord, header.bounds) {
+            problems.push(format!("{name} lies outside the bounds"));
+        }
+        let stored = match reader.tile(&entry) {
+            Ok(stored) => stored,
+            Err(e) => {
+                problems.push(format!("{name}: {e}"));
+                return Ok(());
+            }
+        };
+        let mut layers = Vec::new();
+        if header.tile_type == 1 {
+            match decompress(&stored, header.tile_compression)
+                .and_then(|tile| check_mvt(&tile, layer_names.as_ref()))
+            {
+                Ok(sizes) => layers = sizes,
+                Err(e) => problems.push(format!("{name}: {e}")),
+            }
+        }
+        let layers = layers
+            .iter()
+            .map(|(layer, size)| (layer.as_str(), *size))
+            .collect::<Vec<_>>();
+        // A run is the same tile repeated: count each copy.
+        for i in 0..u64::from(entry.run_length) {
+            stats.add(entry.tile_id + i, stored.len() as u64, &layers);
+        }
+        Ok(())
+    });
+    if let Err(e) = walk {
+        problems.push(format!("directories cannot be read: {e}"));
+    }
+    for problem in problems {
+        report.problem(problem);
+    }
+    for (field, declared, actual) in [
+        ("addressed tiles", header.addressed_tiles, addressed),
+        ("tile entries", header.tile_entries, entries),
+        ("tile contents", header.tile_contents, contents.len() as u64),
+    ] {
+        // Zero means the writer did not count.
+        if declared != 0 && declared != actual {
+            report.problem(format!(
+                "the header declares {declared} {field} but the directories hold {actual}"
+            ));
+        }
+    }
+    report.tile_stats = stats.finish();
+    Ok(report)
+}
+
+fn check_header(header: &super::reader::Header, file_length: u64, report: &mut ArchiveReport) {
+    let sections = [
+        ("root directory", header.root_offset, header.root_length),
+        ("metadata", header.metadata_offset, header.metadata_length),
+        ("leaf directories", header.leaf_offset, header.leaf_length),
+        ("tile data", header.data_offset, header.data_length),
+    ];
+    for (name, offset, length) in sections {
+        if length > 0
+            && offset
+                .checked_add(length)
+                .is_none_or(|end| end > file_length)
+        {
+            report.problem(format!(
+                "the {name} ({offset}+{length}) lies beyond the end of the file"
+            ));
+        }
+    }
+    let mut used = sections
+        .iter()
+        .filter(|s| s.2 > 0)
+        .map(|s| (s.1, s.1 + s.2, s.0))
+        .collect::<Vec<_>>();
+    used.sort();
+    for pair in used.windows(2) {
+        if pair[1].0 < pair[0].1 {
+            report.problem(format!("the {} overlaps the {}", pair[1].2, pair[0].2));
+        }
+    }
+    if header.root_offset + header.root_length > ROOT_LIMIT {
+        report.problem(format!(
+            "the root directory ends at byte {}, past the first {ROOT_LIMIT}",
+            header.root_offset + header.root_length
+        ));
+    }
+    if header.min_zoom > header.max_zoom {
+        report.problem(format!(
+            "the minimum zoom {} exceeds the maximum {}",
+            header.min_zoom, header.max_zoom
+        ));
+    }
+    // West above east is a box crossing the antimeridian.
+    let [west, south, east, north] = header.bounds;
+    if !(west != east && south < north) {
+        report.problem(format!(
+            "the bounds {west} {south} {east} {north} are empty"
+        ));
+    }
+    let [longitude, latitude] = header.center;
+    if !CompileBounds::new(north, south, east, west).contains(longitude, latitude) {
+        report.problem(format!(
+            "the center {longitude} {latitude} lies outside the bounds"
+        ));
+    }
+    if header.tile_type == 1 && !matches!(header.tile_compression, 1 | 2) {
+        report.problem(format!(
+            "MVT tiles are {}-compressed, which viewers may not read",
+            compression_name(header.tile_compression)
+        ));
+    }
+}
+
+/// Checks the metadata and returns the vector layer names it declares.
+fn check_metadata(
+    metadata: &serde_json::Value,
+    tile_type: u8,
+    report: &mut ArchiveReport,
+) -> Option<BTreeSet<String>> {
+    if !metadata.is_object() {
+        report.problem("metadata is not a JSON object".into());
+        return None;
+    }
+    if tile_type != 1 {
+        return None;
+    }
+    let Some(layers) = metadata["vector_layers"].as_array() else {
+        report.problem("metadata lists no vector_layers".into());
+        return None;
+    };
+    let names = layers
+        .iter()
+        .filter_map(|layer| layer["id"].as_str().map(str::to_string))
+        .collect::<BTreeSet<_>>();
+    if names.len() != layers.len() {
+        report.problem("vector_layers has an entry without an id, or a repeated id".into());
+    }
+    Some(names)
+}
+
+/// Whether a tile's square touches the bounds.
+fn tile_meets_bounds(coord: TileCoord, [west, south, east, north]: [f64; 4]) -> bool {
+    let n = f64::from(1u32 << coord.z());
+    let longitude = |x: f64| x / n * 360.0 - 180.0;
+    let latitude = |y: f64| {
+        (std::f64::consts::PI * (1.0 - 2.0 * y / n))
+            .sinh()
+            .atan()
+            .to_degrees()
+    };
+    let (x, y) = (f64::from(coord.x()), f64::from(coord.y()));
+    // A tile touching the bounds only within this margin still meets them,
+    // so rounding in the header's 1e-7 degree precision is not a problem.
+    let margin = 1e-6;
+    let bounds = CompileBounds::new(north + margin, south - margin, east, west);
+    bounds.meets(
+        longitude(x) - margin,
+        latitude(y + 1.0),
+        longitude(x + 1.0) + margin,
+        latitude(y),
+    )
+}
+
+fn varint(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(*at).ok_or("message ends inside a varint")?;
+        *at += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            return Ok(value);
+        }
+    }
+    Err("varint longer than 10 bytes".into())
+}
+
+/// The protobuf fields of `bytes`: (number, wire type, value or payload).
+/// A protobuf field: its number, wire type, varint value and payload.
+type Field<'a> = (u64, u8, u64, &'a [u8]);
+
+fn fields(bytes: &[u8]) -> Result<Vec<Field<'_>>, String> {
+    let mut at = 0;
+    let mut out = Vec::new();
+    while at < bytes.len() {
+        let key = varint(bytes, &mut at)?;
+        let (number, wire) = (key >> 3, (key & 7) as u8);
+        match wire {
+            0 => out.push((number, wire, varint(bytes, &mut at)?, &bytes[..0])),
+            1 | 5 => {
+                let size = if wire == 1 { 8 } else { 4 };
+                let payload = bytes
+                    .get(at..at + size)
+                    .ok_or("message ends inside a field")?;
+                at += size;
+                out.push((number, wire, 0, payload));
+            }
+            2 => {
+                let length = varint(bytes, &mut at)? as usize;
+                let payload = at
+                    .checked_add(length)
+                    .and_then(|end| bytes.get(at..end))
+                    .ok_or("message ends inside a field")?;
+                at += length;
+                out.push((number, wire, 0, payload));
+            }
+            other => return Err(format!("unknown protobuf wire type {other}")),
+        }
+    }
+    Ok(out)
+}
+
+fn packed(bytes: &[u8]) -> Result<Vec<u64>, String> {
+    let mut at = 0;
+    let mut values = Vec::new();
+    while at < bytes.len() {
+        values.push(varint(bytes, &mut at)?);
+    }
+    Ok(values)
+}
+
+/// Checks an uncompressed MVT tile against the spec (version 2) and returns
+/// each layer's name and encoded size in tile order.
+fn check_mvt(
+    tile: &[u8],
+    declared: Option<&BTreeSet<String>>,
+) -> Result<Vec<(String, u64)>, String> {
+    let mut layers = Vec::new();
+    let mut at = 0;
+    while at < tile.len() {
+        let start = at;
+        let key = varint(tile, &mut at)?;
+        if key & 7 != 2 {
+            return Err(format!("top-level field {} is not a message", key >> 3));
+        }
+        let length = varint(tile, &mut at)? as usize;
+        let payload = at
+            .checked_add(length)
+            .and_then(|end| tile.get(at..end))
+            .ok_or("tile ends inside a layer")?;
+        at += length;
+        if key >> 3 != 3 {
+            continue;
+        }
+        let name = check_layer(payload)?;
+        if declared.is_some_and(|names| !names.contains(&name)) {
+            return Err(format!(
+                "layer {name} is not in the metadata's vector_layers"
+            ));
+        }
+        if layers.iter().any(|(other, _)| *other == name) {
+            return Err(format!("layer {name} appears twice"));
+        }
+        layers.push((name, (at - start) as u64));
+    }
+    Ok(layers)
+}
+
+fn check_layer(layer: &[u8]) -> Result<String, String> {
+    let (mut name, mut version, mut extent) = (None, 1, 4096);
+    let (mut keys, mut values, mut features) = (0u64, 0u64, Vec::new());
+    for (number, wire, value, payload) in fields(layer)? {
+        match (number, wire) {
+            (1, 2) => {
+                name = Some(
+                    String::from_utf8(payload.to_vec()).map_err(|_| "a layer name is not UTF-8")?,
+                )
+            }
+            (2, 2) => features.push(payload),
+            (3, 2) => keys += 1,
+            (4, 2) => values += 1,
+            (5, 0) => extent = value,
+            (15, 0) => version = value,
+            _ => {}
+        }
+    }
+    let name = name.ok_or("a layer has no name")?;
+    if version != 2 {
+        return Err(format!("layer {name} is MVT version {version}, not 2"));
+    }
+    if extent == 0 {
+        return Err(format!("layer {name} has extent 0"));
+    }
+    for (index, feature) in features.into_iter().enumerate() {
+        check_feature(feature, keys, values)
+            .map_err(|e| format!("layer {name} feature #{index}: {e}"))?;
+    }
+    Ok(name)
+}
+
+fn check_feature(feature: &[u8], keys: u64, values: u64) -> Result<(), String> {
+    let (mut kind, mut tags, mut commands) = (0, Vec::new(), Vec::new());
+    for (number, wire, value, payload) in fields(feature)? {
+        match (number, wire) {
+            (2, 2) => tags = packed(payload)?,
+            (3, 0) => kind = value,
+            (4, 2) => commands = packed(payload)?,
+            _ => {}
+        }
+    }
+    if tags.len() % 2 != 0 {
+        return Err("odd number of tag indices".into());
+    }
+    for pair in tags.chunks(2) {
+        if pair[0] >= keys || pair[1] >= values {
+            return Err(format!(
+                "tag {}={} indexes past the layer's keys or values",
+                pair[0], pair[1]
+            ));
+        }
+    }
+    if !(1..=3).contains(&kind) {
+        return Err(format!(
+            "geometry type {kind} is not point, line or polygon"
+        ));
+    }
+    let mut at = 0;
+    let mut moves = 0;
+    while at < commands.len() {
+        let (id, count) = (commands[at] & 7, (commands[at] >> 3) as usize);
+        at += 1;
+        match id {
+            1 | 2 => {
+                if count == 0 {
+                    return Err("a MoveTo or LineTo with no points".into());
+                }
+                at = at
+                    .checked_add(count * 2)
+                    .filter(|&end| end <= commands.len())
+                    .ok_or("geometry ends inside a command's points")?;
+                if id == 1 {
+                    moves += 1;
+                }
+            }
+            7 if kind == 3 && count == 1 => {}
+            _ => {
+                return Err(format!(
+                    "command {id}×{count} is not valid in this geometry"
+                ));
+            }
+        }
+    }
+    if moves == 0 {
+        return Err("empty geometry".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fast_mvt::{MvtCoord, MvtGeomType, MvtLayerBuilder};
+
+    fn tile() -> Vec<u8> {
+        let mut feature = MvtLayerBuilder::new("poi")
+            .unwrap()
+            .feature_of(MvtGeomType::Point);
+        feature.id(Some(1));
+        feature.tag_string("name", "x").unwrap();
+        feature.points([MvtCoord { x: 5, y: 5 }]).unwrap();
+        feature.end().encode()
+    }
+
+    #[test]
+    fn measures_valid_layers() {
+        let tile = tile();
+        let declared = BTreeSet::from(["poi".to_string()]);
+        let layers = check_mvt(&tile, Some(&declared)).unwrap();
+        assert_eq!(layers, [("poi".to_string(), tile.len() as u64)]);
+    }
+
+    #[test]
+    fn reports_layers_missing_from_metadata_and_broken_tiles() {
+        let tile = tile();
+        let declared = BTreeSet::from(["water".to_string()]);
+        assert!(
+            check_mvt(&tile, Some(&declared))
+                .unwrap_err()
+                .contains("not in the metadata")
+        );
+        assert!(check_mvt(&tile[..tile.len() - 1], None).is_err());
+        assert!(
+            check_mvt(&[0x1a, 0x01, 0x00], None).is_err(),
+            "a layer without a name"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_features() {
+        // Field 3 (type) = 1, field 4 (geometry) = [LineTo×0].
+        assert!(check_feature(&[0x18, 0x01, 0x22, 0x01, 0x02], 0, 0).is_err());
+        // A point with MoveTo(1) but only one coordinate.
+        assert!(check_feature(&[0x18, 0x01, 0x22, 0x02, 0x09, 0x02], 0, 0).is_err());
+        // Tags indexing past the keys.
+        assert!(
+            check_feature(
+                &[
+                    0x12, 0x02, 0x05, 0x00, 0x18, 0x01, 0x22, 0x03, 0x09, 0x02, 0x02
+                ],
+                1,
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            check_feature(
+                &[
+                    0x12, 0x02, 0x00, 0x00, 0x18, 0x01, 0x22, 0x03, 0x09, 0x02, 0x02
+                ],
+                1,
+                1
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn tiles_meet_bounds_by_their_squares() {
+        let bounds = [7.40, 43.72, 7.45, 43.76];
+        assert!(tile_meets_bounds(
+            TileCoord::new(14, 8529, 5974).unwrap(),
+            bounds
+        ));
+        assert!(tile_meets_bounds(TileCoord::new(0, 0, 0).unwrap(), bounds));
+        assert!(!tile_meets_bounds(
+            TileCoord::new(14, 0, 0).unwrap(),
+            bounds
+        ));
+    }
+}

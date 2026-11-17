@@ -1,0 +1,432 @@
+{
+  "manifest_version": 1,
+  "target": "planetiler-openmaptiles-pinned-policy",
+  "schema_version": "3.16.0",
+  "native_profile_available": true,
+  "equivalent_work_comparison_ready": false,
+  "planetiler": {
+    "release": "0.10.2",
+    "commit": "0e5588c4a6e8c29a270a33afe8df62027d889604",
+    "commit_evidence": "reference jar buildinfo"
+  },
+  "profile": {
+    "repository": "https://github.com/openmaptiles/planetiler-openmaptiles",
+    "commit": "91516fdf477915b1a985015811049b9b96c7f87e",
+    "commit_evidence": "planetiler exact-commit git tree submodule",
+    "archive_sha256": "2f71ad1df101a2b675976d8bde951627f71edbe0cc6276ba6659a5b15c8e9bc8",
+    "local_source_path": "BENCH_DIR/tools/planetiler-openmaptiles-91516fdf/planetiler-openmaptiles-91516fdf477915b1a985015811049b9b96c7f87e",
+    "schema_source": "src/main/java/org/openmaptiles/generated/OpenMapTilesSchema.java",
+    "dispatch_source": "src/main/java/org/openmaptiles/generated/Tables.java",
+    "entry_source": "src/main/java/org/openmaptiles/OpenMapTilesMain.java",
+    "profile_source": "src/main/java/org/openmaptiles/OpenMapTilesProfile.java",
+    "license_source": "LICENSE.md"
+  },
+  "unresolved_workload_bindings": [
+    "Exact effective language/transliteration provider equivalence remains unqualified",
+    "Matching recorded arguments and inputs does not establish equivalent filtering, buffers, topology, merging or ranking"
+  ],
+  "acceptance": "All 16 layers have native source-policy handlers. This is an experimental implementation, not qualified full parity. Matching schema/version does not prove selection, preprocessing, topology, merging, ranking, labels or language-policy equivalence. Comparison manifests intentionally distinguish native-experimental from full-omt.",
+  "layers": [
+    {
+      "layer": "aerodrome_label",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/AerodromeLabel.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/AerodromeLabelTest.java"
+      ],
+      "source_hooks": [],
+      "row_handlers": [
+        "OsmAerodromeLabelPoint"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/labels.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Bundled ICU4X script-to-Latin fallback is qualified on a corpus and Malopolskie; full ICU Any-Latin and BCP-47/name-provider parity remain unqualified",
+        "JTS centroid/interior-point equivalence and Natural Earth join edge cases are unqualified",
+        "Grid rank/buffer ties, source-size filters, deduplication and multipoint/park merging require tile-level qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "aeroway",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Aeroway.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/AerowayTest.java"
+      ],
+      "source_hooks": [],
+      "row_handlers": [
+        "OsmAerowayPolygon",
+        "OsmAerowayLinestring",
+        "OsmAerowayPoint"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/transport.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Line/polygon geometry handling, simplification, clipping and tile merging require archive qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "boundary",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Boundary.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/BoundaryTest.java"
+      ],
+      "source_hooks": [
+        "preprocessOsmRelation",
+        "processNaturalEarth",
+        "processAllOsm",
+        "finish",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmBoundaryPolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/transport.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Relation-derived network, language and reference selection require oracle fixtures",
+        "Line merging, precision, clipping and tile rank/sort equivalence require archive qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "building",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Building.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/BuildingTest.java"
+      ],
+      "source_hooks": [
+        "preprocessOsmRelation",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmBuildingPolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/land.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Per-tile polygon merging and simplification equivalence require archive qualification",
+        "Nearby-building and vertex-count-dependent grouping policy remains to qualify"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "housenumber",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Housenumber.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/HousenumberTest.java"
+      ],
+      "source_hooks": [
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmHousenumberPoint"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/labels.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Bundled ICU4X script-to-Latin fallback is qualified on a corpus and Malopolskie; full ICU Any-Latin and BCP-47/name-provider parity remain unqualified",
+        "JTS centroid/interior-point equivalence and Natural Earth join edge cases are unqualified",
+        "Grid rank/buffer ties, source-size filters, deduplication and multipoint/park merging require tile-level qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "landcover",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Landcover.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/LandcoverTest.java"
+      ],
+      "source_hooks": [
+        "processNaturalEarth",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmLandcoverPolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/land.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Per-tile polygon merging and simplification equivalence require archive qualification",
+        "Nearby-building and vertex-count-dependent grouping policy remains to qualify"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "landuse",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Landuse.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/LanduseTest.java"
+      ],
+      "source_hooks": [
+        "processNaturalEarth",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmLandusePolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/land.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Per-tile polygon merging and simplification equivalence require archive qualification",
+        "Nearby-building and vertex-count-dependent grouping policy remains to qualify"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "mountain_peak",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/MountainPeak.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/MountainPeakTest.java"
+      ],
+      "source_hooks": [
+        "processNaturalEarth",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmPeakPoint",
+        "OsmMountainLinestring"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/labels.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Bundled ICU4X script-to-Latin fallback is qualified on a corpus and Malopolskie; full ICU Any-Latin and BCP-47/name-provider parity remain unqualified",
+        "JTS centroid/interior-point equivalence and Natural Earth join edge cases are unqualified",
+        "Grid rank/buffer ties, source-size filters, deduplication and multipoint/park merging require tile-level qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "park",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Park.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/ParkTest.java"
+      ],
+      "source_hooks": [
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmParkPolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/labels.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Bundled ICU4X script-to-Latin fallback is qualified on a corpus and Malopolskie; full ICU Any-Latin and BCP-47/name-provider parity remain unqualified",
+        "JTS centroid/interior-point equivalence and Natural Earth join edge cases are unqualified",
+        "Grid rank/buffer ties, source-size filters, deduplication and multipoint/park merging require tile-level qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "place",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Place.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/PlaceTest.java"
+      ],
+      "source_hooks": [
+        "processNaturalEarth",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmContinentPoint",
+        "OsmCountryPoint",
+        "OsmStatePoint",
+        "OsmIslandPolygon",
+        "OsmIslandPoint",
+        "OsmCityPoint",
+        "OsmBoundaryPolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/labels.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Bundled ICU4X script-to-Latin fallback is qualified on a corpus and Malopolskie; full ICU Any-Latin and BCP-47/name-provider parity remain unqualified",
+        "JTS centroid/interior-point equivalence and Natural Earth join edge cases are unqualified",
+        "Grid rank/buffer ties, source-size filters, deduplication and multipoint/park merging require tile-level qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "poi",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Poi.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/PoiTest.java"
+      ],
+      "source_hooks": [
+        "finish",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmPoiPoint",
+        "OsmPoiPolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/labels.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Bundled ICU4X script-to-Latin fallback is qualified on a corpus and Malopolskie; full ICU Any-Latin and BCP-47/name-provider parity remain unqualified",
+        "JTS centroid/interior-point equivalence and Natural Earth join edge cases are unqualified",
+        "Grid rank/buffer ties, source-size filters, deduplication and multipoint/park merging require tile-level qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "transportation",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Transportation.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/TransportationTest.java"
+      ],
+      "source_hooks": [
+        "preprocessOsmRelation",
+        "processNaturalEarth",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmHighwayLinestring",
+        "OsmRailwayLinestring",
+        "OsmAerialwayLinestring",
+        "OsmShipwayLinestring",
+        "OsmHighwayPolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/transport.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Relation-derived network, language and reference selection require oracle fixtures",
+        "Line merging, precision, clipping and tile rank/sort equivalence require archive qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "transportation_name",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/TransportationName.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/TransportationTest.java"
+      ],
+      "source_hooks": [
+        "preprocessOsmNode",
+        "preprocessOsmWay",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmHighwayPoint",
+        "OsmHighwayLinestring",
+        "OsmAerialwayLinestring",
+        "OsmShipwayLinestring"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/transport.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Relation-derived network, language and reference selection require oracle fixtures",
+        "Line merging, precision, clipping and tile rank/sort equivalence require archive qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "water",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Water.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/WaterTest.java"
+      ],
+      "source_hooks": [
+        "processNaturalEarth",
+        "processOsmWater",
+        "finish",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmWaterPolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/water.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Supplemental geometry clipping and feature selection require archive qualification",
+        "Waterway/label global grouping and per-tile merge behavior require oracle qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "water_name",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/WaterName.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/WaterNameTest.java"
+      ],
+      "source_hooks": [
+        "processNaturalEarth",
+        "processLakeCenterline"
+      ],
+      "row_handlers": [
+        "OsmMarinePoint",
+        "OsmWaterPolygon"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/water.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Supplemental geometry clipping and feature selection require archive qualification",
+        "Waterway/label global grouping and per-tile merge behavior require oracle qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    },
+    {
+      "layer": "waterway",
+      "native_status": "implemented_experimental",
+      "source": "src/main/java/org/openmaptiles/layers/Waterway.java",
+      "tests": [
+        "src/test/java/org/openmaptiles/layers/WaterwayTest.java"
+      ],
+      "source_hooks": [
+        "preprocessOsmRelation",
+        "processNaturalEarth",
+        "processAllOsm",
+        "postProcess"
+      ],
+      "row_handlers": [
+        "OsmWaterwayLinestring"
+      ],
+      "parity_tests_run": false,
+      "native_source": "osm-tile-compiler/src/omt/water.rs",
+      "parity_verified": false,
+      "remaining_qualification": [
+        "Supplemental geometry clipping and feature selection require archive qualification",
+        "Waterway/label global grouping and per-tile merge behavior require oracle qualification"
+      ],
+      "sampled_archive_comparison_run": true
+    }
+  ],
+  "experimental_comparison_runnable": true,
+  "native_api": "osm_tile_compiler::omt::compile_openmaptiles(OpenMapTilesRequest)",
+  "native_cli": "cargo run --release --example compile_omt -- INPUT.pbf OUTPUT_DIR SOURCES_DIR --bounds W S E N --threads 4 --min-zoom 0 --max-zoom 14",
+  "parity_verified": false,
+  "recorded_workload_bindings": [
+    "Per-run manifests bind input PBF, supplemental datasets, tools and output archive SHA256 hashes",
+    "Explicit bounds, z0-14, detail zoom14, worker count, gzip tile compression and commands are recorded",
+    "Both profiles use no annotation companion and disable Wikidata; native has no Tactical-only network output"
+  ]
+}

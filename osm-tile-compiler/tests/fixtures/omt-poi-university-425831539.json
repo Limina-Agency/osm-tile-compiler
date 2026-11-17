@@ -1,0 +1,96 @@
+{
+  "source_input_sha256": "4c3a6b117c6d1e79f7fbaae4efc8d8565866a3ea1c075488fb04746acec1c971",
+  "pinned_planetiler_jar_sha256": "f310bd0413e2e4512b27f4046d418664e8e1d3bf31603c2a70e23de06c167e4d",
+  "osm_way_id": 425831539,
+  "tags": {
+    "addr:city": "Oświęcim",
+    "addr:country": "PL",
+    "addr:housenumber": "8",
+    "addr:postcode": "32-600",
+    "addr:street": "Maksymiliana Marii Kolbego",
+    "amenity": "university",
+    "barrier": "fence",
+    "email": "sekretariat@pwsz-oswiecim.edu.pl",
+    "fax": "+48 33 843 05 30",
+    "name": "Państwowa Wyższa Szkoła Zawodowa im. rtm. Witolda Pileckiego w Oświęcimiu",
+    "name:de": "Staatliche Rittmeister-Witold-Pilecki-Hochschule Oświęcim",
+    "phone": "+48 33 843 06 91",
+    "short_name": "PWSZ",
+    "website": "https://uczelnia.pwsz-oswiecim.edu.pl/",
+    "wikidata": "Q11815245",
+    "wikipedia": "pl:Małopolska Uczelnia Państwowa im. rotmistrza Witolda Pileckiego w Oświęcimiu"
+  },
+  "coordinates_lonlat": [
+    [
+      19.1969759,
+      50.0275347
+    ],
+    [
+      19.1981375,
+      50.0255756
+    ],
+    [
+      19.1992974,
+      50.0258626
+    ],
+    [
+      19.199229,
+      50.0259852
+    ],
+    [
+      19.1992742,
+      50.0259956
+    ],
+    [
+      19.1989199,
+      50.0265995
+    ],
+    [
+      19.1985916,
+      50.0271481
+    ],
+    [
+      19.1985445,
+      50.027245
+    ],
+    [
+      19.1985198,
+      50.0273203
+    ],
+    [
+      19.1984723,
+      50.0273185
+    ],
+    [
+      19.1984273,
+      50.0273145
+    ],
+    [
+      19.1984007,
+      50.0275671
+    ],
+    [
+      19.1982826,
+      50.0277954
+    ],
+    [
+      19.1981798,
+      50.0278223
+    ],
+    [
+      19.1969759,
+      50.0275347
+    ]
+  ],
+  "absent_at_z13_tiles": [
+    [
+      4532,
+      2777
+    ],
+    [
+      4533,
+      2777
+    ]
+  ],
+  "min_pixel_size_z13": 80
+}

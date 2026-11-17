@@ -1,0 +1,131 @@
+{
+  "source": {
+    "coordinate": [
+      5,
+      17,
+      10
+    ],
+    "layer": "boundary",
+    "feature_id": 399309380,
+    "attributes": {
+      "admin_level": 4,
+      "disputed": 0,
+      "maritime": 0
+    },
+    "native_archive": "omt-opt32/repeat-01/native/basemap.pmtiles",
+    "reference_archive": "omt-v2/repeat-01/planetiler/basemap.pmtiles",
+    "pinned_java": "planetiler-0.10.2.jar",
+    "pinned_call": "FeatureMerge.mergeLineStrings -> LoopLineMerger.setMergeStrokes(true)",
+    "pinned_jar_sha256": "f310bd0413e2e4512b27f4046d418664e8e1d3bf31603c2a70e23de06c167e4d",
+    "native_archive_sha256": "e7a3f495a57267fae3abbc9b5e6c1d3c3a4f4430b7e4818841592111f310513f",
+    "reference_archive_sha256": "62baae469fdc1d42613bcbd06181a7fc69c715cabaa22542ff11121786466b2c"
+  },
+  "purpose": "Three actual arms at a degree-three junction, in decoded tile coordinates. The reference joins the spur to the eastward arm through the junction while keeping the south arm separate.",
+  "input_paths": [
+    [
+      [
+        3152,
+        3194
+      ],
+      [
+        3153,
+        3201
+      ],
+      [
+        3157,
+        3204
+      ],
+      [
+        3168,
+        3205
+      ]
+    ],
+    [
+      [
+        3168,
+        3205
+      ],
+      [
+        3176,
+        3198
+      ],
+      [
+        3175,
+        3196
+      ],
+      [
+        3189,
+        3199
+      ]
+    ],
+    [
+      [
+        3168,
+        3205
+      ],
+      [
+        3168,
+        3211
+      ],
+      [
+        3172,
+        3213
+      ],
+      [
+        3175,
+        3223
+      ]
+    ]
+  ],
+  "pinned_java_output_tolerance_0": [
+    [
+      [
+        3152,
+        3194
+      ],
+      [
+        3153,
+        3201
+      ],
+      [
+        3157,
+        3204
+      ],
+      [
+        3168,
+        3205
+      ],
+      [
+        3176,
+        3198
+      ],
+      [
+        3175,
+        3196
+      ],
+      [
+        3189,
+        3199
+      ]
+    ],
+    [
+      [
+        3168,
+        3205
+      ],
+      [
+        3168,
+        3211
+      ],
+      [
+        3172,
+        3213
+      ],
+      [
+        3175,
+        3223
+      ]
+    ]
+  ],
+  "native_current_outcome": "Three separate paths: join_paths only joins degree-two nodes."
+}

@@ -1,0 +1,1203 @@
+{
+  "features": {
+    "z00": {},
+    "z01": {},
+    "z02": {},
+    "z03": {},
+    "z04": {
+      "boundary": 1
+    },
+    "z05": {
+      "boundary": 3,
+      "place": 1
+    },
+    "z06": {
+      "boundary": 3,
+      "place": 1,
+      "water": 1
+    },
+    "z07": {
+      "boundary": 3,
+      "place": 2,
+      "transportation": 1,
+      "water": 1
+    },
+    "z08": {
+      "boundary": 3,
+      "place": 2,
+      "transportation": 2,
+      "water": 1
+    },
+    "z09": {
+      "boundary": 3,
+      "landuse": 1,
+      "place": 2,
+      "transportation": 13,
+      "water": 1
+    },
+    "z10": {
+      "boundary": 3,
+      "landuse": 1,
+      "place": 2,
+      "transportation": 15,
+      "water": 1
+    },
+    "z11": {
+      "boundary": 5,
+      "landuse": 3,
+      "place": 11,
+      "transportation": 23,
+      "water": 1
+    },
+    "z12": {
+      "aeroway": 1,
+      "boundary": 7,
+      "landuse": 6,
+      "place": 11,
+      "poi": 2,
+      "transportation": 426,
+      "water": 4
+    },
+    "z13": {
+      "aeroway": 1,
+      "boundary": 15,
+      "building": 4,
+      "landcover": 5,
+      "landuse": 13,
+      "mountain_peak": 24,
+      "park": 1,
+      "place": 44,
+      "poi": 8,
+      "transportation": 694,
+      "transportation_name": 1,
+      "water": 16,
+      "waterway": 4
+    },
+    "z14": {
+      "aeroway": 12,
+      "boundary": 16,
+      "building": 58,
+      "housenumber": 115,
+      "landcover": 67,
+      "landuse": 40,
+      "mountain_peak": 17,
+      "park": 5,
+      "place": 60,
+      "poi": 2268,
+      "transportation": 796,
+      "transportation_name": 399,
+      "water": 64,
+      "water_name": 18,
+      "waterway": 6
+    }
+  },
+  "header": {
+    "addressed_tiles": 19,
+    "bounds": [
+      7.409205,
+      43.72335,
+      7.448637,
+      43.75169
+    ],
+    "center": [
+      7.428921,
+      43.73752,
+      13
+    ],
+    "clustered": true,
+    "internal_compression": "Gzip",
+    "tile_compression": "Gzip",
+    "tile_contents": 19,
+    "tile_entries": 19,
+    "tile_type": "Mvt",
+    "zooms": [
+      0,
+      14
+    ]
+  },
+  "metadata": {
+    "attribution": "<a href=\"https://www.openmaptiles.org/\" target=\"_blank\">&copy; OpenMapTiles</a> <a href=\"https://www.openstreetmap.org/copyright\" target=\"_blank\">&copy; OpenStreetMap contributors</a>",
+    "description": "Native Rust OpenMapTiles profile",
+    "format": "pbf",
+    "maxzoom": 14,
+    "minzoom": 0,
+    "name": "OpenMapTiles",
+    "planetiler_openmaptiles_profile_commit": "91516fdf477915b1a985015811049b9b96c7f87e",
+    "type": "baselayer",
+    "vector_layers": [
+      {
+        "fields": {
+          "class": "String",
+          "id": "Number",
+          "intermittent": "Number"
+        },
+        "id": "water",
+        "maxzoom": 14,
+        "minzoom": 6
+      },
+      {
+        "fields": {
+          "brunnel": "String",
+          "class": "String",
+          "intermittent": "Number"
+        },
+        "id": "waterway",
+        "maxzoom": 14,
+        "minzoom": 13
+      },
+      {
+        "fields": {
+          "class": "String",
+          "subclass": "String"
+        },
+        "id": "landcover",
+        "maxzoom": 14,
+        "minzoom": 13
+      },
+      {
+        "fields": {
+          "class": "String"
+        },
+        "id": "landuse",
+        "maxzoom": 14,
+        "minzoom": 7
+      },
+      {
+        "fields": {
+          "class": "String",
+          "rank": "Number"
+        },
+        "id": "mountain_peak",
+        "maxzoom": 14,
+        "minzoom": 13
+      },
+      {
+        "fields": {
+          "class": "String",
+          "name": "String",
+          "name:ar": "String",
+          "name:fr": "String",
+          "name:it": "String",
+          "name:latin": "String",
+          "name_de": "String",
+          "name_en": "String",
+          "name_int": "String",
+          "rank": "Number"
+        },
+        "id": "park",
+        "maxzoom": 14,
+        "minzoom": 13
+      },
+      {
+        "fields": {
+          "admin_level": "Number",
+          "disputed": "Number",
+          "maritime": "Number"
+        },
+        "id": "boundary",
+        "maxzoom": 14,
+        "minzoom": 4
+      },
+      {
+        "fields": {
+          "class": "String"
+        },
+        "id": "aeroway",
+        "maxzoom": 14,
+        "minzoom": 12
+      },
+      {
+        "fields": {
+          "access": "String",
+          "bicycle": "String",
+          "brunnel": "String",
+          "class": "String",
+          "foot": "String",
+          "horse": "String",
+          "indoor": "Number",
+          "layer": "Number",
+          "level": "Number",
+          "oneway": "Number",
+          "ramp": "Number",
+          "service": "String",
+          "subclass": "String",
+          "surface": "String"
+        },
+        "id": "transportation",
+        "maxzoom": 14,
+        "minzoom": 7
+      },
+      {
+        "fields": {
+          "colour": "String",
+          "render_height": "Number",
+          "render_min_height": "Number"
+        },
+        "id": "building",
+        "maxzoom": 14,
+        "minzoom": 13
+      },
+      {
+        "fields": {
+          "class": "String",
+          "intermittent": "Number",
+          "name": "String",
+          "name:en": "String",
+          "name:latin": "String",
+          "name_de": "String",
+          "name_en": "String",
+          "name_int": "String"
+        },
+        "id": "water_name",
+        "maxzoom": 14,
+        "minzoom": 14
+      },
+      {
+        "fields": {
+          "class": "String",
+          "layer": "Number",
+          "level": "Number",
+          "name": "String",
+          "name:en": "String",
+          "name:es": "String",
+          "name:it": "String",
+          "name:latin": "String",
+          "name_de": "String",
+          "name_en": "String",
+          "name_int": "String",
+          "network": "String",
+          "ref": "String",
+          "ref_length": "Number",
+          "route_1_name": "String",
+          "route_1_network": "String",
+          "route_1_ref": "String",
+          "route_2_name": "String",
+          "route_2_network": "String",
+          "route_2_ref": "String",
+          "subclass": "String"
+        },
+        "id": "transportation_name",
+        "maxzoom": 14,
+        "minzoom": 12
+      },
+      {
+        "fields": {
+          "capital": "Number",
+          "class": "String",
+          "iso_a2": "String",
+          "name": "String",
+          "name:af": "String",
+          "name:am": "String",
+          "name:ar": "String",
+          "name:az": "String",
+          "name:be": "String",
+          "name:bg": "String",
+          "name:bn": "String",
+          "name:br": "String",
+          "name:bs": "String",
+          "name:ca": "String",
+          "name:cs": "String",
+          "name:cy": "String",
+          "name:da": "String",
+          "name:de": "String",
+          "name:el": "String",
+          "name:en": "String",
+          "name:eo": "String",
+          "name:es": "String",
+          "name:et": "String",
+          "name:eu": "String",
+          "name:fa": "String",
+          "name:fi": "String",
+          "name:fr": "String",
+          "name:fy": "String",
+          "name:ga": "String",
+          "name:gd": "String",
+          "name:he": "String",
+          "name:hi": "String",
+          "name:hr": "String",
+          "name:hu": "String",
+          "name:hy": "String",
+          "name:id": "String",
+          "name:is": "String",
+          "name:it": "String",
+          "name:ja": "String",
+          "name:ka": "String",
+          "name:kk": "String",
+          "name:kn": "String",
+          "name:ko": "String",
+          "name:ku": "String",
+          "name:la": "String",
+          "name:latin": "String",
+          "name:lb": "String",
+          "name:lt": "String",
+          "name:lv": "String",
+          "name:mk": "String",
+          "name:ml": "String",
+          "name:mt": "String",
+          "name:nl": "String",
+          "name:no": "String",
+          "name:oc": "String",
+          "name:pa": "String",
+          "name:pl": "String",
+          "name:pnb": "String",
+          "name:pt": "String",
+          "name:rm": "String",
+          "name:ro": "String",
+          "name:ru": "String",
+          "name:sk": "String",
+          "name:sl": "String",
+          "name:sq": "String",
+          "name:sr": "String",
+          "name:sv": "String",
+          "name:ta": "String",
+          "name:te": "String",
+          "name:th": "String",
+          "name:tr": "String",
+          "name:uk": "String",
+          "name:ur": "String",
+          "name:vi": "String",
+          "name:zh": "String",
+          "name:zh-Hans": "String",
+          "name:zh-Hant": "String",
+          "name_de": "String",
+          "name_en": "String",
+          "name_int": "String",
+          "rank": "Number"
+        },
+        "id": "place",
+        "maxzoom": 14,
+        "minzoom": 5
+      },
+      {
+        "fields": {
+          "housenumber": "String"
+        },
+        "id": "housenumber",
+        "maxzoom": 14,
+        "minzoom": 14
+      },
+      {
+        "fields": {
+          "class": "String",
+          "indoor": "Number",
+          "layer": "Number",
+          "level": "Number",
+          "name": "String",
+          "name:ar": "String",
+          "name:de": "String",
+          "name:el": "String",
+          "name:en": "String",
+          "name:es": "String",
+          "name:fr": "String",
+          "name:he": "String",
+          "name:id": "String",
+          "name:it": "String",
+          "name:ja": "String",
+          "name:ko": "String",
+          "name:latin": "String",
+          "name:ru": "String",
+          "name:tr": "String",
+          "name:uk": "String",
+          "name:zh": "String",
+          "name_de": "String",
+          "name_en": "String",
+          "name_int": "String",
+          "rank": "Number",
+          "subclass": "String"
+        },
+        "id": "poi",
+        "maxzoom": 14,
+        "minzoom": 12
+      },
+      {
+        "fields": {},
+        "id": "aerodrome_label",
+        "maxzoom": 14,
+        "minzoom": 0
+      }
+    ],
+    "version": "3.16.0"
+  },
+  "tiles": {
+    "10/533/373": {
+      "boundary": {
+        "attributes": "23f37dd9213e217e",
+        "features": 3,
+        "geometry": "cf003e0dfa5faac0"
+      },
+      "landuse": {
+        "attributes": "6ee08e5664e929aa",
+        "features": 1,
+        "geometry": "68187f49fda90a8f"
+      },
+      "place": {
+        "attributes": "f85155cde585f831",
+        "features": 2,
+        "geometry": "78de9695a7a50e55"
+      },
+      "transportation": {
+        "attributes": "e885408bfda43700",
+        "features": 15,
+        "geometry": "cb6cce27ec8e3a21"
+      },
+      "water": {
+        "attributes": "33cf6bfe98b142e4",
+        "features": 1,
+        "geometry": "1c46a6d962796e31"
+      }
+    },
+    "11/1066/746": {
+      "boundary": {
+        "attributes": "b4f80d54776b7ae5",
+        "features": 5,
+        "geometry": "bb3fa10228ab2377"
+      },
+      "landuse": {
+        "attributes": "6925128c354af69f",
+        "features": 3,
+        "geometry": "03a74d5e9154be28"
+      },
+      "place": {
+        "attributes": "49f758df49763d59",
+        "features": 11,
+        "geometry": "5e46a29de1bd2ecf"
+      },
+      "transportation": {
+        "attributes": "a18be64ebba57be5",
+        "features": 23,
+        "geometry": "98e51731e92e2d34"
+      },
+      "water": {
+        "attributes": "33cf6bfe98b142e4",
+        "features": 1,
+        "geometry": "1049a0467fc2ba8c"
+      }
+    },
+    "12/2132/1493": {
+      "aeroway": {
+        "attributes": "2c9a50974a9a335f",
+        "features": 1,
+        "geometry": "ee42239913faecf3"
+      },
+      "boundary": {
+        "attributes": "189b2b25219752d8",
+        "features": 7,
+        "geometry": "92b56de21bf7fe26"
+      },
+      "landuse": {
+        "attributes": "a87ee6e6f6986fb3",
+        "features": 6,
+        "geometry": "a6b98fadbc095186"
+      },
+      "place": {
+        "attributes": "36924e38519ba179",
+        "features": 11,
+        "geometry": "e1d4b2f367ff4fed"
+      },
+      "poi": {
+        "attributes": "1a8c9b384904a248",
+        "features": 2,
+        "geometry": "4de8e7928b815823"
+      },
+      "transportation": {
+        "attributes": "ae98b025b1e80912",
+        "features": 426,
+        "geometry": "629567788c8c2a9d"
+      },
+      "water": {
+        "attributes": "a7b38fb1e8572727",
+        "features": 4,
+        "geometry": "ab0920c4afdad795"
+      }
+    },
+    "13/4264/2986": {
+      "boundary": {
+        "attributes": "fbd9a3ddc13f3e33",
+        "features": 2,
+        "geometry": "98b731f65d2de802"
+      },
+      "building": {
+        "attributes": "fcd417b041385882",
+        "features": 1,
+        "geometry": "806eff5ef1149b4a"
+      },
+      "landuse": {
+        "attributes": "01154ffa84e9e1a8",
+        "features": 1,
+        "geometry": "776953843bcaaf47"
+      },
+      "mountain_peak": {
+        "attributes": "6a0ef80fcb2d96f8",
+        "features": 6,
+        "geometry": "1009c38b12405947"
+      },
+      "place": {
+        "attributes": "49f758df49763d59",
+        "features": 11,
+        "geometry": "8c2041476966021c"
+      },
+      "poi": {
+        "attributes": "1a8c9b384904a248",
+        "features": 2,
+        "geometry": "18d707d81525a7fd"
+      },
+      "transportation": {
+        "attributes": "ab41765891856c36",
+        "features": 69,
+        "geometry": "b2a0e0ee5e400132"
+      },
+      "waterway": {
+        "attributes": "8218a51525eae819",
+        "features": 2,
+        "geometry": "4b747104e673d72d"
+      }
+    },
+    "13/4264/2987": {
+      "aeroway": {
+        "attributes": "2c9a50974a9a335f",
+        "features": 1,
+        "geometry": "d5e01f37797fabad"
+      },
+      "boundary": {
+        "attributes": "b492346b3cd5a258",
+        "features": 7,
+        "geometry": "6040aa121a56052a"
+      },
+      "building": {
+        "attributes": "476d99ac5360e83f",
+        "features": 1,
+        "geometry": "18e253c47d1b1f22"
+      },
+      "landcover": {
+        "attributes": "5ed194d24aba1c19",
+        "features": 3,
+        "geometry": "2084944c46d49306"
+      },
+      "landuse": {
+        "attributes": "7841344d240c3986",
+        "features": 9,
+        "geometry": "aa0a27411bd44ad2"
+      },
+      "mountain_peak": {
+        "attributes": "6a0ef80fcb2d96f8",
+        "features": 6,
+        "geometry": "db93c6aeba5f2191"
+      },
+      "place": {
+        "attributes": "49f758df49763d59",
+        "features": 11,
+        "geometry": "f88a4ff78e2e8152"
+      },
+      "poi": {
+        "attributes": "1a8c9b384904a248",
+        "features": 2,
+        "geometry": "8446e9116cae7eba"
+      },
+      "transportation": {
+        "attributes": "16bda7d8ea76a239",
+        "features": 446,
+        "geometry": "71248cefc40494b6"
+      },
+      "transportation_name": {
+        "attributes": "434eb0c1b4830b00",
+        "features": 1,
+        "geometry": "9b3f1538e2363b50"
+      },
+      "water": {
+        "attributes": "1fe15cedfa8013e9",
+        "features": 4,
+        "geometry": "9eb906458facacd2"
+      }
+    },
+    "13/4265/2986": {
+      "boundary": {
+        "attributes": "bff9a93ab0d9470d",
+        "features": 3,
+        "geometry": "eb222365c076027e"
+      },
+      "building": {
+        "attributes": "2340941a3a48d60b",
+        "features": 1,
+        "geometry": "13ad32e4b591a857"
+      },
+      "landcover": {
+        "attributes": "cc3b94fadaf79a3b",
+        "features": 1,
+        "geometry": "cc89583d89fa3b03"
+      },
+      "landuse": {
+        "attributes": "d7c0a122ae7a4d26",
+        "features": 2,
+        "geometry": "9283e8f6fa490cff"
+      },
+      "mountain_peak": {
+        "attributes": "6a0ef80fcb2d96f8",
+        "features": 6,
+        "geometry": "16f590e7d51402f1"
+      },
+      "park": {
+        "attributes": "0d9feca0255759e9",
+        "features": 1,
+        "geometry": "2629b79c28bcb743"
+      },
+      "place": {
+        "attributes": "49f758df49763d59",
+        "features": 11,
+        "geometry": "dff57fe493197942"
+      },
+      "poi": {
+        "attributes": "1a8c9b384904a248",
+        "features": 2,
+        "geometry": "e1f196c68bccb397"
+      },
+      "transportation": {
+        "attributes": "7d586732584a6e74",
+        "features": 119,
+        "geometry": "e53ac3185825381f"
+      },
+      "water": {
+        "attributes": "080784088213e231",
+        "features": 11,
+        "geometry": "43f7add95bae6e4a"
+      },
+      "waterway": {
+        "attributes": "8218a51525eae819",
+        "features": 2,
+        "geometry": "7c5a2576ee951c41"
+      }
+    },
+    "13/4265/2987": {
+      "boundary": {
+        "attributes": "0d620b894d50aafe",
+        "features": 3,
+        "geometry": "7a8b162e9347aa50"
+      },
+      "building": {
+        "attributes": "929dd2a5e5991c09",
+        "features": 1,
+        "geometry": "e99b797a744cdafc"
+      },
+      "landcover": {
+        "attributes": "cc3b94fadaf79a3b",
+        "features": 1,
+        "geometry": "4aab590a20a2fa02"
+      },
+      "landuse": {
+        "attributes": "01154ffa84e9e1a8",
+        "features": 1,
+        "geometry": "0f4958c3edbd56eb"
+      },
+      "mountain_peak": {
+        "attributes": "6a0ef80fcb2d96f8",
+        "features": 6,
+        "geometry": "008fee56419ef6f7"
+      },
+      "place": {
+        "attributes": "49f758df49763d59",
+        "features": 11,
+        "geometry": "53740911583a26e9"
+      },
+      "poi": {
+        "attributes": "1a8c9b384904a248",
+        "features": 2,
+        "geometry": "5b77d08b83def7d9"
+      },
+      "transportation": {
+        "attributes": "047b63db6c881ada",
+        "features": 60,
+        "geometry": "493054b8892e5f88"
+      },
+      "water": {
+        "attributes": "33cf6bfe98b142e4",
+        "features": 1,
+        "geometry": "aa53916f180b3a29"
+      }
+    },
+    "14/8529/5973": {
+      "boundary": {
+        "attributes": "1a23edfb2c18ddda",
+        "features": 1,
+        "geometry": "5c579ed48af07b2f"
+      },
+      "building": {
+        "attributes": "bb4ccbea432f22eb",
+        "features": 4,
+        "geometry": "982781d07a388ce9"
+      },
+      "housenumber": {
+        "attributes": "2def0963ddc55b48",
+        "features": 18,
+        "geometry": "440b566a1395e3a1"
+      },
+      "landcover": {
+        "attributes": "554e2b181d904469",
+        "features": 4,
+        "geometry": "bf1db19f4ff50755"
+      },
+      "landuse": {
+        "attributes": "01154ffa84e9e1a8",
+        "features": 1,
+        "geometry": "05a89b4d1ddb8958"
+      },
+      "mountain_peak": {
+        "attributes": "0ec99d7533a55943",
+        "features": 2,
+        "geometry": "9660930770251384"
+      },
+      "park": {
+        "attributes": "1ba407bc4603300a",
+        "features": 1,
+        "geometry": "259e11e38c664544"
+      },
+      "place": {
+        "attributes": "49f758df49763d59",
+        "features": 11,
+        "geometry": "7e5c5562db406e32"
+      },
+      "poi": {
+        "attributes": "b249c8d3b402c548",
+        "features": 377,
+        "geometry": "fd526cc377b7585e"
+      },
+      "transportation": {
+        "attributes": "f0de002d27a68ccb",
+        "features": 71,
+        "geometry": "ae431bb288db571f"
+      },
+      "transportation_name": {
+        "attributes": "ba5053aaa8108e03",
+        "features": 52,
+        "geometry": "36a59bdcf8d7171e"
+      },
+      "water": {
+        "attributes": "1d92df78c6039024",
+        "features": 5,
+        "geometry": "1c80b6aa33f3a835"
+      },
+      "water_name": {
+        "attributes": "8e618d4f115126d3",
+        "features": 4,
+        "geometry": "5dc7ad1d86e17a49"
+      },
+      "waterway": {
+        "attributes": "630c263a0e8f69dc",
+        "features": 3,
+        "geometry": "772c388db07b13de"
+      }
+    },
+    "14/8529/5974": {
+      "aeroway": {
+        "attributes": "f7ae8ef0d7790406",
+        "features": 11,
+        "geometry": "8a6dd3d2dd56d2ad"
+      },
+      "boundary": {
+        "attributes": "b492346b3cd5a258",
+        "features": 7,
+        "geometry": "09578cb361365f08"
+      },
+      "building": {
+        "attributes": "ebe1e6904705cefd",
+        "features": 19,
+        "geometry": "42a0fac86709e022"
+      },
+      "housenumber": {
+        "attributes": "aedafb5e9253813d",
+        "features": 59,
+        "geometry": "3c081c17b2813f72"
+      },
+      "landcover": {
+        "attributes": "f6dc534c3068b27f",
+        "features": 37,
+        "geometry": "4cdfe51f441d69cc"
+      },
+      "landuse": {
+        "attributes": "8ca8255e39bddfad",
+        "features": 28,
+        "geometry": "b9fa074b11b0426f"
+      },
+      "mountain_peak": {
+        "attributes": "5d529cc50fa42c02",
+        "features": 7,
+        "geometry": "204b41a140fc2ce4"
+      },
+      "park": {
+        "attributes": "1ba407bc4603300a",
+        "features": 1,
+        "geometry": "3df7bd42cb8ab02a"
+      },
+      "place": {
+        "attributes": "49f758df49763d59",
+        "features": 11,
+        "geometry": "61517902ce738f94"
+      },
+      "poi": {
+        "attributes": "069029d24d2fe4ea",
+        "features": 996,
+        "geometry": "31d01d4c5a00d883"
+      },
+      "transportation": {
+        "attributes": "97d659141bf63e1b",
+        "features": 502,
+        "geometry": "846de503fd313453"
+      },
+      "transportation_name": {
+        "attributes": "a93d7eef3792c8b5",
+        "features": 256,
+        "geometry": "9d7921c0220fdff0"
+      },
+      "water": {
+        "attributes": "3f2617ebf1df0133",
+        "features": 26,
+        "geometry": "87065982e5507486"
+      },
+      "water_name": {
+        "attributes": "8e618d4f115126d3",
+        "features": 4,
+        "geometry": "73db3a39a90ab9e8"
+      }
+    },
+    "14/8529/5975": {
+      "boundary": {
+        "attributes": "9dd0171b7a69b1c6",
+        "features": 2,
+        "geometry": "36cd34e990ce6dcf"
+      },
+      "building": {
+        "attributes": "f3789a75e76cb8f4",
+        "features": 1,
+        "geometry": "e302970fe65f925b"
+      },
+      "mountain_peak": {
+        "attributes": "b3945c186bbc556e",
+        "features": 1,
+        "geometry": "f57f866eb4f84ef7"
+      },
+      "place": {
+        "attributes": "d191a0fe1e1fc63f",
+        "features": 8,
+        "geometry": "f6e3240077967c80"
+      },
+      "poi": {
+        "attributes": "573c9818ce7e8b55",
+        "features": 76,
+        "geometry": "f570b1d1939fd5de"
+      },
+      "transportation": {
+        "attributes": "294ff60689d73f6d",
+        "features": 4,
+        "geometry": "24fe2a548f37bad2"
+      },
+      "transportation_name": {
+        "attributes": "14d8303aa921cf29",
+        "features": 2,
+        "geometry": "aacf38a6b9b3de5c"
+      },
+      "water": {
+        "attributes": "67263a5b10382a00",
+        "features": 2,
+        "geometry": "0fa11a207429aeae"
+      },
+      "water_name": {
+        "attributes": "95ed02e1a6da8386",
+        "features": 1,
+        "geometry": "8f26ca9ac6f1710e"
+      }
+    },
+    "14/8530/5973": {
+      "aeroway": {
+        "attributes": "eb3308ed72119e13",
+        "features": 1,
+        "geometry": "776694dc8a70f828"
+      },
+      "boundary": {
+        "attributes": "bff9a93ab0d9470d",
+        "features": 3,
+        "geometry": "add43c195f823753"
+      },
+      "building": {
+        "attributes": "5888e5fe909b2034",
+        "features": 33,
+        "geometry": "ebc4f1083db255c3"
+      },
+      "housenumber": {
+        "attributes": "b6e89cfd79638fb2",
+        "features": 29,
+        "geometry": "1dd62e0477f3185b"
+      },
+      "landcover": {
+        "attributes": "d1decefe967fee28",
+        "features": 18,
+        "geometry": "1b572115824f0050"
+      },
+      "landuse": {
+        "attributes": "fc5d090223ae59de",
+        "features": 4,
+        "geometry": "1663ae0a6dd243a0"
+      },
+      "mountain_peak": {
+        "attributes": "0ec99d7533a55943",
+        "features": 2,
+        "geometry": "2e7f81337b804956"
+      },
+      "park": {
+        "attributes": "0cc1c96f29d30e0a",
+        "features": 2,
+        "geometry": "696ee3e07db8cafe"
+      },
+      "place": {
+        "attributes": "49f758df49763d59",
+        "features": 11,
+        "geometry": "cd2c509f4891b119"
+      },
+      "poi": {
+        "attributes": "c31413506b9d3e26",
+        "features": 369,
+        "geometry": "70673ad38f21671d"
+      },
+      "transportation": {
+        "attributes": "090fbb1feab5c1a3",
+        "features": 141,
+        "geometry": "606bca609429395a"
+      },
+      "transportation_name": {
+        "attributes": "7a406d9fed95d088",
+        "features": 64,
+        "geometry": "b3191f1ac8125782"
+      },
+      "water": {
+        "attributes": "05aaa5cc254fd2fe",
+        "features": 27,
+        "geometry": "a7d4ac5e1a635e65"
+      },
+      "water_name": {
+        "attributes": "8e618d4f115126d3",
+        "features": 4,
+        "geometry": "2a28dedbc154b6ac"
+      },
+      "waterway": {
+        "attributes": "630c263a0e8f69dc",
+        "features": 3,
+        "geometry": "a733a6101e126451"
+      }
+    },
+    "14/8530/5974": {
+      "boundary": {
+        "attributes": "0d620b894d50aafe",
+        "features": 3,
+        "geometry": "3b9d801051bfec22"
+      },
+      "building": {
+        "attributes": "1e097a14c8a7eadb",
+        "features": 1,
+        "geometry": "97659dfdf2d59b6b"
+      },
+      "housenumber": {
+        "attributes": "e49920b920954e9d",
+        "features": 9,
+        "geometry": "ad1ae717845a9d62"
+      },
+      "landcover": {
+        "attributes": "14212092cd4b29d0",
+        "features": 8,
+        "geometry": "e594e9bd42a53272"
+      },
+      "landuse": {
+        "attributes": "848959fe7d1c247e",
+        "features": 7,
+        "geometry": "2a7eb5912d5f3787"
+      },
+      "mountain_peak": {
+        "attributes": "4908db296d2138ac",
+        "features": 4,
+        "geometry": "feb390d64eb43b07"
+      },
+      "park": {
+        "attributes": "1ba407bc4603300a",
+        "features": 1,
+        "geometry": "ff121293dcd65691"
+      },
+      "place": {
+        "attributes": "49f758df49763d59",
+        "features": 11,
+        "geometry": "d3d04777e64fe44b"
+      },
+      "poi": {
+        "attributes": "c59072f426e19e30",
+        "features": 449,
+        "geometry": "23f303dba4ae83e0"
+      },
+      "transportation": {
+        "attributes": "c1100a0985207a25",
+        "features": 78,
+        "geometry": "3a0145a0b06c7eb9"
+      },
+      "transportation_name": {
+        "attributes": "3306ba85413f0ef1",
+        "features": 25,
+        "geometry": "4aa456848b1003e1"
+      },
+      "water": {
+        "attributes": "c6e6c319ddaba8f3",
+        "features": 3,
+        "geometry": "458a1931f4a23589"
+      },
+      "water_name": {
+        "attributes": "8e618d4f115126d3",
+        "features": 4,
+        "geometry": "1738158c66d894d9"
+      }
+    },
+    "14/8530/5975": {
+      "mountain_peak": {
+        "attributes": "b3945c186bbc556e",
+        "features": 1,
+        "geometry": "7c123e514f3c4ba9"
+      },
+      "place": {
+        "attributes": "d191a0fe1e1fc63f",
+        "features": 8,
+        "geometry": "788cd18eaf3f3521"
+      },
+      "poi": {
+        "attributes": "d6c81688504f8fc8",
+        "features": 1,
+        "geometry": "d600461c7483ef89"
+      },
+      "water": {
+        "attributes": "33cf6bfe98b142e4",
+        "features": 1,
+        "geometry": "46d6bd4bd7cc3844"
+      },
+      "water_name": {
+        "attributes": "95ed02e1a6da8386",
+        "features": 1,
+        "geometry": "39e6465960c3f3cc"
+      }
+    },
+    "4/8/5": {
+      "boundary": {
+        "attributes": "ea094bddaab1f078",
+        "features": 1,
+        "geometry": "f3b5a573d811f009"
+      }
+    },
+    "5/16/11": {
+      "boundary": {
+        "attributes": "23f37dd9213e217e",
+        "features": 3,
+        "geometry": "0e4ef5a960e58e77"
+      },
+      "place": {
+        "attributes": "0cab78a34bfcbc1c",
+        "features": 1,
+        "geometry": "2b1f80af3741019a"
+      }
+    },
+    "6/33/23": {
+      "boundary": {
+        "attributes": "23f37dd9213e217e",
+        "features": 3,
+        "geometry": "7d926a7616b58c7d"
+      },
+      "place": {
+        "attributes": "0cab78a34bfcbc1c",
+        "features": 1,
+        "geometry": "d662e241fa5e0bcf"
+      },
+      "water": {
+        "attributes": "33cf6bfe98b142e4",
+        "features": 1,
+        "geometry": "e9747458e162abe6"
+      }
+    },
+    "7/66/46": {
+      "boundary": {
+        "attributes": "23f37dd9213e217e",
+        "features": 3,
+        "geometry": "4ea2938ef3eaef9b"
+      },
+      "place": {
+        "attributes": "f85155cde585f831",
+        "features": 2,
+        "geometry": "72b4c74217cbd972"
+      },
+      "transportation": {
+        "attributes": "1b525bcf547f9019",
+        "features": 1,
+        "geometry": "8e6414322883477b"
+      },
+      "water": {
+        "attributes": "33cf6bfe98b142e4",
+        "features": 1,
+        "geometry": "b2083f4bc00dce53"
+      }
+    },
+    "8/133/93": {
+      "boundary": {
+        "attributes": "23f37dd9213e217e",
+        "features": 3,
+        "geometry": "86de967341e3fb87"
+      },
+      "place": {
+        "attributes": "f85155cde585f831",
+        "features": 2,
+        "geometry": "f1d359702a0eb161"
+      },
+      "transportation": {
+        "attributes": "d29037b16a423aa5",
+        "features": 2,
+        "geometry": "d1ecb657d5abc977"
+      },
+      "water": {
+        "attributes": "33cf6bfe98b142e4",
+        "features": 1,
+        "geometry": "ab31693f7c415cf6"
+      }
+    },
+    "9/266/186": {
+      "boundary": {
+        "attributes": "23f37dd9213e217e",
+        "features": 3,
+        "geometry": "6b5cee60b77577fe"
+      },
+      "landuse": {
+        "attributes": "6ee08e5664e929aa",
+        "features": 1,
+        "geometry": "1dac128f42a64264"
+      },
+      "place": {
+        "attributes": "f85155cde585f831",
+        "features": 2,
+        "geometry": "0e86ab199402686c"
+      },
+      "transportation": {
+        "attributes": "6f5b0977e6772333",
+        "features": 13,
+        "geometry": "422139b5c793c0b2"
+      },
+      "water": {
+        "attributes": "33cf6bfe98b142e4",
+        "features": 1,
+        "geometry": "18b5b0182c8a0cba"
+      }
+    }
+  },
+  "tiles_per_zoom": [
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    4,
+    6
+  ]
+}

@@ -1,0 +1,11 @@
+osm-tile-compiler
+Copyright 2026 Limina
+
+This product includes software developed by Limina.
+
+style/osm-bright.json is derived from OSM Bright
+(https://github.com/openmaptiles/osm-bright-gl-style), Copyright (c) 2024,
+MapTiler.com & OpenMapTiles contributors and Copyright (c) 2014, Mapbox: code
+under the BSD 3-Clause License, design under CC-BY 4.0. Maps using it must
+visibly credit OpenMapTiles and OpenStreetMap contributors. See
+style/LICENSE.md.

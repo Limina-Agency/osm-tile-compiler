@@ -1,0 +1,572 @@
+//! Runs the built `osm-tile-compiler` binary: the command line's usage
+//! handling, a real `compile` of `fixtures/monaco.osm.pbf` against synthetic
+//! supplemental inputs, the `style` it is drawn with, and the desktop worker
+//! protocol's argument errors.
+
+mod common;
+
+use common::{monaco_pbf, synthetic_sources};
+use pmtiles::{AsyncPmTilesReader, TileType};
+use std::ffi::OsStr;
+use std::process::{Command, Output};
+
+fn run<I, S>(args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(env!("CARGO_BIN_EXE_osm-tile-compiler"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[test]
+fn help_and_version_print_to_stdout() {
+    for args in [&["--help"][..], &["help"], &["-h"], &["compile", "--help"]] {
+        let output = run(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let stdout = text(&output.stdout);
+        assert!(stdout.contains("Usage:"), "{args:?}: {stdout}");
+        assert!(stdout.contains("compile <INPUT.pbf>"), "{args:?}: {stdout}");
+        assert!(
+            stdout.contains("building-levels <INPUT.pmtiles>"),
+            "{args:?}: {stdout}"
+        );
+        assert!(stdout.contains("fetch-sources <DIR>"), "{args:?}: {stdout}");
+        assert!(stdout.contains("style <ARCHIVE_URL>"), "{args:?}: {stdout}");
+    }
+    let output = run(["--version"]);
+    assert!(output.status.success());
+    assert_eq!(
+        text(&output.stdout),
+        format!("osm-tile-compiler {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn usage_errors_exit_with_2() {
+    let cases: &[(&[&str], &str)] = &[
+        (&[], "no command given"),
+        (&["frobnicate"], "unknown command 'frobnicate'"),
+        (&["--bogus"], "unknown command '--bogus'"),
+        (&["compile"], "compile needs an input PBF"),
+        (&["compile", "in.pbf", "--sources", "s"], "--output"),
+        (&["compile", "in.pbf", "--output", "o.pmtiles"], "--sources"),
+        (&["compile", "in.pbf", "--output"], "--output needs a value"),
+        (
+            &["compile", "in.pbf", "--bounds", "1", "2", "3"],
+            "four numbers",
+        ),
+        (
+            &["compile", "in.pbf", "--bounds", "7.4", "43.7", "x", "43.8"],
+            "--bounds expects a number, got 'x'",
+        ),
+        (
+            &[
+                "compile", "in.pbf", "--bounds", "7.4", "43.7", "7.4", "43.8",
+            ],
+            "W different from E",
+        ),
+        (
+            &["compile", "in.pbf", "--bounds", "177", "-19", "182", "-15"],
+            "within -180..180",
+        ),
+        (
+            &["compile", "in.pbf", "--polygon"],
+            "--polygon needs a value",
+        ),
+        (
+            &["compile", "in.pbf", "--center", "7.4", "43.7"],
+            "three numbers",
+        ),
+        (
+            &["compile", "in.pbf", "--center", "7.4", "43.7", "12.5"],
+            "whole number 0-14",
+        ),
+        (&["compile", "in.pbf", "--max-zoom", "15"], "<= 14"),
+        (
+            &["compile", "in.pbf", "--min-zoom", "9", "--max-zoom", "4"],
+            "--min-zoom <= --max-zoom",
+        ),
+        (&["compile", "in.pbf", "--threads", "0"], "at least 1"),
+        (
+            &["compile", "a.pbf", "b.pbf"],
+            "unexpected argument 'b.pbf'",
+        ),
+        (
+            &["compile", "in.pbf", "--frob"],
+            "unknown compile option '--frob'",
+        ),
+        (&["building-levels"], "needs an input and an output archive"),
+        (&["building-levels", "a"], "needs an input and an output"),
+        (
+            &["building-levels", "a", "b", "c"],
+            "unexpected argument 'c'",
+        ),
+        (
+            &["building-levels", "a", "b", "--threads", "0"],
+            "at least 1",
+        ),
+        (
+            &["building-levels", "a", "b", "--frob"],
+            "unknown building-levels option '--frob'",
+        ),
+        (&["fetch-sources"], "fetch-sources needs a directory"),
+        (&["fetch-sources", "a", "b"], "unexpected argument 'b'"),
+        (&["style"], "style needs an archive URL"),
+        (&["inspect"], "inspect needs an archive"),
+        (&["verify", "a", "b"], "verify takes one archive"),
+        (&["verify", "a", "--frob"], "unknown verify option '--frob'"),
+        (
+            &["compile", "in.pbf", "--gzip-level", "10"],
+            "--gzip-level must be 0-9",
+        ),
+        (&["style", "a", "b"], "unexpected argument 'b'"),
+        (
+            &["style", "a", "--glyphs", "g.pbf"],
+            "{fontstack} and {range}",
+        ),
+        (&["style", "a", "--sprite"], "--sprite needs a value"),
+        (
+            &["compile", "in.pbf", "--layers", "water,roads"],
+            "--layers: unknown layer 'roads'; the layers are water, waterway,",
+        ),
+        (
+            &["compile", "in.pbf", "--exclude-layers", "poi,parks"],
+            "--exclude-layers: unknown layer 'parks'",
+        ),
+        (
+            &[
+                "compile",
+                "in.pbf",
+                "--layers",
+                "poi",
+                "--exclude-layers",
+                "water",
+            ],
+            "--layers and --exclude-layers cannot be combined",
+        ),
+        (&["compile", "in.pbf", "--layers", ","], "no layer is left"),
+        (
+            &["compile", "in.pbf", "--languages", "en,xx"],
+            "--languages: unknown language 'xx'; the languages are af,",
+        ),
+        (
+            &["compile", "in.pbf", "--languages", "*"],
+            "'*' is not supported",
+        ),
+        (
+            &["compile", "in.pbf", "--languages"],
+            "--languages needs a value",
+        ),
+    ];
+    for (args, expected) in cases {
+        let output = run(*args);
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(stderr.starts_with("error: "), "{args:?}: {stderr}");
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+        assert!(stderr.contains("Usage:"), "{args:?}: {stderr}");
+    }
+}
+
+#[test]
+fn compile_without_sources_points_at_fetch_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let sources = temp.path().join("sources");
+    let output = temp.path().join("monaco.pmtiles");
+    let pbf = monaco_pbf();
+    let result = run::<[&OsStr; 6], _>([
+        "compile".as_ref(),
+        pbf.as_os_str(),
+        "--output".as_ref(),
+        output.as_os_str(),
+        "--sources".as_ref(),
+        sources.as_os_str(),
+    ]);
+    let stderr = text(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("fetch-sources"), "{stderr}");
+    assert!(stderr.contains("water-polygons-split-3857.zip"), "{stderr}");
+    assert!(!output.exists());
+    assert!(!sources.exists(), "a failed check must not create sources");
+
+    // Leaving the datasets out needs none of them, nor --sources.
+    let result = run::<[&OsStr; 6], _>([
+        "compile".as_ref(),
+        pbf.as_os_str(),
+        "--output".as_ref(),
+        output.as_os_str(),
+        "--omit-sources".as_ref(),
+        "all".as_ref(),
+    ]);
+    let stderr = text(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Leaving out water_polygons: No seas"),
+        "{stderr}"
+    );
+    let metadata: serde_json::Value = serde_json::from_str(
+        &osm_tile_compiler::archive::ArchiveReader::open(&output)
+            .unwrap()
+            .metadata()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        metadata["omitted_sources"],
+        serde_json::json!(["lake_centerlines", "natural_earth", "water_polygons"])
+    );
+    let unknown = run::<[&OsStr; 6], _>([
+        "compile".as_ref(),
+        pbf.as_os_str(),
+        "--output".as_ref(),
+        temp.path().join("other.pmtiles").as_os_str(),
+        "--omit-sources".as_ref(),
+        "coastlines".as_ref(),
+    ]);
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(text(&unknown.stderr).contains("unknown dataset 'coastlines'"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compiles_monaco_into_a_valid_archive() {
+    let temp = tempfile::tempdir().unwrap();
+    let sources = temp.path().join("sources");
+    synthetic_sources(&sources);
+    let archive = temp.path().join("out/monaco.pmtiles");
+    let pbf = monaco_pbf();
+    let args: [&OsStr; 10] = [
+        "compile".as_ref(),
+        pbf.as_os_str(),
+        "--output".as_ref(),
+        archive.as_os_str(),
+        "--sources".as_ref(),
+        sources.as_os_str(),
+        "--threads".as_ref(),
+        "2".as_ref(),
+        "--json".as_ref(),
+        "--building-levels".as_ref(),
+    ];
+    // A default scratch directory this tool did not create is never removed.
+    let scratch = temp.path().join("out/monaco.pmtiles.tmp");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let refused = run(args);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        text(&refused.stderr).contains("is not an osm-tile-compiler scratch directory"),
+        "{}",
+        text(&refused.stderr)
+    );
+    // One a running compile holds is refused and left alone.
+    let marker = std::fs::File::create(scratch.join(".osm-tile-compiler-scratch")).unwrap();
+    std::fs::write(scratch.join("node-store.bin"), b"in use").unwrap();
+    marker.try_lock().unwrap();
+    let busy = run(args);
+    assert_eq!(busy.status.code(), Some(1));
+    assert!(
+        text(&busy.stderr).contains("is in use by another compile"),
+        "{}",
+        text(&busy.stderr)
+    );
+    assert!(scratch.join("node-store.bin").exists());
+    // One left by an interrupted compile, and an archive it was writing, are
+    // cleared and reused.
+    drop(marker);
+    let abandoned = temp.path().join("out/monaco.pmtiles.1.partial");
+    std::fs::write(&abandoned, b"half an archive").unwrap();
+    let output = run(args);
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Removed what an interrupted compile left"),
+        "{stderr}"
+    );
+    assert!(
+        !abandoned.exists(),
+        "an unlocked partial archive is removed"
+    );
+    let leftovers = std::fs::read_dir(temp.path().join("out"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != "monaco.pmtiles" && name != "monaco-buildings.pmtiles")
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    assert!(
+        temp.path().join("out/monaco-buildings.pmtiles").is_file(),
+        "--building-levels writes the building levels beside the archive"
+    );
+    assert!(stderr.contains("Wrote "), "{stderr}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let tiles = result["tiles"].as_u64().unwrap();
+    assert!(tiles > 0, "{result}");
+    assert!(result["profile_features"].as_u64().unwrap() > 0, "{result}");
+    assert!(
+        stderr.contains(&format!("{tiles} tiles")),
+        "the summary reports the tile count: {stderr}"
+    );
+    let largest = &result["tile_stats"]["largest"][0];
+    assert!(
+        stderr.contains(&format!(
+            "Largest tile: {} at ",
+            largest["tile"].as_str().unwrap()
+        )),
+        "the summary names the largest tile: {stderr}"
+    );
+    let zooms = result["tile_stats"]["zooms"].as_array().unwrap();
+    assert_eq!(
+        zooms
+            .iter()
+            .map(|z| z["tiles"].as_u64().unwrap())
+            .sum::<u64>(),
+        tiles,
+        "{result}"
+    );
+    assert!(
+        !temp.path().join("out/monaco.pmtiles.tmp").exists(),
+        "the default temp directory is removed"
+    );
+
+    // verify accepts the archive; inspect reports what the compile did.
+    let verified = run(["verify".as_ref(), archive.as_os_str()]);
+    assert!(verified.status.success(), "{}", text(&verified.stderr));
+    assert!(
+        text(&verified.stdout).contains(&format!("valid, {tiles} tiles checked")),
+        "{}",
+        text(&verified.stdout)
+    );
+    let inspected = run(["inspect".as_ref(), archive.as_os_str(), "--json".as_ref()]);
+    assert!(inspected.status.success(), "{}", text(&inspected.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(report["problem_count"], 0, "{report}");
+    assert_eq!(report["tile_stats"], result["tile_stats"]);
+    assert_eq!(report["metadata"]["name"], "OpenMapTiles");
+    let described = run(["inspect".as_ref(), archive.as_os_str()]);
+    assert!(text(&described.stdout).contains("No problems found."));
+    // A tile's bytes overwritten: verify finds it and fails.
+    let damaged = temp.path().join("damaged.pmtiles");
+    let mut bytes = std::fs::read(&archive).unwrap();
+    let data_offset = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize;
+    bytes[data_offset..data_offset + 16].fill(0xff);
+    std::fs::write(&damaged, bytes).unwrap();
+    let rejected = run(["verify".as_ref(), damaged.as_os_str()]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(
+        text(&rejected.stderr).contains("not valid gzip"),
+        "{}",
+        text(&rejected.stderr)
+    );
+
+    let reader = AsyncPmTilesReader::new_with_path(&archive).await.unwrap();
+    let header = reader.get_header();
+    assert_eq!(header.tile_type, TileType::Mvt);
+    assert_eq!((header.min_zoom, header.max_zoom), (0, 14));
+    assert_eq!(header.n_addressed_tiles().map(u64::from), Some(tiles));
+    // Defaults to the PBF header's bounding box, which covers Monaco.
+    assert!(header.min_longitude < 7.42 && header.max_longitude > 7.42);
+    assert!(header.min_latitude < 43.73 && header.max_latitude > 43.73);
+
+    // Every layer of the style draws one of the archive's source layers.
+    let metadata: serde_json::Value =
+        serde_json::from_str(&reader.get_metadata().await.unwrap()).unwrap();
+    let declared = metadata["vector_layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|layer| layer["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let style: serde_json::Value =
+        serde_json::from_slice(&run(["style", "monaco.pmtiles"]).stdout).unwrap();
+    for layer in style["layers"].as_array().unwrap() {
+        if let Some(source_layer) = layer["source-layer"].as_str() {
+            assert!(
+                declared.contains(&source_layer),
+                "{} draws {source_layer}, not in {declared:?}",
+                layer["id"]
+            );
+        }
+    }
+
+    // A selection writes only its layers and languages, and verifies.
+    let selected = temp.path().join("out/selected.pmtiles");
+    let output = run::<[&OsStr; 13], _>([
+        "compile".as_ref(),
+        pbf.as_os_str(),
+        "--output".as_ref(),
+        selected.as_os_str(),
+        "--sources".as_ref(),
+        sources.as_os_str(),
+        "--threads".as_ref(),
+        "2".as_ref(),
+        "--layers".as_ref(),
+        "poi, place".as_ref(),
+        "--languages".as_ref(),
+        "en".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let verified = run(["verify".as_ref(), selected.as_os_str()]);
+    assert!(verified.status.success(), "{}", text(&verified.stdout));
+    let reader = AsyncPmTilesReader::new_with_path(&selected).await.unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(&reader.get_metadata().await.unwrap()).unwrap();
+    let layers = metadata["vector_layers"].as_array().unwrap();
+    let ids = layers
+        .iter()
+        .map(|layer| layer["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["place", "poi"]);
+    for layer in layers {
+        let fields = layer["fields"].as_object().unwrap();
+        let names = fields
+            .keys()
+            .filter(|key| key.starts_with("name"))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "name",
+                "name:en",
+                "name:latin",
+                "name_de",
+                "name_en",
+                "name_int"
+            ],
+            "{}",
+            layer["id"]
+        );
+    }
+
+    // The archive is never replaced.
+    let again = run(args);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(
+        text(&again.stderr).contains("refusing to replace existing archive"),
+        "{}",
+        text(&again.stderr)
+    );
+}
+
+#[test]
+fn style_points_at_the_archive() {
+    let output = run(["style", "https://example.com/tiles/region.pmtiles"]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let style: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(style["version"], 8);
+    let source = &style["sources"]["openmaptiles"];
+    assert_eq!(source["type"], "vector");
+    assert_eq!(
+        source["url"],
+        "pmtiles://https://example.com/tiles/region.pmtiles"
+    );
+    assert!(
+        source["attribution"]
+            .as_str()
+            .unwrap()
+            .contains("OpenMapTiles"),
+        "{source}"
+    );
+    assert_eq!(
+        style["glyphs"],
+        "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf"
+    );
+    assert_eq!(
+        style["sprite"],
+        "https://openmaptiles.github.io/osm-bright-gl-style/sprite"
+    );
+
+    let output = run([
+        "style",
+        "pmtiles://region.pmtiles",
+        "--glyphs",
+        "/fonts/{fontstack}/{range}.pbf",
+        "--sprite",
+        "/sprites/bright",
+    ]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let style: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        style["sources"]["openmaptiles"]["url"],
+        "pmtiles://region.pmtiles"
+    );
+    assert_eq!(style["glyphs"], "/fonts/{fontstack}/{range}.pbf");
+    assert_eq!(style["sprite"], "/sprites/bright");
+}
+
+#[test]
+fn worker_mode_still_reports_bad_arguments_as_error_events() {
+    let usage = serde_json::json!({
+        "protocolVersion": 1,
+        "event": "error",
+        "message": "usage: osm-tile-compiler [--parent-stdin] --request <request.json>",
+    });
+    for args in [&["--request"][..], &["--request", "a.json", "extra"]] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let stdout = text(&output.stdout);
+        let lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "{args:?}: one event line: {stdout}");
+        let event: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(event, usage, "{args:?}");
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    // The selection fields are read, and checked before any download.
+    let pbf = monaco_pbf();
+    for (selection, expected) in [
+        (
+            serde_json::json!({"layers": ["poi"], "excludeLayers": ["water"]}),
+            "not both",
+        ),
+        (
+            serde_json::json!({"excludeLayers": ["roads"]}),
+            "unknown layer 'roads'",
+        ),
+        (
+            serde_json::json!({"layers": ["poi"], "languages": ["en", "xx"]}),
+            "unknown language 'xx'",
+        ),
+    ] {
+        let mut request = serde_json::json!({
+            "inputPbfPath": pbf,
+            "sourcesDir": temp.path().join("sources"),
+            "outputPmtilesPath": temp.path().join("out.pmtiles"),
+            "tempDir": temp.path().join("temp"),
+            "manifestPath": temp.path().join("manifest.json"),
+        });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(selection.as_object().unwrap().clone());
+        let path = temp.path().join("request.json");
+        std::fs::write(&path, request.to_string()).unwrap();
+        let output = run::<[&OsStr; 2], _>(["--request".as_ref(), path.as_os_str()]);
+        assert_eq!(output.status.code(), Some(1), "{selection}");
+        let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(event["event"], "error", "{selection}");
+        let message = event["message"].as_str().unwrap();
+        assert!(message.contains(expected), "{selection}: {message}");
+        assert!(!temp.path().join("sources").exists(), "{selection}");
+    }
+
+    let missing = temp.path().join("missing.json");
+    let output = run::<[&OsStr; 2], _>(["--request".as_ref(), missing.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["event"], "error");
+    assert_eq!(event["protocolVersion"], 1);
+    assert!(
+        event["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Failed to read compiler request"),
+        "{event}"
+    );
+}

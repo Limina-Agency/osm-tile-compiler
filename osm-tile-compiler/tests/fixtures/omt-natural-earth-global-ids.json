@@ -1,0 +1,15 @@
+{
+  "source_zip_sha256": "375da61836d4779dffa8b87887bc4faa94dac77745ba0ee3914bd7cbedf40a02",
+  "reference": "Pinned Planetiler 0.10.2 NaturalEarthReader.java readFeatures increments a source-wide ID for every non-null GEOMETRY in JDBC table order",
+  "cases": [
+    {"table": "ne_10m_admin_0_boundary_lines_land", "table_first_id": 109, "row": 91, "ogc_fid": 91, "reference_feature_id": 1990},
+    {"table": "ne_10m_admin_1_states_provinces_lines", "table_first_id": 55543, "row": 2338, "ogc_fid": 2338, "reference_feature_id": 578800},
+    {"table": "ne_10m_admin_1_states_provinces_lines", "table_first_id": 55543, "row": 6553, "ogc_fid": 6553, "reference_feature_id": 620950},
+    {"table": "ne_110m_admin_0_boundary_lines_land", "table_first_id": 329818, "row": 70, "ogc_fid": 70, "reference_feature_id": 3298870},
+    {"table": "ne_50m_admin_0_boundary_lines_land", "table_first_id": 332456, "row": 51, "ogc_fid": 51, "reference_feature_id": 3325060},
+    {"table": "ne_10m_ocean", "table_first_id": 149821, "row": 1, "ogc_fid": 1, "reference_feature_id": 1498210},
+    {"table": "ne_110m_ocean", "table_first_id": 331921, "row": 2, "ogc_fid": 2, "reference_feature_id": 3319220},
+    {"table": "ne_50m_ocean", "table_first_id": 342913, "row": 1, "ogc_fid": 1, "reference_feature_id": 3429130},
+    {"table": "ne_50m_urban_areas", "table_first_id": 347696, "row": 957, "ogc_fid": 957, "reference_feature_id": 3486520}
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "source_pbf_sha256": "4c3a6b117c6d1e79f7fbaae4efc8d8565866a3ea1c075488fb04746aec1c971",
+  "profile_revision": "91516fdf477915b1a985015811049b9b96c7f87e",
+  "eligible_relations": 4057,
+  "eligible_way_memberships": 134518,
+  "targets": [
+    {
+      "way_id": 700946356,
+      "lower": 94784,
+      "insertion_order": [
+        1472092,
+        2327669,
+        5186551
+      ],
+      "java_get_order": [
+        5186551,
+        2327669,
+        1472092
+      ]
+    },
+    {
+      "way_id": 288997253,
+      "lower": 54794,
+      "insertion_order": [
+        3789075,
+        3792707
+      ],
+      "java_get_order": [
+        3792707,
+        3789075
+      ]
+    },
+    {
+      "way_id": 24821847,
+      "lower": 1473,
+      "insertion_order": [
+        29371,
+        5245186,
+        5248552
+      ],
+      "java_get_order": [
+        5248552,
+        5245186,
+        29371
+      ]
+    }
+  ]
+}

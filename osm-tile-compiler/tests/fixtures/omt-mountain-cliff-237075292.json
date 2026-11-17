@@ -1,0 +1,59 @@
+{
+  "source_input_sha256": "4c3a6b117c6d1e79f7fbaae4efc8d8565866a3ea1c075488fb04746acec1c971",
+  "pinned_planetiler_jar_sha256": "f310bd0413e2e4512b27f4046d418664e8e1d3bf31603c2a70e23de06c167e4d",
+  "osm_way_id": 237075292,
+  "tags": {
+    "height": "12",
+    "leisure": "climbing",
+    "name": "Pierwszy Filarek",
+    "natural": "cliff",
+    "rock": "limestone",
+    "source": "knowledge",
+    "sport": "climbing"
+  },
+  "coordinates_lonlat": [
+    [
+      19.7637553,
+      50.1657108
+    ],
+    [
+      19.7637699,
+      50.1656899
+    ],
+    [
+      19.7638043,
+      50.1656787
+    ],
+    [
+      19.7638355,
+      50.1656746
+    ],
+    [
+      19.7638572,
+      50.1656555
+    ],
+    [
+      19.7638545,
+      50.1656469
+    ],
+    [
+      19.763874,
+      50.1656338
+    ]
+  ],
+  "absent_at_z13_tiles": [
+    [
+      4545,
+      2772
+    ],
+    [
+      4546,
+      2772
+    ]
+  ],
+  "present_at_z14_tile": [
+    9091,
+    5544
+  ],
+  "pinned_packed_simplified_length_px_z13": 0.9833358850823176
+}

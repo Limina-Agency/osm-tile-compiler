@@ -1,0 +1,278 @@
+{
+  "source_input_sha256": "4c3a6b117c6d1e79f7fbaae4efc8d8565866a3ea1c075488fb04746acec1c971",
+  "tile": [
+    13,
+    4566,
+    2799
+  ],
+  "records": [
+    {
+      "tile_id": 79494294,
+      "zoom": 13,
+      "id": 619340532,
+      "layer": "building",
+      "geometry": {
+        "Polygon": [
+          {
+            "exterior": [
+              {
+                "x": 3981,
+                "y": 616
+              },
+              {
+                "x": 3990,
+                "y": 603
+              },
+              {
+                "x": 3999,
+                "y": 609
+              },
+              {
+                "x": 3990,
+                "y": 622
+              },
+              {
+                "x": 3981,
+                "y": 616
+              }
+            ],
+            "holes": []
+          }
+        ]
+      },
+      "attrs": {},
+      "sort_key": 5,
+      "grid_size": 0.0,
+      "grid_cell": null,
+      "grid_limit": 0,
+      "rank": false
+    },
+    {
+      "tile_id": 79494294,
+      "zoom": 13,
+      "id": 619340582,
+      "layer": "building",
+      "geometry": {
+        "Polygon": [
+          {
+            "exterior": [
+              {
+                "x": 3978,
+                "y": 614
+              },
+              {
+                "x": 3972,
+                "y": 610
+              },
+              {
+                "x": 3980,
+                "y": 596
+              },
+              {
+                "x": 3986,
+                "y": 599
+              },
+              {
+                "x": 3978,
+                "y": 614
+              }
+            ],
+            "holes": []
+          }
+        ]
+      },
+      "attrs": {},
+      "sort_key": 5,
+      "grid_size": 0.0,
+      "grid_cell": null,
+      "grid_limit": 0,
+      "rank": false
+    },
+    {
+      "tile_id": 79494294,
+      "zoom": 13,
+      "id": 619340622,
+      "layer": "building",
+      "geometry": {
+        "Polygon": [
+          {
+            "exterior": [
+              {
+                "x": 3970,
+                "y": 613
+              },
+              {
+                "x": 3977,
+                "y": 617
+              },
+              {
+                "x": 3970,
+                "y": 631
+              },
+              {
+                "x": 3962,
+                "y": 627
+              },
+              {
+                "x": 3970,
+                "y": 613
+              }
+            ],
+            "holes": []
+          }
+        ]
+      },
+      "attrs": {},
+      "sort_key": 5,
+      "grid_size": 0.0,
+      "grid_cell": null,
+      "grid_limit": 0,
+      "rank": false
+    },
+    {
+      "tile_id": 79494294,
+      "zoom": 13,
+      "id": 14310105342,
+      "layer": "building",
+      "geometry": {
+        "Polygon": [
+          {
+            "exterior": [
+              {
+                "x": 3980,
+                "y": 620
+              },
+              {
+                "x": 3993,
+                "y": 629
+              },
+              {
+                "x": 3989,
+                "y": 634
+              },
+              {
+                "x": 3976,
+                "y": 625
+              },
+              {
+                "x": 3980,
+                "y": 620
+              }
+            ],
+            "holes": []
+          }
+        ]
+      },
+      "attrs": {},
+      "sort_key": 5,
+      "grid_size": 0.0,
+      "grid_cell": null,
+      "grid_limit": 0,
+      "rank": false
+    },
+    {
+      "tile_id": 79494294,
+      "zoom": 13,
+      "id": 14310105362,
+      "layer": "building",
+      "geometry": {
+        "Polygon": [
+          {
+            "exterior": [
+              {
+                "x": 3975,
+                "y": 662
+              },
+              {
+                "x": 3963,
+                "y": 654
+              },
+              {
+                "x": 3974,
+                "y": 637
+              },
+              {
+                "x": 3986,
+                "y": 645
+              },
+              {
+                "x": 3975,
+                "y": 662
+              }
+            ],
+            "holes": []
+          }
+        ]
+      },
+      "attrs": {},
+      "sort_key": 5,
+      "grid_size": 0.0,
+      "grid_cell": null,
+      "grid_limit": 0,
+      "rank": false
+    }
+  ],
+  "reference_geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          3970,
+          613
+        ],
+        [
+          3980,
+          596
+        ],
+        [
+          3986,
+          599
+        ],
+        [
+          3985,
+          600
+        ],
+        [
+          3999,
+          609
+        ],
+        [
+          3988,
+          625
+        ],
+        [
+          3993,
+          629
+        ],
+        [
+          3982,
+          642
+        ],
+        [
+          3986,
+          645
+        ],
+        [
+          3975,
+          662
+        ],
+        [
+          3963,
+          654
+        ],
+        [
+          3976,
+          634
+        ],
+        [
+          3962,
+          627
+        ],
+        [
+          3970,
+          613
+        ]
+      ]
+    ]
+  }
+}

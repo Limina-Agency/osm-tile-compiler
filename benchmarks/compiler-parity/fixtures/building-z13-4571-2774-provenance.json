@@ -1,0 +1,32 @@
+{
+  "case": "z13/4571/2774 building proximity cluster 190",
+  "purpose": "Document a precision-sensitive buffer/erosion difference without changing native runtime selection.",
+  "input_pbf_sha256": "4c3a6b117c6d1e79f7fbaae4efc8d8565866a3ea1c075488fb04746acec1c971",
+  "reference_archive_sha256": "62baae469fdc1d42613bcbd06181a7fc69c715cabaa22542ff11121786466b2c",
+  "native_quality44_archive_sha256": "48938986745d6d35650878b698d4c80b863656d917c3896131816563aabbeb62",
+  "planetiler_jar_sha256": "f310bd0413e2e4512b27f4046d418664e8e1d3bf31603c2a70e23de06c167e4d",
+  "source_record_ids": [
+    3376794502,
+    3376794852,
+    3376794582,
+    7413157722
+  ],
+  "source_record_order_in_full_tile": [
+    215,
+    237,
+    220,
+    1534
+  ],
+  "full_tile_premerge_record_count": 1589,
+  "full_tile_capture_sha256": "9fe2610c68b2ec1d7c512c67328e81814a6b4cd6780195153eeb8ca7eed51298",
+  "compact_records_sha256": "5ee09350bc27e401fab0c238cb11f23d8e4d5ecb1cca978cf3e4a8e4cc6ab35d",
+  "java_stages_sha256": "11cb48005d164648f94f8cda1386069f667ddfc0de6e58e508690142c4493ac1",
+  "native_stages_sha256": "66d06528480bce96705ed8ef0af9d2dc29eee04608df76c6908471bcf05e63ca",
+  "native_merged_extra_component_area_px2": 47.19921875,
+  "java_positive_union_area_px2": 69.26438757285104,
+  "java_negative_buffer_area_px2": 3.0154955547597383e-13,
+  "java_final_output": "LINEARRING EMPTY",
+  "native_positive_union_area_px2": 69.264387975,
+  "native_negative_buffer_area_px2": 47.23523,
+  "interpretation": "The four actual OSM buildings enter both implementations. Nearly identical positive-union contours produce different negative-buffer topology; the pinned reference snaps an almost-zero triangle to empty. This is not evidence that the native geometry should be removed."
+}

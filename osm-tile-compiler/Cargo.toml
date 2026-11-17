@@ -1,0 +1,63 @@
+[package]
+name = "osm-tile-compiler"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+rust-version.workspace = true
+description = "Compiles an OpenStreetMap .osm.pbf into an OpenMapTiles-schema basemap as one PMTiles archive"
+readme = "README.md"
+keywords = ["openstreetmap", "openmaptiles", "pmtiles", "vector-tiles", "basemap"]
+categories = ["science::geo", "command-line-utilities"]
+# These tests read ../fixtures/monaco.osm.pbf, which lives outside this crate.
+# The unit-test fixtures in tests/fixtures/ stay (1.3 MB).
+exclude = ["tests/monaco.rs", "tests/cli.rs", "tests/antimeridian.rs", "tests/embedding.rs", "tests/common/"]
+
+
+[lints]
+workspace = true
+[features]
+# The binary's allocator. Apps that link the library leave it out with
+# `default-features = false`: the library itself never installs one.
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+benchmark-profiling = []
+
+[dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }
+ureq.workspace = true
+sha2.workspace = true
+hex = "0.4"
+fast-mvt = { workspace = true }
+regex = "1"
+rustc-hash = "2"
+icu_experimental = "0.6"
+unicode-script = "0.5"
+unicode-normalization = "0.1"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+shapefile = { version = "0.9", features = ["geo-types"] }
+rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
+geo = { workspace = true }
+i_overlay = "4.5"
+geo-types = { workspace = true }
+geojson = { workspace = true }
+flate2 = { workspace = true }
+pmtiles = { workspace = true, features = ["write"] }
+rayon = { workspace = true }
+crossbeam-channel = "0.5"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+osm-pbf-ingest = { workspace = true }
+
+[dev-dependencies]
+# Checks that the store's group keys are the bytes bincode 1 wrote for them.
+bincode = { workspace = true }
+# The archive reader, for tests that read compiled PMTiles back.
+pmtiles = { workspace = true, features = ["mmap-async-tokio"] }
+tempfile = "3"
+# Writes the synthetic PBF of tests/antimeridian.rs, at the versions
+# osm-pbf-ingest reads with.
+osmpbfreader = "0.19"
+protobuf = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,17 @@
+{
+  "input_pbf": "BENCH_DIR/malopolskie/input/malopolskie.osm.pbf",
+  "native_binary": "target/release/examples/compile_omt",
+  "java_binary": "BENCH_DIR/tools/java21/jdk-21.0.12.1+1/bin/java.exe",
+  "planetiler_jar": "BENCH_DIR/tools/planetiler-0.10.2.jar",
+  "planetiler_sources": "BENCH_DIR/malopolskie/planetiler-sources",
+  "java_heap": "4g",
+  "threads": 4,
+  "repeats": 3,
+  "timeout_seconds": 3600,
+  "sample_interval_seconds": 0.1,
+  "rss_limit_gib": 9,
+  "expected_sha256": {
+    "input_pbf": "4c3a6b117c6d1e79f7fbaae4efc8d8565866a3ea1c075488fb04746acec1c971",
+    "planetiler_jar": "f310bd0413e2e4512b27f4046d418664e8e1d3bf31603c2a70e23de06c167e4d"
+  }
+}

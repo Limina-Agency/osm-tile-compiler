@@ -1,0 +1,307 @@
+# osm-tile-compiler
+
+Turns an OpenStreetMap extract (`.osm.pbf`) into a vector basemap in the
+[OpenMapTiles](https://openmaptiles.org/) schema, written as one
+[PMTiles](https://docs.protomaps.com/pmtiles/) file you can serve from any
+static host or open on a device. It is a Rust port of the OpenMapTiles
+profile that [Planetiler](https://github.com/onthegomap/planetiler) runs,
+built for regional extracts on ordinary laptops, and inside apps.
+
+## Built for search and rescue
+
+The compiler comes from search and rescue (SAR) requirements. A team needs
+current map data for its search area quickly, made where the team is: on a
+field laptop or a phone at the edge, not on a server it may not reach. That
+set the design:
+
+- **In-process.** The compile is a library that runs inside the app that
+  shows the map, on iOS too, with no separate service, database or Java
+  runtime to ship or start. The command line is a thin layer over the same
+  call.
+- **Speed and memory first.** A region compiles in seconds to a minute, in
+  a fraction of the memory a server-side tool expects, so it fits on the
+  hardware a team carries and leaves room for the rest of the app.
+- **Under the app's control.** Progress is reported stage by stage, a
+  cancel stops the compile within about a second, and a stopped or failed
+  compile leaves nothing behind.
+- **Little to carry.** One extract and, optionally, the supplemental
+  datasets downloaded in advance; a compile can also go without them.
+
+## Why use it
+
+- **Fast and light.** On the Małopolskie extract from Geofabrik, on four
+  threads, a compile takes 41.6 s and peaks at 0.86 GiB of memory, where
+  Planetiler takes 93.0 s and 2.9 GiB on the same machine: more than twice
+  as fast in under a third of the memory.
+- **Close to Planetiler's output.** On that run both archives hold the same
+  11,293 tiles and the same 2,846,782 features, attributes included. Only 18
+  merged polygons (14 building clusters, 4 landuse areas) differ, slightly,
+  in shape (see [Compatibility with Planetiler](#compatibility-with-planetiler)).
+- **One binary, one file.** No Java, database or GIS tools: a single
+  executable reads the extract and writes a single archive.
+- **Checked output.** `verify` decodes every tile of an archive, and the
+  test suite pins the Monaco build's features.
+
+It is pre-1.0. The OpenMapTiles profile is experimental: its output is
+compared with Planetiler's, but not claimed identical
+(`parity_verified: false`).
+
+## How it works
+
+A compile runs in stages, each reported as progress:
+
+1. **Supplemental datasets** (`read_sources`). OpenMapTiles takes the sea
+   from OSM's water polygons, and low zooms and label ranks from Natural
+   Earth; lake labels follow lake centerlines. `fetch-sources` downloads these
+   once (about 1.5 GB), checking Natural Earth and the lake centerlines
+   against pinned SHA-256 hashes (the water polygons change daily upstream).
+   The first compile extracts them, and later compiles reuse that.
+2. **First pass over the PBF** (`index_osm`). Node locations and relations
+   are read with [osm-pbf-ingest](https://crates.io/crates/osm-pbf-ingest).
+3. **Second pass** (`read_osm`). Ways and relations are assembled into
+   features, the OpenMapTiles 3.16 rules applied layer by layer, and the
+   features simplified and cut into each zoom's tiles, spilling to scratch
+   disk.
+4. **Tiles** (`write_tiles`). Each tile's features are sorted and, where the
+   profile merges them (buildings, landuse, roads), merged, then encoded with
+   [fast-mvt](https://crates.io/crates/fast-mvt), and written to the
+   PMTiles archive.
+5. **Building levels** (`building_levels`, only when asked for). A second,
+   smaller archive holds the buildings as boxes, for renderers that draw
+   distant buildings that way.
+
+Each stage runs in parallel on the threads you give it.
+
+## Quick start
+
+Install the binary (prebuilt Linux binaries are on the releases page):
+
+```sh
+cargo install osm-tile-compiler
+```
+
+Download the supplemental datasets, then compile an extract, for example
+Monaco from [Geofabrik](https://download.geofabrik.de/europe/monaco.html):
+
+```sh
+osm-tile-compiler fetch-sources sources/
+osm-tile-compiler compile monaco-latest.osm.pbf --output monaco.pmtiles --sources sources/
+```
+
+This writes `monaco.pmtiles`, zooms 0 to 14. `compile --fetch` downloads any dataset missing from
+`sources/` instead. Progress goes to stderr; `--json` prints the result,
+with tile size statistics, on stdout. `osm-tile-compiler --help` lists every
+option.
+
+To look at the map, print a [MapLibre](https://maplibre.org/) style for
+the archive:
+
+```sh
+osm-tile-compiler style monaco.pmtiles > style.json
+```
+
+Put this `index.html` beside the style and the archive, and serve the
+directory over HTTP with range requests (for example `npx http-server`;
+Python's `http.server` cannot serve ranges):
+
+```html
+<!doctype html>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@6.14.0/dist/maplibre-gl.css">
+<script src="https://unpkg.com/pmtiles@4.5.0/dist/pmtiles.js"></script>
+<style>html, body, #map { margin: 0; height: 100%; }</style>
+<div id="map"></div>
+<script type="module">
+  import { Map, addProtocol } from "https://unpkg.com/maplibre-gl@6.14.0/dist/maplibre-gl.mjs";
+  const protocol = new pmtiles.Protocol();
+  addProtocol("pmtiles", protocol.tile);
+  const archive = new pmtiles.PMTiles("monaco.pmtiles");
+  protocol.add(archive);
+  const { centerLon, centerLat, centerZoom } = await archive.getHeader();
+  new Map({ container: "map", style: "style.json", center: [centerLon, centerLat], zoom: centerZoom });
+</script>
+```
+
+The style is OSM Bright from OpenMapTiles, adapted to this compiler's layers.
+It credits OpenMapTiles and OpenStreetMap in the map's corner, as their
+licenses require.
+
+## Choosing what to compile
+
+### Area
+
+By default the area is the PBF header's bounding box. `--bounds W S E N`
+sets another box, and `--polygon FILE` (GeoJSON, or the Osmosis `.poly`
+files Geofabrik publishes) keeps only the tiles the polygon covers; those
+tiles keep their full content.
+
+Areas may cross the antimeridian (Fiji, Chukotka, the Aleutians): a box with
+W greater than E runs east from W across 180, and polygons may either run on
+past ±180 or be split there (RFC 7946). Features near 180 are written into
+the tiles on both sides. The archive then declares longitudes -180 to 180,
+because MapLibre requests no tiles for a box whose west exceeds its east.
+
+Viewers open the archive at the middle of the area, zoomed to show all of
+it, unless you pass `--center LON LAT ZOOM`. `--min-zoom` and `--max-zoom`
+narrow the zooms from 0 to 14.
+
+### Layers and languages
+
+`--layers poi,place` writes only those layers, and `--exclude-layers
+housenumber` every layer but those. Each layer written is identical to the
+same layer of a full build, since layers depend on one another (water names
+on water polygons, road names on roads).
+
+`--languages en,de,pl` keeps the `name:<lang>` attributes of those languages
+only, out of the 80 the schema lists. The syntax is Planetiler's: `default`
+adds the whole list and `-ru` leaves one out, so `default,-ru` keeps all but
+Russian. `name`, `name_en`, `name_de`, `name_int`, `name:latin` and
+`name:nonlatin` are always written.
+
+### Without the supplemental datasets
+
+`--omit-sources water_polygons,natural_earth,lake_centerlines` (or `all`)
+compiles without some or all of them, which saves the download and the disk
+they take. The archive's metadata lists what was left out, and the map
+lacks:
+
+- **without water polygons**, the sea from zoom 6 in: it is drawn as land,
+  so coastlines and islands do not show. Lakes and rivers are unaffected.
+- **without Natural Earth**, most of zooms 0 to 5 (oceans, large lakes,
+  rivers, glaciers, country and state borders), state names, and the ranks
+  that let city and sea names show early.
+- **without lake centerlines**, lake names along their lakes: they are
+  placed at one point instead.
+
+An inland region loses little without them. `SupplementalDataset::without_warning()`
+gives these sentences for an app to show.
+
+### Archive details
+
+`--name`, `--description` and `--attribution` set the archive's metadata;
+the attribution must keep crediting OpenMapTiles and OpenStreetMap.
+`--gzip-level` trades compile time for size, `--threads` sets the worker
+threads (every core by default), and `--temp-dir` the scratch space
+(`<output>.tmp` by default, removed afterwards).
+
+## Building levels
+
+Building levels are an optional second archive for renderers that draw
+distant buildings as boxes: the basemap's buildings as instanced boxes at
+zooms 11, 12 and 14. They are not written by default. `compile
+--building-levels` writes them beside the archive as
+`<NAME>-buildings.pmtiles`, and `building-levels` writes them from an
+existing basemap:
+
+```sh
+osm-tile-compiler building-levels monaco.pmtiles monaco-buildings.pmtiles
+```
+
+## Checking archives
+
+```sh
+osm-tile-compiler inspect monaco.pmtiles   # header, metadata, tile sizes, problems
+osm-tile-compiler verify monaco.pmtiles    # exits with 1 if anything is wrong
+```
+
+Both read any PMTiles v3 archive. `verify` checks the layout (sections,
+directories, entry order, clustering, the header's counts) and decodes every
+tile, checking its MVT encoding and that its layers are declared in the
+metadata. Tiles over 1 MiB compressed produce a warning at compile time.
+
+## Using it as a library
+
+`compile_basemap` runs the whole compile in the caller's process: it fetches
+the supplemental datasets if asked, compiles, writes the building levels if
+`building_levels` is set, and returns the result and a manifest. The command line calls it too, so
+both produce the same bytes.
+
+```rust
+let mut request = BasemapRequest::new(pbf, output, sources_dir, temp_dir);
+request.threads = 2;
+request.sources_policy = SourcesPolicy::FetchMissing; // or UsePresent, FetchAndVerify
+let output: Result<BasemapOutput, CompileError> =
+    compile_basemap(&request, |progress: &CompileProgress| { /* ... */ }, || cancelled());
+```
+
+- **Progress.** The callbacks run on the calling thread, while the work runs
+  on a rayon pool of `request.threads` threads built for the compile. Each
+  report names its stage (the ids above), the stage's fraction, and an
+  overall fraction; stages are reported as they start, then at most every
+  200 ms.
+- **Cancelling.** `should_cancel` is asked every 50 ms. Once it says yes the
+  compile returns `CompileError::Cancelled` within about a second in every
+  stage; a stalled download can hold it until the connection times out.
+- **Clean-up.** A cancelled or failed compile leaves neither archive and
+  removes its scratch directory. Complete downloads and extracted datasets
+  stay for the next compile.
+- **Embedding.** The library prints nothing, never exits the process,
+  installs no allocator (build with `default-features = false` to leave out
+  the binary's mimalloc) and never reads the working directory, so pass
+  absolute paths. While the PBF is read, up to about twice `threads` threads
+  are busy.
+
+Apps that would rather run a separate process can start the binary as a
+worker (`--request <request.json>`), which reports progress as JSON lines on
+stdout. [`docs/formats.md`](docs/formats.md) describes the request, the manifest and the other
+formats the compiler writes, and how their versions change.
+
+## Performance
+
+On a Ryzen 7 5800H laptop with the real supplemental datasets and building
+levels on, Małopolskie compiles in 61 s on 2 threads and 22 s on 16, peaking at 0.7 to 1.3 GiB of
+memory and about 1 GB of scratch disk; the basemap is 147 MiB and its
+building levels 26 MiB. Monaco takes half a second. [`docs/performance.md`](docs/performance.md)
+has the measurements, per stage and thread count.
+
+Plan disk for the supplemental datasets: 1.45 GB of downloads, unpacked once
+into another 2.23 GB. Scratch disk peaks at about five times the extract.
+
+## Compatibility with Planetiler
+
+The profile follows OpenMapTiles 3.16 as Planetiler 0.10.2 implements it
+(profile revision `91516fdf`). [`benchmarks/compiler-parity/`](benchmarks/compiler-parity/) builds the same
+extract with both and compares every tile; [`docs/parity.md`](docs/parity.md) has the results
+for Małopolskie, Berlin and Pomorskie. In short: the same tiles and the same
+features. What differs is the shape of a few merged polygons, where
+Planetiler merges nearby buildings and landuse through JTS's buffer and
+union and the port comes out slightly different: 18 on Małopolskie
+(2026-11-17), 44 on Berlin and 15 on Pomorskie (2026-11-03), all but one of
+the latter within 1% of their area and a pixel. No polygon is invalid where
+Planetiler's is valid. Berlin also has two romanised Han names that ICU4X
+spaces differently from Java's ICU4J, and one ocean polygon without an ID.
+
+Unlike Planetiler, a `--bounds` box with W greater than E crosses the
+antimeridian, and `--languages` refuses codes outside the schema's list.
+
+## Licensing
+
+The code is under the Apache License, Version 2.0 ([`LICENSE`](LICENSE), [`NOTICE`](NOTICE)).
+Parts are ported from Planetiler (Apache-2.0) and JTS (Eclipse Distribution
+License 1.0), with their licenses in `osm-tile-compiler/src/omt/`; the style
+is adapted from OSM Bright (BSD 3-Clause code, CC-BY 4.0 design), with its
+license in `osm-tile-compiler/style/`. Release archives also carry
+`THIRD-PARTY-LICENSES` for the crates the binary includes.
+
+Tiles you build are not covered by the code's license. They are a derived
+database of OpenStreetMap under the Open Database License 1.0: credit
+"© OpenStreetMap contributors" (https://www.openstreetmap.org/copyright).
+Tiles in the OpenMapTiles schema carry that schema's attribution terms
+(https://github.com/openmaptiles/openmaptiles/blob/master/LICENSE.md), and
+each supplemental dataset carries its own license.
+
+By default the style loads fonts from the MapLibre demo server and icons
+from OSM Bright's GitHub Pages site, neither meant for production. Host your
+own with `style --glyphs URL --sprite URL` (the style uses Noto Sans Regular,
+Bold and Italic). The sprite lacks icons for some POI classes, which then
+show only their names.
+
+## Development
+
+```sh
+scripts/check.sh
+```
+
+runs what CI runs: formatting, clippy (warnings are errors), the Rust tests
+and the benchmark harness's Python tests. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers changes to
+tile output, and [`RELEASING.md`](RELEASING.md) the release steps.

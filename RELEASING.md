@@ -1,0 +1,16 @@
+# Releasing
+
+1. Run `scripts/check.sh` and the Planetiler comparison in
+   `benchmarks/compiler-parity/` on a quiet machine against the previous release.
+2. Bump the workspace version and update `CHANGELOG.md`.
+3. Tag `v<version>` and push the tag. The release workflow refuses a tag that does
+   not match the crate version, runs the CI checks, then builds the compiler
+   binary for Linux (x86_64 and arm64) and attaches the archives and their
+   SHA-256 checksums to the GitHub release.
+4. Publish `osm-tile-compiler` to crates.io.
+
+Each archive carries `THIRD-PARTY-LICENSES`, the licenses of the crates
+the binary includes, which the release workflow writes with cargo-about from
+`about.toml` and `about.hbs`. A dependency under a license `about.toml` does
+not accept fails the release build; check before tagging with
+`cargo about generate --locked -m osm-tile-compiler/Cargo.toml about.hbs`.

@@ -1,0 +1,436 @@
+//! One call that does a whole compile, for apps that run it in their own
+//! process, and for this crate's command line and worker.
+
+use crate::building_levels::{BuildingLevelsReport, building_levels_path, has_building_layer};
+use crate::control::{self, CompileError, CompileProgress, CompileStage, Control, RemoveOnDrop};
+use crate::omt::{self, OpenMapTilesRequest, OpenMapTilesResult};
+use crate::sources::{self, CachedInput, FetchEvent, FetchMode, SupplementalDataset};
+use crate::{ArchiveCenter, CompileArea, CompileBounds, archive::ArchiveOptions};
+use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// What to do about the supplemental datasets the compile reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcesPolicy {
+    /// Use what `sources` holds, unchecked; fail if a dataset not omitted is
+    /// missing.
+    UsePresent,
+    /// Download the datasets missing from `sources`; keep the others
+    /// unchecked.
+    FetchMissing,
+    /// Check every dataset against its recorded hash and download any that
+    /// is missing or changed. Checking reads the 1.5 GB again.
+    FetchAndVerify,
+}
+
+/// A compile of one PBF extract into a basemap.
+#[derive(Debug, Clone)]
+pub struct BasemapRequest {
+    /// The `.osm.pbf` extract, read in place.
+    pub input_pbf: PathBuf,
+    /// The archive to write; it must not exist yet. Building levels, when
+    /// asked for, go beside it ([`building_levels_path`]).
+    pub output: PathBuf,
+    /// The directory of the supplemental datasets: downloads go there, and
+    /// the first compile that reads one extracts it there too.
+    pub sources: PathBuf,
+    pub sources_policy: SourcesPolicy,
+    /// Datasets to compile without: they are neither fetched nor read. The
+    /// archive's metadata (`omitted_sources`) and the output list them; see
+    /// [`SupplementalDataset::without_warning`] for what the map lacks.
+    pub omit_sources: Vec<SupplementalDataset>,
+    /// Scratch space. The compile works in a directory of its own inside it
+    /// and removes that directory when it ends, however it ends.
+    pub temp_dir: PathBuf,
+    /// The box to compile [default: the PBF header's]; one whose west is
+    /// greater than its east crosses the antimeridian.
+    pub bounds: Option<CompileBounds>,
+    /// A GeoJSON or Osmosis `.poly` file limiting the compile to the tiles
+    /// its polygon covers.
+    pub polygon: Option<PathBuf>,
+    /// Where viewers start [default: the middle of the area].
+    pub center: Option<ArchiveCenter>,
+    pub archive: ArchiveOptions,
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+    /// The compile's threads. Its work runs on a rayon pool of this many
+    /// threads; the PBF reader and the tile renderers start this many of
+    /// their own as well, so up to about twice as many are busy at a time
+    /// while the PBF is read.
+    pub threads: usize,
+    /// The layers to write [default: all]; not together with
+    /// `exclude_layers`. See [`crate::omt::select_layers`].
+    pub layers: Option<Vec<String>>,
+    pub exclude_layers: Option<Vec<String>>,
+    /// The `name:<lang>` languages to write, as
+    /// [`crate::omt::resolve_languages`] takes them [default: all].
+    pub languages: Option<Vec<String>>,
+    /// Whether to write the building levels beside the archive (when it
+    /// has buildings at zoom 14) [default: no]. They serve renderers that
+    /// draw far buildings as boxes; see [`write_building_levels`].
+    ///
+    /// [`write_building_levels`]: crate::write_building_levels
+    pub building_levels: bool,
+}
+
+impl BasemapRequest {
+    /// A full compile at zooms 0 to 14 on every core, with the supplemental
+    /// datasets `sources` holds, and no building levels.
+    pub fn new(
+        input_pbf: impl Into<PathBuf>,
+        output: impl Into<PathBuf>,
+        sources: impl Into<PathBuf>,
+        temp_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            input_pbf: input_pbf.into(),
+            output: output.into(),
+            sources: sources.into(),
+            sources_policy: SourcesPolicy::UsePresent,
+            omit_sources: Vec::new(),
+            temp_dir: temp_dir.into(),
+            bounds: None,
+            polygon: None,
+            center: None,
+            archive: ArchiveOptions::default(),
+            min_zoom: 0,
+            max_zoom: 14,
+            threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
+            layers: None,
+            exclude_layers: None,
+            languages: None,
+            building_levels: false,
+        }
+    }
+
+    /// The datasets the compile reads.
+    pub fn used_sources(&self) -> Vec<SupplementalDataset> {
+        SupplementalDataset::ALL
+            .into_iter()
+            .filter(|dataset| !self.omit_sources.contains(dataset))
+            .collect()
+    }
+}
+
+/// What a compile wrote.
+#[derive(Debug)]
+pub struct BasemapOutput {
+    pub result: OpenMapTilesResult,
+    /// The archive: the request's `output`.
+    pub archive: PathBuf,
+    /// The building levels and what they hold, if written.
+    pub building_levels: Option<(PathBuf, BuildingLevelsReport)>,
+    /// The area compiled.
+    pub bounds: CompileBounds,
+    /// Where each supplemental dataset read came from, when the request
+    /// fetched or verified them; empty for [`SourcesPolicy::UsePresent`].
+    pub supplemental_inputs: Vec<CachedInput>,
+    /// The datasets left out, as the request asked.
+    pub omitted_sources: Vec<SupplementalDataset>,
+}
+
+/// The manifest's `format`.
+pub const MANIFEST_FORMAT: &str = "basemap-manifest";
+/// The manifest's `formatVersion`. See `docs/formats.md` for when it changes.
+pub const MANIFEST_VERSION: u32 = 1;
+
+impl BasemapOutput {
+    /// The manifest the desktop worker writes beside its output. `version`
+    /// is the OpenMapTiles schema's; `formatVersion` is the manifest's own.
+    /// `omittedSources` is there only when a dataset was left out.
+    pub fn manifest(&self) -> serde_json::Value {
+        let mut manifest = json!({
+            "format": MANIFEST_FORMAT,
+            "formatVersion": MANIFEST_VERSION,
+            "schema": "OpenMapTiles",
+            "version": omt::OMT_SCHEMA_VERSION,
+            "result": self.result,
+            "supplementalInputs": self.supplemental_inputs,
+        });
+        if !self.omitted_sources.is_empty() {
+            manifest["omittedSources"] = json!(self.omitted_sources);
+        }
+        manifest
+    }
+}
+
+/// Reads the PBF header's bounding box, normalized (a box crossing the
+/// antimeridian has west above east).
+pub fn pbf_bounds(input: &Path) -> Result<CompileBounds, String> {
+    let index = osm_pbf_ingest::blob_index::PbfBlobIndex::scan(input)
+        .map_err(|e| format!("Failed to inspect {}: {e}", input.display()))?;
+    let b = index.header().bounds.ok_or_else(|| {
+        format!(
+            "{} has no bounding box in its header; the compile needs one",
+            input.display()
+        )
+    })?;
+    Ok(CompileBounds::new(b.north, b.south, b.east, b.west).normalized())
+}
+
+/// Compiles `request.input_pbf` into a basemap: fetches the supplemental
+/// datasets as the request says, compiles, and writes the building levels
+/// beside the archive if the request asks for them.
+///
+/// `progress` and `should_cancel` are called on the calling thread, which
+/// waits for the compile while the work runs on a rayon pool of
+/// `request.threads` threads built for it. `progress` gets every stage as it
+/// starts and then the stage's fraction at most every 200 ms; `should_cancel`
+/// is asked every 50 ms and right after each progress report. Once it
+/// returns true the compile stops within about a second in every stage
+/// (downloads: see [`sources::fetch_sources`]) and returns
+/// [`CompileError::Cancelled`].
+///
+/// A cancelled or failed compile leaves neither the archive nor the building
+/// levels, and removes its scratch directory. Downloads already complete,
+/// and extracted datasets, stay in `sources` for the next compile.
+///
+/// The library prints nothing, never exits the process, and installs no
+/// allocator; paths are used as given, so pass absolute ones.
+pub fn compile_basemap(
+    request: &BasemapRequest,
+    progress: impl FnMut(&CompileProgress),
+    should_cancel: impl Fn() -> bool,
+) -> Result<BasemapOutput, CompileError> {
+    // Everything that needs no reading or network is checked first.
+    let layers = omt::select_layers(request.layers.as_deref(), request.exclude_layers.as_deref())?;
+    if let Some(languages) = &request.languages {
+        omt::resolve_languages(languages)?;
+    }
+    let levels = building_levels_path(&request.output);
+    let archives = [
+        Some(&request.output),
+        request.building_levels.then_some(&levels),
+    ];
+    for archive in archives.into_iter().flatten() {
+        if archive.exists() {
+            return Err(CompileError::Failed(format!(
+                "refusing to replace existing archive {}",
+                archive.display()
+            )));
+        }
+    }
+    control::run(
+        request.threads,
+        request.building_levels,
+        progress,
+        should_cancel,
+        |control| compile(request, layers, control),
+    )
+}
+
+fn compile(
+    request: &BasemapRequest,
+    layers: Option<Vec<String>>,
+    control: &Control,
+) -> Result<BasemapOutput, String> {
+    let bounds = match request.bounds {
+        Some(bounds) => bounds,
+        None => pbf_bounds(&request.input_pbf)?,
+    };
+    let area = request
+        .polygon
+        .as_deref()
+        .map(CompileArea::read)
+        .transpose()?;
+    let mut compile_request = OpenMapTilesRequest {
+        input_pbf: request.input_pbf.clone(),
+        sources: request.sources.clone(),
+        output: request.output.clone(),
+        temp_dir: PathBuf::new(),
+        bounds,
+        area,
+        center: request.center,
+        archive: request.archive.clone(),
+        min_zoom: request.min_zoom,
+        max_zoom: request.max_zoom,
+        threads: request.threads,
+        layers,
+        languages: request.languages.clone(),
+        omit_sources: request.omit_sources.clone(),
+    };
+    omt::validate(&compile_request)?;
+    let used = request.used_sources();
+    let supplemental_inputs = fetch(request, &used, control)?;
+    let missing = used
+        .iter()
+        .filter(|dataset| !dataset.is_present(&request.sources))
+        .map(|dataset| dataset.file_name())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{} is missing supplemental datasets: {}",
+            request.sources.display(),
+            missing.join(", ")
+        ));
+    }
+    let scratch = Scratch::create(&request.temp_dir)?;
+    compile_request.temp_dir = scratch.path.clone();
+    // The archive is moved into place only when complete; it and the
+    // levels are removed again if a later step fails or is cancelled.
+    let archive_guard = RemoveOnDrop::file(request.output.clone());
+    let result = omt::compile(&compile_request, control, |_| {});
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            // The archive was never put in place: nothing to remove.
+            archive_guard.keep();
+            return Err(error);
+        }
+    };
+    let mut building_levels = None;
+    let mut levels_guard = None;
+    if request.building_levels && has_building_layer(&request.output)? {
+        control.stage(CompileStage::BuildingLevels, "Writing building levels")?;
+        let path = building_levels_path(&request.output);
+        let report =
+            crate::building_levels::write_levels(&request.output, &path, request.threads, control)?;
+        levels_guard = Some(RemoveOnDrop::file(path.clone()));
+        building_levels = Some((path, report));
+    }
+    control.check()?;
+    drop(scratch);
+    archive_guard.keep();
+    if let Some(guard) = levels_guard {
+        guard.keep();
+    }
+    Ok(BasemapOutput {
+        result,
+        archive: request.output.clone(),
+        building_levels,
+        bounds,
+        supplemental_inputs,
+        omitted_sources: SupplementalDataset::ALL
+            .into_iter()
+            .filter(|dataset| request.omit_sources.contains(dataset))
+            .collect(),
+    })
+}
+
+/// Fetches the datasets as the request's policy says, in the
+/// `FetchSources` stage.
+fn fetch(
+    request: &BasemapRequest,
+    used: &[SupplementalDataset],
+    control: &Control,
+) -> Result<Vec<CachedInput>, String> {
+    let mode = match request.sources_policy {
+        SourcesPolicy::UsePresent => return Ok(Vec::new()),
+        SourcesPolicy::FetchMissing => FetchMode::OnlyMissing,
+        SourcesPolicy::FetchAndVerify => FetchMode::Verify,
+    };
+    if used.is_empty() {
+        return Ok(Vec::new());
+    }
+    control.stage(CompileStage::FetchSources, "Checking supplemental datasets")?;
+    // The fraction: bytes checked or received over the datasets' sizes,
+    // each counted at its approximate size until its real one is known.
+    let sizes = used
+        .iter()
+        .map(|dataset| AtomicU64::new(dataset.approximate_bytes()))
+        .collect::<Vec<_>>();
+    let finished = AtomicU64::new(0);
+    let index = |dataset| used.iter().position(|d| *d == dataset).unwrap_or(0);
+    let report = |dataset: SupplementalDataset, bytes: u64, total: Option<u64>| {
+        let i = index(dataset);
+        if let Some(total) = total.filter(|total| *total > 0) {
+            sizes[i].store(total, Ordering::Relaxed);
+        }
+        let all = sizes
+            .iter()
+            .map(|size| size.load(Ordering::Relaxed))
+            .sum::<u64>();
+        control.set_total(all);
+        control.set_done(finished.load(Ordering::Relaxed) + bytes);
+    };
+    let megabytes = |bytes: u64| bytes / 1_000_000;
+    sources::fetch(
+        &request.sources,
+        used,
+        mode,
+        |event| match event {
+            FetchEvent::Checking {
+                dataset,
+                bytes,
+                total,
+            } => {
+                control.message(format!("Checking {}", dataset.file_name()));
+                report(dataset, bytes, Some(total));
+            }
+            FetchEvent::Downloading { dataset, .. } => {
+                control.message(format!("Downloading {}", dataset.file_name()));
+                report(dataset, 0, None);
+            }
+            FetchEvent::Received {
+                dataset,
+                bytes,
+                total,
+            } => {
+                control.message(match total {
+                    Some(total) => format!(
+                        "Downloading {} ({} of {} MB)",
+                        dataset.file_name(),
+                        megabytes(bytes),
+                        megabytes(total)
+                    ),
+                    None => format!(
+                        "Downloading {} ({} MB)",
+                        dataset.file_name(),
+                        megabytes(bytes)
+                    ),
+                });
+                report(dataset, bytes, total);
+            }
+            FetchEvent::Ready { dataset, bytes, .. } => {
+                sizes[index(dataset)].store(bytes, Ordering::Relaxed);
+                finished.fetch_add(bytes, Ordering::Relaxed);
+                report(dataset, 0, None);
+            }
+        },
+        &|| control.is_cancelled(),
+    )
+}
+
+/// The compile's own scratch directory inside the request's, removed with
+/// everything in it when dropped. The request's directory is removed too
+/// if the compile made it and it is empty.
+struct Scratch {
+    path: PathBuf,
+    parent: Option<PathBuf>,
+}
+
+impl Scratch {
+    fn create(temp_dir: &Path) -> Result<Self, String> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let made_parent = !temp_dir.exists();
+        std::fs::create_dir_all(temp_dir)
+            .map_err(|e| format!("Failed to create {}: {e}", temp_dir.display()))?;
+        loop {
+            let path = temp_dir.join(format!(
+                "compile-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        parent: made_parent.then(|| temp_dir.to_path_buf()),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("Failed to create {}: {e}", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(parent) = &self.parent {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}

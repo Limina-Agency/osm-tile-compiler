@@ -1,0 +1,874 @@
+{
+  "contract_version": 1,
+  "status": "locked_reference_observation_native_omt_blocked",
+  "effective_settings_complete": false,
+  "scope": "Exact completed Planetiler reference workload; raw argument values preserved as strings. This contract does not assert that native implements OMT or that global defaults override per-feature profile policies.",
+  "reference": {
+    "release": "0.10.2",
+    "engine_commit": "0e5588c4a6e8c29a270a33afe8df62027d889604",
+    "profile_commit": "91516fdf477915b1a985015811049b9b96c7f87e",
+    "schema_version": "3.16.0",
+    "jar_buildinfo": {
+      "version": "0.10.2",
+      "git_hash": "0e5588c4a6e8c29a270a33afe8df62027d889604",
+      "build_timestamp": "2026-03-28T14:35:36.815Z",
+      "evidence": "completed stdout build identity lines"
+    }
+  },
+  "evidence": {
+    "run_manifest": {
+      "path": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\manifest.json",
+      "sha256": "6862430ed33798921ecfdea565ea73ab94fd5a4c77cdd0de17455617d457df74",
+      "bytes": 6760
+    },
+    "logs": [
+      {
+        "path": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\stdout.log",
+        "sha256": "0ebb839cfab75bb393fc7fcd56f0cd6a077e345aa762a48e0e17f25455abaa14",
+        "bytes": 36531
+      },
+      {
+        "path": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-02\\planetiler\\stdout.log",
+        "sha256": "3f44de26478cb31bfc468b83b0de46bc6475f68d9c24bc131847f1c2de8c1a3f",
+        "bytes": 36545
+      }
+    ],
+    "profile_archive": "2f71ad1df101a2b675976d8bde951627f71edbe0cc6276ba6659a5b15c8e9bc8",
+    "schema_source": {
+      "path": "BENCH_DIR\\tools\\planetiler-openmaptiles-91516fdf\\planetiler-openmaptiles-91516fdf477915b1a985015811049b9b96c7f87e\\src\\main\\java\\org\\openmaptiles\\generated\\OpenMapTilesSchema.java",
+      "sha256": "1524e3b7baf8fdf5c48821bd08501cde980bd28d883afaff9c15143d4b3a9cf9",
+      "bytes": 98905
+    },
+    "extra_layers_source": {
+      "path": "BENCH_DIR\\tools\\planetiler-openmaptiles-91516fdf\\planetiler-openmaptiles-91516fdf477915b1a985015811049b9b96c7f87e\\src\\main\\java\\org\\openmaptiles\\addons\\ExtraLayers.java",
+      "sha256": "113d72778a2f8e13510f30406eb41318559f01442fc3a937d991fc4b527a6039",
+      "bytes": 598
+    },
+    "engine_sort_source": {
+      "path": "BENCH_DIR\\tools\\planetiler-0.10.2-source-reference\\collection_ExternalMergeSort.java",
+      "sha256": "990e9d9e98631cea8a4589be9884d2b0fc37a14c66baad5132b3adf4ed9c4545",
+      "bytes": 22147,
+      "exact_commit_url": "https://raw.githubusercontent.com/onthegomap/planetiler/0e5588c4a6e8c29a270a33afe8df62027d889604/planetiler-core/src/main/java/com/onthegomap/planetiler/collection/ExternalMergeSort.java",
+      "verified_against_remote_commit": true
+    }
+  },
+  "input": {
+    "path": "BENCH_DIR\\malopolskie\\input\\malopolskie.osm.pbf",
+    "bytes": 201947173,
+    "sha256": "4c3a6b117c6d1e79f7fbaae4efc8d8565866a3ea1c075488fb04746acec1c971"
+  },
+  "auxiliary_inputs": [
+    {
+      "path": "BENCH_DIR\\malopolskie\\planetiler-sources\\lake_centerline.shp.zip",
+      "bytes": 80906805,
+      "sha256": "6c900507c88fc9f5b5a386f90fd0a42d0495e8755a03d075538fb9a6801a3192"
+    },
+    {
+      "path": "BENCH_DIR\\malopolskie\\planetiler-sources\\natural_earth_vector.sqlite.zip",
+      "bytes": 434210731,
+      "sha256": "375da61836d4779dffa8b87887bc4faa94dac77745ba0ee3914bd7cbedf40a02"
+    },
+    {
+      "path": "BENCH_DIR\\malopolskie\\planetiler-sources\\water-polygons-split-3857.zip",
+      "bytes": 930975912,
+      "sha256": "2d29619f2c9955cd2feb0209b2f9cc9514cf4f10a542b1a21cfcd9877b4a60ad"
+    }
+  ],
+  "tool_files": {
+    "planetiler_jar": {
+      "path": "BENCH_DIR\\tools\\planetiler-0.10.2.jar",
+      "bytes": 93278824,
+      "sha256": "f310bd0413e2e4512b27f4046d418664e8e1d3bf31603c2a70e23de06c167e4d"
+    },
+    "java_binary": {
+      "path": "BENCH_DIR\\tools\\java21\\jdk-21.0.12.1+1\\bin\\java.exe",
+      "bytes": 50304,
+      "sha256": "82051fdab26319d77d20cc0065045d05ec00b3e3d05f44935d7c06b96b621d55"
+    }
+  },
+  "command": [
+    "BENCH_DIR\\tools\\java21\\jdk-21.0.12.1+1\\bin\\java.exe",
+    "-Xmx4g",
+    "-jar",
+    "BENCH_DIR\\tools\\planetiler-0.10.2.jar",
+    "--osm-path=BENCH_DIR\\malopolskie\\input\\malopolskie.osm.pbf",
+    "--download-dir=BENCH_DIR\\malopolskie\\planetiler-sources",
+    "--output=BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\basemap.pmtiles",
+    "--tmpdir=BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\tmp",
+    "--threads=4",
+    "--minzoom=0",
+    "--maxzoom=14",
+    "--render-maxzoom=14"
+  ],
+  "working_directory": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler",
+  "runtime_arguments": {
+    "config": "null",
+    "download_dir": "BENCH_DIR\\malopolskie\\planetiler-sources",
+    "area": "monaco",
+    "madvise": "true",
+    "storage": "mmap",
+    "parallel_tmp_io": "false",
+    "threads": "4",
+    "write_threads": "1",
+    "process_threads": "4",
+    "bounds": "null",
+    "polygon": "null",
+    "minzoom": "0",
+    "maxzoom": "14",
+    "render_maxzoom": "14",
+    "tmpdir": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\tmp",
+    "extra_name_tags": "",
+    "mlt_advanced": "false",
+    "feature_read_threads": "1",
+    "tile_write_threads": "1",
+    "loginterval": "10 seconds",
+    "force": "false",
+    "append": "false",
+    "compress_temp": "false",
+    "mmap_temp": "true",
+    "sort_max_readers": "6",
+    "sort_max_writers": "6",
+    "nodemap_type": "sparsearray",
+    "nodemap_storage": "mmap",
+    "nodemap_madvise": "true",
+    "multipolygon_geometry_storage": "mmap",
+    "multipolygon_geometry_madvise": "true",
+    "http_user_agent": "Planetiler downloader",
+    "http_timeout": "30 seconds",
+    "http_retries": "5",
+    "http_retry_wait": "5 seconds",
+    "download_chunk_size_mb": "100",
+    "download_threads": "1",
+    "download_max_bandwidth": "",
+    "min_feature_size_at_max_zoom": "0.0625",
+    "min_feature_size": "1.0",
+    "simplify_tolerance_at_max_zoom": "0.0625",
+    "simplify_tolerance": "0.1",
+    "osm_lazy_reads": "true",
+    "skip_filled_tiles": "false",
+    "tile_warning_size_mb": "1.0",
+    "color": "null",
+    "keep_unzipped": "false",
+    "tile_compression": "gzip",
+    "tile_format": "mvt",
+    "exclude_ids": "false",
+    "mlt_fastpfor": "false",
+    "mlt_fsst": "false",
+    "mlt_tessellate_polygons": "false",
+    "mlt_reorder_features": "false",
+    "mlt_shared_dict": "false",
+    "output_layerstats": "false",
+    "debug_url": "https://onthegomap.github.io/planetiler-demo/#{z}/{lat}/{lon}",
+    "tile_weights": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\tile_weights.tsv.gz",
+    "max_point_buffer": "Infinity",
+    "log_jts_exceptions": "false",
+    "feature_source_id_multiplier": "10",
+    "reuse_featuredb": "false",
+    "only_download": "false",
+    "tests": "null",
+    "download": "false",
+    "refresh_sources": "false",
+    "download_osm_tile_weights": "false",
+    "temp_nodes": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\tmp\\node.db",
+    "temp_multipolygons": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\tmp\\multipolygon.db",
+    "temp_features": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\tmp\\feature.db",
+    "osm_parse_node_bounds": "false",
+    "only_fetch_wikidata": "false",
+    "fetch_wikidata": "false",
+    "use_wikidata": "true",
+    "wikidata_cache": "BENCH_DIR\\malopolskie\\planetiler-sources\\wikidata_names.json",
+    "wikidata_max_age": "0 seconds",
+    "wikidata_update_limit": "0",
+    "lake_centerlines_path": "BENCH_DIR\\malopolskie\\planetiler-sources\\lake_centerline.shp.zip",
+    "refresh_lake_centerlines": "false",
+    "free_lake_centerlines_after_read": "false",
+    "water_polygons_path": "BENCH_DIR\\malopolskie\\planetiler-sources\\water-polygons-split-3857.zip",
+    "refresh_water_polygons": "false",
+    "free_water_polygons_after_read": "false",
+    "natural_earth_path": "BENCH_DIR\\malopolskie\\planetiler-sources\\natural_earth_vector.sqlite.zip",
+    "refresh_natural_earth": "false",
+    "free_natural_earth_after_read": "false",
+    "natural_earth_keep_unzipped": "false",
+    "osm_path": "BENCH_DIR\\malopolskie\\input\\malopolskie.osm.pbf",
+    "refresh_osm": "false",
+    "free_osm_after_read": "false",
+    "output": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\basemap.pmtiles",
+    "version": "false",
+    "transliterate": "true",
+    "languages": "af,am,ar,az,be,bg,bn,br,bs,ca,co,cs,cy,da,de,el,en,eo,es,et,eu,fa,fi,fr,fy,ga,gd,he,hi,hr,hu,hy,id,is,it,ja,ja_kana,ja_rm,ja-Latn,ja-Hira,ka,kk,kn,ko,ko-Latn,ku,la,lb,lt,lv,mk,mt,ml,nl,no,oc,pa,pnb,pl,pt,rm,ro,ru,sk,sl,sq,sr,sr-Latn,sv,ta,te,th,tok,tr,uk,ur,vi,zh,zh-Hant,zh-Hans",
+    "only_layers": "",
+    "exclude_layers": "",
+    "boundary_country_names": "true",
+    "boundary_osm_only": "false",
+    "transportation_z13_paths": "false",
+    "building_merge_z13": "true",
+    "transportation_name_brunnel": "false",
+    "transportation_name_size_for_shield": "false",
+    "transportation_name_limit_merge": "false",
+    "transportation_name_minor_refs": "false",
+    "help": "false",
+    "layer_stats": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\basemap.pmtiles.layerstats.tsv.gz",
+    "archive_name": "OpenMapTiles",
+    "archive_description": "A tileset showcasing all layers in OpenMapTiles. https://openmaptiles.org",
+    "archive_attribution": "<a href=\"https://www.openmaptiles.org/\" target=\"_blank\">&copy; OpenMapTiles</a> <a href=\"https://www.openstreetmap.org/copyright\" target=\"_blank\">&copy; OpenStreetMap contributors</a>",
+    "archive_version": "3.16.0",
+    "archive_type": "baselayer"
+  },
+  "repeat_argument_differences": {
+    "keys": [
+      "layer_stats",
+      "output",
+      "temp_features",
+      "temp_multipolygons",
+      "temp_nodes",
+      "tile_weights",
+      "tmpdir"
+    ],
+    "classification": "Only run-specific output/scratch/statistics paths differ; all other logged argument values identical.",
+    "evidence": "Hashed repeat01 and repeat02 stdout logs above; raw commands preserved in their measurement.json."
+  },
+  "language_policy": {
+    "languages": [
+      "af",
+      "am",
+      "ar",
+      "az",
+      "be",
+      "bg",
+      "bn",
+      "br",
+      "bs",
+      "ca",
+      "co",
+      "cs",
+      "cy",
+      "da",
+      "de",
+      "el",
+      "en",
+      "eo",
+      "es",
+      "et",
+      "eu",
+      "fa",
+      "fi",
+      "fr",
+      "fy",
+      "ga",
+      "gd",
+      "he",
+      "hi",
+      "hr",
+      "hu",
+      "hy",
+      "id",
+      "is",
+      "it",
+      "ja",
+      "ja_kana",
+      "ja_rm",
+      "ja-Latn",
+      "ja-Hira",
+      "ka",
+      "kk",
+      "kn",
+      "ko",
+      "ko-Latn",
+      "ku",
+      "la",
+      "lb",
+      "lt",
+      "lv",
+      "mk",
+      "mt",
+      "ml",
+      "nl",
+      "no",
+      "oc",
+      "pa",
+      "pnb",
+      "pl",
+      "pt",
+      "rm",
+      "ro",
+      "ru",
+      "sk",
+      "sl",
+      "sq",
+      "sr",
+      "sr-Latn",
+      "sv",
+      "ta",
+      "te",
+      "th",
+      "tok",
+      "tr",
+      "uk",
+      "ur",
+      "vi",
+      "zh",
+      "zh-Hant",
+      "zh-Hans"
+    ],
+    "transliterate": true,
+    "extra_name_tags": [],
+    "wikidata_requested": true,
+    "wikidata_effectively_available": false,
+    "wikidata_evidence": "stdout: no wikidata translations found, run with --fetch-wikidata to download",
+    "external_downloads_during_compile": false
+  },
+  "layer_policy": {
+    "only_layers": [],
+    "exclude_layers": [],
+    "addons": [],
+    "addons_evidence": "ExtraLayers.create returns empty List.of at pinned profile commit",
+    "layers": [
+      {
+        "name": "water",
+        "declared_default_buffer_pixels": 4.0,
+        "default_buffer_evidence_line": 102,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Water.java",
+          "sha256": "94f98f324900fb0a7eb662029a79099bc991f81d3609f3ef79446ed867c50aab",
+          "bytes": 11930
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          158,
+          167,
+          177,
+          178
+        ]
+      },
+      {
+        "name": "waterway",
+        "declared_default_buffer_pixels": 4.0,
+        "default_buffer_evidence_line": 201,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Waterway.java",
+          "sha256": "12afcbad57b94633c178139feecbb9f9e4a00df87647cc40564542337ba58188",
+          "bytes": 9374
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          132,
+          175,
+          179,
+          194,
+          202,
+          216,
+          223
+        ]
+      },
+      {
+        "name": "landcover",
+        "declared_default_buffer_pixels": 4.0,
+        "default_buffer_evidence_line": 293,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Landcover.java",
+          "sha256": "1faccec10eee282fbf13a9d67f678b0817fc1f3aa9ce4e5939179c921ebc8a40",
+          "bytes": 7771
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          114,
+          127,
+          128,
+          130
+        ]
+      },
+      {
+        "name": "landuse",
+        "declared_default_buffer_pixels": 4.0,
+        "default_buffer_evidence_line": 452,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Landuse.java",
+          "sha256": "dafe28179cbcbaa8d449e90b8310cae8966912129e839f4484094d5ddb712d46",
+          "bytes": 6180
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          101,
+          121,
+          126,
+          127,
+          130,
+          150
+        ]
+      },
+      {
+        "name": "mountain_peak",
+        "declared_default_buffer_pixels": 64.0,
+        "default_buffer_evidence_line": 548,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/MountainPeak.java",
+          "sha256": "42bb7cd7be62cf94864d4225339ce45f4dd85a4167e6ff732fce07a941355137",
+          "bytes": 8805
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          133,
+          154,
+          183,
+          192,
+          196,
+          199
+        ]
+      },
+      {
+        "name": "park",
+        "declared_default_buffer_pixels": 4.0,
+        "default_buffer_evidence_line": 632,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Park.java",
+          "sha256": "92da85c6765f3f90ee05b24eba2150cf8cd9402f54d00fb2e4b6cc032aea6f2c",
+          "bytes": 6513
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          100,
+          102,
+          115
+        ]
+      },
+      {
+        "name": "boundary",
+        "declared_default_buffer_pixels": 4.0,
+        "default_buffer_evidence_line": 695,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Boundary.java",
+          "sha256": "692e7df317a38a02bdf15966ee5a67e7afdbda8dcae31ec6bdfe2ba724ae4608",
+          "bytes": 21200
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          209,
+          211,
+          317,
+          321,
+          332,
+          335,
+          358,
+          364,
+          389
+        ]
+      },
+      {
+        "name": "aeroway",
+        "declared_default_buffer_pixels": 4.0,
+        "default_buffer_evidence_line": 805,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Aeroway.java",
+          "sha256": "bd5ce15caf0ba9e23ddee1892788d2f28c4885070740cb0e65672b57097eccd9",
+          "bytes": 3319
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          63
+        ]
+      },
+      {
+        "name": "transportation",
+        "declared_default_buffer_pixels": 4.0,
+        "default_buffer_evidence_line": 865,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Transportation.java",
+          "sha256": "65e16007811830e2746a9963d5e1ed17b369f9438a1a32c149772cec59964223",
+          "bytes": 33408
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          514,
+          538,
+          652,
+          660,
+          667,
+          676,
+          682,
+          690,
+          692,
+          704,
+          730
+        ]
+      },
+      {
+        "name": "building",
+        "declared_default_buffer_pixels": 4.0,
+        "default_buffer_evidence_line": 1221,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Building.java",
+          "sha256": "c7475e7e5acec869eafda24f0177b99c4689cf69a400ebd05341a20e32cc532c",
+          "bytes": 7586
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          164,
+          166,
+          174,
+          175,
+          184
+        ]
+      },
+      {
+        "name": "water_name",
+        "declared_default_buffer_pixels": 256.0,
+        "default_buffer_evidence_line": 1263,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/WaterName.java",
+          "sha256": "e6065403db494fb2eb2914f531aacb7b09d0bec8d4fc5ddf2bb0a86942c6aafb",
+          "bytes": 11122
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          209,
+          238,
+          249,
+          258
+        ]
+      },
+      {
+        "name": "transportation_name",
+        "declared_default_buffer_pixels": 8.0,
+        "default_buffer_evidence_line": 1340,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/TransportationName.java",
+          "sha256": "d85a221d723156f1bfc6d541bda3a12e11f6f773198c6389fb453008d4e75eb0",
+          "bytes": 16305
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          199,
+          257,
+          258,
+          268,
+          318,
+          319,
+          323,
+          333,
+          334,
+          337,
+          356
+        ]
+      },
+      {
+        "name": "place",
+        "declared_default_buffer_pixels": 256.0,
+        "default_buffer_evidence_line": 1612,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Place.java",
+          "sha256": "d524a7d0607b7db774ec2772ad8edd8ac9aa97ec6ec8d0a902bdd089b2ce2ce6",
+          "bytes": 18229
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          206,
+          244,
+          270,
+          292,
+          306,
+          353,
+          382
+        ]
+      },
+      {
+        "name": "housenumber",
+        "declared_default_buffer_pixels": 8.0,
+        "default_buffer_evidence_line": 1736,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Housenumber.java",
+          "sha256": "d5c9b0e32d693b319fe6033a389e57869a10b2ca00bdd6fdff823ed8ca4c8821",
+          "bytes": 6432
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          136
+        ]
+      },
+      {
+        "name": "poi",
+        "declared_default_buffer_pixels": 64.0,
+        "default_buffer_evidence_line": 1768,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/Poi.java",
+          "sha256": "57de69c08d5bbb51f7151228cdaade2ff5fea2430dc8e92dcdd36967bb2afac2",
+          "bytes": 14357
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          310,
+          314
+        ]
+      },
+      {
+        "name": "aerodrome_label",
+        "declared_default_buffer_pixels": 64.0,
+        "default_buffer_evidence_line": 2012,
+        "implementation": {
+          "path": "src/main/java/org/openmaptiles/layers/AerodromeLabel.java",
+          "sha256": "9e09cd1801b070753b47b4b6d59634752cad3d864dfae509f30e851a798374c0",
+          "bytes": 3673
+        },
+        "policy_inventory_complete": false,
+        "native_parity_status": "unsupported",
+        "profile_policy_evidence_lines": [
+          75
+        ]
+      }
+    ]
+  },
+  "bounds_policy": {
+    "explicit_bounds": null,
+    "polygon": null,
+    "osm_parse_node_bounds": false,
+    "effective_envelope_wsen": [
+      18.87522,
+      49.02835,
+      21.43328,
+      50.53221
+    ],
+    "evidence": "stdout: Setting map bounds from input",
+    "clip_equivalence_with_native": "unproven; same absent bounds flag does not imply same geometry clipping"
+  },
+  "resource_policy": {
+    "jvm_max_heap_flag": "-Xmx4g",
+    "configured_threads": 4,
+    "write_threads": 1,
+    "process_threads": 4,
+    "sort_max_readers": 6,
+    "sort_max_writers": 6,
+    "sort_chunk_logged_decimal_mb": 1431,
+    "sort_chunk_exact_bytes": null,
+    "sort_max_workers_logged": 4,
+    "sort_worker_caveat": "Observed sort pipeline has one worker. Constructor caps this.workers=min(workers,max(1,(heap/3)/chunkSize)); startup log prints input workers=4, not capped field. Pipeline worker count does not establish internal parallelSort thread count.",
+    "sort_chunk_formula": "min(2000000000, JVM max heap bytes / 3)",
+    "storage": "mmap",
+    "compress_temp": false,
+    "mmap_temp": true,
+    "madvise_requested": true,
+    "madvise_available": false,
+    "disk_limit_bytes": null,
+    "disk_limit_note": "No disk cap requested; logged preflight estimates are estimates, not limits or peak disk measurement.",
+    "heap_is_rss_limit": false,
+    "harness_tree_rss_limit_gib": 9,
+    "observed_sort_pipeline_workers": 1,
+    "observed_sort_pipeline_workers_evidence": {
+      "log": "BENCH_DIR\\compiler-parity-20260926\\after-two-repeats\\repeat-01\\planetiler\\stdout.log",
+      "line": 239,
+      "text": "\u001b[m\u001b[0m0:01:02 INF [sort] -   worker  1x(62% 2s)"
+    },
+    "internal_parallel_sort_thread_count": null
+  },
+  "native_compatibility": {
+    "observed_native_schema": "TacticalV7",
+    "native_evidence": "osm-tile-compiler/src/lib.rs PublishedSchema enum; omt-target.json per-layer unsupported statuses",
+    "matchable_now": [
+      "identical PBF bytes",
+      "physical min/max zoom 0/14 and retained detail ceiling14",
+      "configured worker counts (not identical thread topology)",
+      "PMTiles MVT tile compression gzip"
+    ],
+    "not_matched_now": [
+      "16-layer OMT feature selection, attributes, ranking and merging",
+      "supplemental Natural Earth/ocean/lake-centerline ingestion",
+      "exact language/transliteration policy",
+      "per-layer/per-feature buffers and simplification/min-size rules",
+      "source-derived clipping semantics",
+      "feature ID multiplier and source-id policy",
+      "OMT-only output without tactical annotations",
+      "JVM memory/storage policies (implementation-specific resource controls)"
+    ],
+    "machine_readiness": "unsupported",
+    "constraints": [
+      "Do not map Tactical layers to OMT names and claim equivalent work.",
+      "Do not run or label a matched benchmark until actual native OMT output implements the pinned source policies and all unknown workload-affecting settings are resolved.",
+      "Compression bytes and buffers must be compared in explicit units; gzip type equality alone is insufficient."
+    ],
+    "matched_run_ready": false
+  },
+  "unknowns": [
+    {
+      "field": "per_feature_effective_geometry_policy",
+      "reason": "Source expressions are inventoried but all conditionals/zoom functions have not been expanded into a complete feature-class-by-zoom table.",
+      "classification": "workload_semantics"
+    },
+    {
+      "field": "sort_chunk_exact_bytes_and_internal_parallel_sort_threads",
+      "reason": "Logs round chunk size; exact runtime max heap value and internal parallelSort thread count absent. Sort pipeline one-worker count is observed separately.",
+      "classification": "performance_provenance"
+    },
+    {
+      "field": "JVM_GC_and_native_library_versions",
+      "reason": "Only executable hash and jar buildinfo pinned here, not complete runtime library tree or GC ergonomics.",
+      "classification": "performance_provenance",
+      "blocks_semantic_workload_matching": false
+    },
+    {
+      "field": "full_output_layer_inventory",
+      "reason": "Schema registration lists16 layers; whether every layer has emitted features is data-dependent and requires archive inventory.",
+      "classification": "output_validation"
+    }
+  ],
+  "coordinate_units": {
+    "planetiler_tile_extent": 4096,
+    "planetiler_profile_pixel_size": 256,
+    "planetiler_profile_pixel_to_mvt_unit_multiplier": 16,
+    "native_tile_extent": 4096,
+    "native_tile_buffer_named_pixels_but_mvt_units": 64,
+    "native_buffer_in_planetiler_profile_pixels": 4,
+    "native_evidence": "osm-tile-compiler/src/tile_slicer.rs:16-18",
+    "planetiler_evidence": {
+      "jar_entry": "com/onthegomap/planetiler/VectorTile.java",
+      "sha256": "fa4daf4bb65027b3c4a72c6f7f281185712511679039ab1ddd03380bdecea21c"
+    },
+    "caveat": "Native global64 MVT units matches only a4 profile-pixel buffer numerically. It does not match 8/64/256 profile-pixel label buffers or source/zoom-specific overrides."
+  },
+  "compression_policy": {
+    "tile_format": "mvt",
+    "tile_compression": "gzip",
+    "planetiler_encoder": "java.util.zip.GZIPOutputStream default Deflater compression; numeric zlib level not explicitly set in profile",
+    "planetiler_evidence": [
+      {
+        "jar_entry": "com/onthegomap/planetiler/archive/TileArchiveWriter.java",
+        "sha256": "1d1c19028038289bab7de4a8d6b74d20c507e94eacf30dd7d116b31d74ca54f1"
+      },
+      {
+        "jar_entry": "com/onthegomap/planetiler/util/Gzip.java",
+        "sha256": "a8a85cb23a89d67354be830f98dbd4715fcd5114848d94da335c3c1e370c81be"
+      }
+    ],
+    "native_mvt_encoder": "flate2::write::GzEncoder with flate2::Compression::default()",
+    "native_mvt_evidence": "former in-tree tile codec, mvt.rs:146",
+    "native_annotation_encoder": "flate2::GzBuilder with Compression::fast() (separate non-MVT companion)",
+    "native_annotation_evidence": "osm-tile-compiler/src/annotations.rs:502-504",
+    "identical_compression_strategy_established": false,
+    "backend_versions_and_stream_byte_equivalence": "unknown; default level policies alone do not prove identical implementation, output bytes or CPU work"
+  },
+  "runtime_argument_evidence_lines": {
+    "config": 1,
+    "download_dir": 2,
+    "area": 3,
+    "madvise": 5,
+    "storage": 6,
+    "parallel_tmp_io": 7,
+    "threads": 8,
+    "write_threads": 9,
+    "process_threads": 10,
+    "bounds": 11,
+    "polygon": 12,
+    "minzoom": 13,
+    "maxzoom": 14,
+    "render_maxzoom": 15,
+    "tmpdir": 16,
+    "extra_name_tags": 17,
+    "mlt_advanced": 18,
+    "feature_read_threads": 19,
+    "tile_write_threads": 20,
+    "loginterval": 21,
+    "force": 22,
+    "append": 23,
+    "compress_temp": 24,
+    "mmap_temp": 25,
+    "sort_max_readers": 26,
+    "sort_max_writers": 27,
+    "nodemap_type": 28,
+    "nodemap_storage": 29,
+    "nodemap_madvise": 30,
+    "multipolygon_geometry_storage": 31,
+    "multipolygon_geometry_madvise": 32,
+    "http_user_agent": 33,
+    "http_timeout": 34,
+    "http_retries": 35,
+    "http_retry_wait": 36,
+    "download_chunk_size_mb": 37,
+    "download_threads": 38,
+    "download_max_bandwidth": 39,
+    "min_feature_size_at_max_zoom": 40,
+    "min_feature_size": 41,
+    "simplify_tolerance_at_max_zoom": 42,
+    "simplify_tolerance": 43,
+    "osm_lazy_reads": 44,
+    "skip_filled_tiles": 45,
+    "tile_warning_size_mb": 46,
+    "color": 47,
+    "keep_unzipped": 48,
+    "tile_compression": 49,
+    "tile_format": 50,
+    "exclude_ids": 51,
+    "mlt_fastpfor": 52,
+    "mlt_fsst": 53,
+    "mlt_tessellate_polygons": 54,
+    "mlt_reorder_features": 55,
+    "mlt_shared_dict": 56,
+    "output_layerstats": 57,
+    "debug_url": 58,
+    "tile_weights": 59,
+    "max_point_buffer": 60,
+    "log_jts_exceptions": 61,
+    "feature_source_id_multiplier": 62,
+    "reuse_featuredb": 63,
+    "only_download": 64,
+    "tests": 65,
+    "download": 66,
+    "refresh_sources": 67,
+    "download_osm_tile_weights": 68,
+    "temp_nodes": 69,
+    "temp_multipolygons": 70,
+    "temp_features": 71,
+    "osm_parse_node_bounds": 72,
+    "only_fetch_wikidata": 73,
+    "fetch_wikidata": 74,
+    "use_wikidata": 75,
+    "wikidata_cache": 76,
+    "wikidata_max_age": 77,
+    "wikidata_update_limit": 78,
+    "lake_centerlines_path": 79,
+    "refresh_lake_centerlines": 80,
+    "free_lake_centerlines_after_read": 81,
+    "water_polygons_path": 82,
+    "refresh_water_polygons": 83,
+    "free_water_polygons_after_read": 84,
+    "natural_earth_path": 85,
+    "refresh_natural_earth": 86,
+    "free_natural_earth_after_read": 87,
+    "natural_earth_keep_unzipped": 88,
+    "osm_path": 89,
+    "refresh_osm": 90,
+    "free_osm_after_read": 91,
+    "output": 93,
+    "version": 94,
+    "transliterate": 98,
+    "languages": 99,
+    "only_layers": 100,
+    "exclude_layers": 101,
+    "boundary_country_names": 102,
+    "boundary_osm_only": 103,
+    "transportation_z13_paths": 104,
+    "building_merge_z13": 105,
+    "transportation_name_brunnel": 106,
+    "transportation_name_size_for_shield": 107,
+    "transportation_name_limit_merge": 108,
+    "transportation_name_minor_refs": 109,
+    "help": 110,
+    "layer_stats": 111,
+    "archive_name": 136,
+    "archive_description": 137,
+    "archive_attribution": 138,
+    "archive_version": 139,
+    "archive_type": 140
+  }
+}

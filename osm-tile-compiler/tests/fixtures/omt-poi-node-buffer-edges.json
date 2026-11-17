@@ -1,0 +1,45 @@
+{
+  "source_input_sha256": "4c3a6b117c6d1e79f7fbaae4efc8d8565866a3ea1c075488fb04746acec1c971",
+  "pinned_planetiler_jar_sha256": "f310bd0413e2e4512b27f4046d418664e8e1d3bf31603c2a70e23de06c167e4d",
+  "cases": [
+    {
+      "id": 281710618,
+      "lon": 20.4290767,
+      "lat": 49.4405695,
+      "tags": {
+        "amenity": "drinking_water",
+        "man_made": "water_well",
+        "name": "Zdrój Ziemroźka",
+        "pump": "powered",
+        "tourism": "attraction",
+        "water_characteristic": "mineral"
+      },
+      "absent_neighbor_tiles": [
+        [
+          9122,
+          5595
+        ],
+        [
+          9122,
+          5596
+        ]
+      ]
+    },
+    {
+      "id": 2684283884,
+      "lon": 19.5008869,
+      "lat": 49.9406155,
+      "tags": {
+        "bus": "yes",
+        "highway": "bus_stop",
+        "public_transport": "platform"
+      },
+      "absent_neighbor_tiles": [
+        [
+          9079,
+          5561
+        ]
+      ]
+    }
+  ]
+}

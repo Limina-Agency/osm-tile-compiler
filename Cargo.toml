@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["osm-tile-compiler"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Limina-Agency/osm-tile-compiler"
+rust-version = "1.95"
+
+[workspace.dependencies]
+bincode = "1.3"
+fast-mvt = { version = "0.7.2", default-features = false, features = ["reader", "writer"] }
+flate2 = { version = "1.1", features = ["zlib-rs"] }
+geo = { version = "0.33.1", default-features = false }
+geo-types = { version = "0.7.20", default-features = false }
+geojson = "1.0"
+osm-pbf-ingest = "0.1.0"
+pmtiles = { version = "0.25.0", default-features = false }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sha2 = "0.11"
+tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+
+# geo's relate debug-asserts on some valid polygon pairs whose rings touch
+# (polygon_validity's polygons_conflict_matches_geo_relate finds them). Release
+# builds compile the assertion out, so tests build geo the same way.
+[profile.dev.package.geo]
+debug-assertions = false
+
+[workspace.lints.rust]
+dead_code = "warn"
+unused_imports = "warn"
+unused_must_use = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
