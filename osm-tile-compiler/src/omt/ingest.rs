@@ -68,7 +68,7 @@ fn junction_highway_rank(highway: &str) -> u8 {
 // Match the four OMT preprocessOsmRelation handlers. OsmReader only adds way
 // memberships to its multimap when at least one handler returns relation info.
 fn profile_relation_eligible(relation: &NormalizedRelation) -> bool {
-    let tag = |key| relation.tags.get(key).map(|value| value.as_str());
+    let tag = |key| relation.tags.get(key);
     let building = tag("type") == Some("building");
     let waterway =
         tag("waterway") == Some("river") && tag("name").is_some_and(|name| !name.is_empty());
@@ -477,7 +477,7 @@ impl Pass2Sink for SourceSink<'_> {
 }
 
 fn is_junction(tags: &NodeTags) -> bool {
-    tags.get("highway").map(|v| v.as_str()) == Some("motorway_junction")
+    tags.get("highway") == Some("motorway_junction")
 }
 
 fn node_source(n: &NormalizedNode) -> Result<Source, String> {
@@ -608,7 +608,7 @@ impl Index {
             {
                 members.push((way.way_id, ordinal, way.node_ids.clone()));
             }
-            let highway = way.tags.get("highway").map(|v| v.as_str()).unwrap_or("");
+            let highway = way.tags.get("highway").unwrap_or("");
             let rank = junction_highway_rank(highway);
             if rank > 0 {
                 for id in &way.node_ids {
@@ -668,7 +668,7 @@ impl Index {
         relation: &NormalizedRelation,
         member_ways: &HashMap<i64, Vec<i64>>,
     ) -> Result<Option<Source>, String> {
-        let kind = relation.tags.get("type").map(|v| v.as_str()).unwrap_or("");
+        let kind = relation.tags.get("type").unwrap_or("");
         if !matches!(kind, "multipolygon" | "boundary" | "land_area") {
             return Ok(None);
         }
@@ -1152,8 +1152,8 @@ mod tests {
         let relation = |relation_id, way_id, eligible| {
             let mut tags = NodeTags::default();
             if eligible {
-                tags.insert("route".into(), "hiking".into());
-                tags.insert("network".into(), "rwn".into());
+                tags.insert("route", "hiking");
+                tags.insert("network", "rwn");
             }
             NormalizedRelation {
                 relation_id,
@@ -1224,7 +1224,7 @@ mod tests {
         let relation = |pairs: &[(&str, &str)]| {
             let mut tags = NodeTags::default();
             for (key, value) in pairs {
-                tags.insert((*key).into(), (*value).into());
+                tags.insert(key, value);
             }
             NormalizedRelation {
                 relation_id: 1,

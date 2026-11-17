@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2 (2026-11-17)
+
+- OSM is read with `osm-pbf-ingest` 0.2, which no longer depends on
+  `osmpbfreader` at runtime. The unmaintained `smartstring`, and `futures`
+  0.1, `par-map`, `protobuf` and the crates under WTFPL and MPL-2.0 with it,
+  are out of the binary; `deny.toml` needs no exceptions. The tiles are
+  unchanged.
+
 ## 0.1.1 (2026-11-17)
 
 - `CompileError` says what went wrong, and is `#[non_exhaustive]`:

@@ -16,12 +16,6 @@ targets = [
 
 [advisories]
 version = 2
-ignore = [
-    # smartstring is unmaintained (not a vulnerability). It comes in through
-    # osmpbfreader, a dependency of osm-pbf-ingest; drop this once the ingest
-    # no longer depends on it.
-    { id = "RUSTSEC-2026-0249", reason = "unmaintained, via osm-pbf-ingest's osmpbfreader; no safe upgrade" },
-]
 
 [licenses]
 version = 2
@@ -36,9 +30,7 @@ allow = [
     "0BSD",
     "Unicode-3.0",
     "Unlicense",
-    "WTFPL",
     "CDLA-Permissive-2.0",
-    "MPL-2.0",
 ]
 
 [bans]
