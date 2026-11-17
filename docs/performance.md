@@ -24,7 +24,7 @@ threads), 15 GiB of RAM, Linux, NVMe (btrfs), load under 3 at the start of
 every run. One compile per process, through an app's compile host, which
 calls `compile_basemap` with building levels on, the system allocator (no
 mimalloc) and the real supplemental datasets, already unpacked and in the
-page cache. These are Linux numbers; the Mac's are still to be taken.
+page cache. These are Linux numbers; Apple silicon follows below.
 
 | Extract | Threads | Time | Peak RSS | Peak anonymous | Peak scratch disk | Basemap + building levels |
 |---|---|---|---|---|---|---|
@@ -53,6 +53,32 @@ page cache. These are Linux numbers; the Mac's are still to be taken.
 - The supplemental datasets, once unpacked and cached, cost an inland
   region almost nothing in time or memory; they cost disk: 1.45 GB of
   downloads unpacked into another 2.23 GB.
+
+## On Apple silicon
+
+Measured on 2026-11-17 on an Apple M5 (10 cores, 16 GB, macOS 27.2.1), in
+a throwaway SwiftUI app on the iOS 27 simulator (iPhone 18 Pro), which runs
+on the Mac's CPU. The app calls `compile_basemap` through a static library
+(system allocator) on 4 threads, with the extract and the supplemental
+datasets in its Documents folder. Małopolskie is Geofabrik's extract of
+2026-11-02 (194 MiB). Peak RSS is the whole app's, SwiftUI included.
+
+| Run | Time | Peak RSS | Basemap + building levels |
+|---|---|---|---|
+| Datasets and building levels, first run (extracts the datasets) | 26.7 s | 890 MiB | 146.3 + 26.3 MiB |
+| Datasets and building levels, datasets already extracted | 20.5 s | 871 MiB | 146.3 + 26.3 MiB |
+| No supplemental datasets, no building levels | 20.9 s | 845 MiB | 146.1 MiB |
+| macOS command line (mimalloc), as the second run | 16.1 s | 783 MiB | the same bytes as the simulator's |
+
+- Stages of the second run: `read_sources` 0.9 s (8.7 s in the first,
+  extracting), `index_osm` 0.6 s, `read_osm` 8.8 s, `write_tiles` 8.9 s,
+  `building_levels` 1.1 s.
+- Every archive passed `verify`'s checks, and the scratch directory was
+  empty afterwards.
+- Monaco (`fixtures/monaco.osm.pbf`, no supplemental datasets) took 0.13 s
+  in the simulator, again byte-identical to macOS.
+- A phone has not been measured: its CPU is slower than the Mac's and its
+  memory limit stricter.
 
 ## Cancelling
 

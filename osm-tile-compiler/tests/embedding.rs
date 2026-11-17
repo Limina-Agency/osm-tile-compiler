@@ -236,7 +236,7 @@ fn compiles_without_supplemental_datasets_and_says_so() {
     let mut incomplete = request(&temp.path().join("incomplete"), &missing, 2);
     incomplete.omit_sources = vec![SupplementalDataset::WaterPolygons];
     match compile_basemap(&incomplete, |_| {}, || false) {
-        Err(CompileError::Failed(message)) => assert!(
+        Err(CompileError::InvalidRequest(message)) => assert!(
             message.contains("lake_centerline.shp.zip")
                 && message.contains("natural_earth_vector.sqlite.zip")
                 && !message.contains("water-polygons"),
@@ -340,19 +340,21 @@ fn a_failed_compile_reports_the_failure_and_cleans_up() {
     let mut request = request(temp.path(), &sources, 1);
     request.input_pbf = temp.path().join("missing.osm.pbf");
     match compile_basemap(&request, |_| {}, || false) {
-        Err(CompileError::Failed(message)) => assert!(message.contains("missing.osm.pbf")),
+        Err(CompileError::InvalidRequest(message)) => assert!(message.contains("missing.osm.pbf")),
         other => panic!("{other:?}"),
     }
     request.input_pbf = monaco_pbf();
     request.threads = 0;
     assert!(matches!(
         compile_basemap(&request, |_| {}, || false),
-        Err(CompileError::Failed(_))
+        Err(CompileError::InvalidRequest(_))
     ));
     request.threads = 1;
     request.exclude_layers = Some(vec!["roads".into()]);
     match compile_basemap(&request, |_| {}, || false) {
-        Err(CompileError::Failed(message)) => assert!(message.contains("roads"), "{message}"),
+        Err(CompileError::InvalidRequest(message)) => {
+            assert!(message.contains("roads"), "{message}")
+        }
         other => panic!("{other:?}"),
     }
     assert!(!request.temp_dir.exists());

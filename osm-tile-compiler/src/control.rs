@@ -22,31 +22,96 @@ const THROTTLE: Duration = Duration::from_millis(200);
 /// turns any failure after a cancel into [`CompileError::Cancelled`].
 pub(crate) const CANCELLED: &str = "The compile was cancelled";
 
-/// Why a compile or a download did not finish.
+/// Why a compile or a download did not finish. Whatever the kind,
+/// temporary files and partial outputs have been removed, and each message
+/// is in words fit to show.
+///
+/// More kinds may be added in later versions, so match with a wildcard arm,
+/// or use [`kind`](Self::kind).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompileError {
-    /// The cancel callback asked to stop. Temporary files and partial
-    /// outputs have been removed.
+    /// The cancel callback asked to stop.
     Cancelled,
-    /// Anything else, in words fit to show. Temporary files and partial
-    /// outputs have been removed.
-    Failed(String),
+    /// The request cannot run as given, found before any stage started: an
+    /// unknown layer or language, no threads, an output that already exists,
+    /// a PBF or polygon that cannot be opened or read, or supplemental
+    /// datasets missing when the request does not fetch them.
+    InvalidRequest(String),
+    /// Downloading or verifying a supplemental dataset failed: the network,
+    /// the server, or a file that does not match its pinned hash.
+    Download(String),
+    /// A write failed because the disk is full.
+    OutOfSpace(String),
+    /// Anything else, with the stage it happened in, if one had started:
+    /// for example a PBF that turns out corrupt while it is read.
+    Failed {
+        stage: Option<CompileStage>,
+        message: String,
+    },
+}
+
+impl CompileError {
+    /// A stable identifier for the kind: `cancelled`, `invalid_request`,
+    /// `download`, `out_of_space` or `failed`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::InvalidRequest(_) => "invalid_request",
+            Self::Download(_) => "download",
+            Self::OutOfSpace(_) => "out_of_space",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    /// The message, in words fit to show.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Cancelled => CANCELLED,
+            Self::InvalidRequest(message)
+            | Self::Download(message)
+            | Self::OutOfSpace(message)
+            | Self::Failed { message, .. } => message,
+        }
+    }
+
+    /// Sorts a failure by where it happened: before any stage, it is the
+    /// request's; in `FetchSources`, the download's. A full disk is
+    /// recognised by its OS error code wherever it happens.
+    pub(crate) fn classify(message: String, stage: Option<CompileStage>) -> Self {
+        if is_out_of_space(&message) {
+            return Self::OutOfSpace(message);
+        }
+        match stage {
+            None => Self::InvalidRequest(message),
+            Some(CompileStage::FetchSources) => Self::Download(message),
+            stage => Self::Failed { stage, message },
+        }
+    }
+}
+
+/// Whether `message` carries the OS error for a full disk, as
+/// `std::io::Error` writes it: ENOSPC is 28 on Linux, macOS and iOS;
+/// Windows has ERROR_HANDLE_DISK_FULL (39) and ERROR_DISK_FULL (112).
+fn is_out_of_space(message: &str) -> bool {
+    let codes: &[i32] = if cfg!(windows) { &[39, 112] } else { &[28] };
+    codes
+        .iter()
+        .any(|code| message.contains(&format!("(os error {code})")))
 }
 
 impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cancelled => f.write_str(CANCELLED),
-            Self::Failed(message) => f.write_str(message),
-        }
+        f.write_str(self.message())
     }
 }
 
 impl std::error::Error for CompileError {}
 
+/// A failure found before the compile started is the request's.
 impl From<String> for CompileError {
     fn from(message: String) -> Self {
-        Self::Failed(message)
+        Self::classify(message, None)
     }
 }
 
@@ -232,6 +297,12 @@ impl Control {
         }
     }
 
+    /// The stage running, or `None` before the first one starts.
+    fn current_stage(&self) -> Option<CompileStage> {
+        let started = lock(&self.message).0 > 0;
+        started.then(|| CompileStage::from_index(self.stage.load(Ordering::Relaxed)))
+    }
+
     /// Starts `stage`, with no fraction until [`Self::set_total`]. Waits
     /// until the monitor has reported it and asked whether to cancel, so
     /// every stage is reported and a cancel asked for on its report stops
@@ -322,13 +393,18 @@ pub(crate) fn run<T: Send>(
     work: impl FnOnce(&Control) -> Result<T, String> + Send,
 ) -> Result<T, CompileError> {
     if threads == 0 {
-        return Err(CompileError::Failed("threads must be positive".into()));
+        return Err(CompileError::InvalidRequest(
+            "threads must be positive".into(),
+        ));
     }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|index| format!("osm-tile-compile-{index}"))
         .build()
-        .map_err(|e| CompileError::Failed(format!("Failed to start {threads} threads: {e}")))?;
+        .map_err(|e| CompileError::Failed {
+            stage: None,
+            message: format!("Failed to start {threads} threads: {e}"),
+        })?;
     let control = Control::new(Some(std::thread::current()), building_levels);
     let finished = AtomicBool::new(false);
     let mut result = None;
@@ -376,7 +452,7 @@ pub(crate) fn run<T: Send>(
     match result.expect("the work ran to completion") {
         Ok(value) => Ok(value),
         Err(_) if control.is_cancelled() => Err(CompileError::Cancelled),
-        Err(message) => Err(CompileError::Failed(message)),
+        Err(message) => Err(CompileError::classify(message, control.current_stage())),
     }
 }
 
@@ -401,5 +477,64 @@ impl Drop for RemoveOnDrop {
         if let Some(path) = self.path.take() {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failures_are_classified_by_where_they_happen() {
+        let classify = |message: &str, stage| CompileError::classify(message.into(), stage);
+        assert_eq!(
+            classify("unknown layer 'roads'", None),
+            CompileError::InvalidRequest("unknown layer 'roads'".into())
+        );
+        assert_eq!(
+            classify("connection refused", Some(CompileStage::FetchSources)),
+            CompileError::Download("connection refused".into())
+        );
+        assert_eq!(
+            classify("bad block", Some(CompileStage::ReadOsm)),
+            CompileError::Failed {
+                stage: Some(CompileStage::ReadOsm),
+                message: "bad block".into()
+            }
+        );
+        let full = std::io::Error::from_raw_os_error(if cfg!(windows) { 112 } else { 28 });
+        let message = format!("Failed to write tile run: {full}");
+        assert_eq!(
+            classify(&message, Some(CompileStage::WriteTiles)),
+            CompileError::OutOfSpace(message.clone())
+        );
+        assert_eq!(classify(&message, None).kind(), "out_of_space");
+    }
+
+    #[test]
+    fn kinds_are_stable() {
+        let failed = CompileError::Failed {
+            stage: None,
+            message: "x".into(),
+        };
+        let kinds = [
+            CompileError::Cancelled,
+            CompileError::InvalidRequest("x".into()),
+            CompileError::Download("x".into()),
+            CompileError::OutOfSpace("x".into()),
+            failed,
+        ]
+        .map(|error| error.kind());
+        assert_eq!(
+            kinds,
+            [
+                "cancelled",
+                "invalid_request",
+                "download",
+                "out_of_space",
+                "failed"
+            ]
+        );
+        assert_eq!(CompileError::Cancelled.to_string(), CANCELLED);
     }
 }

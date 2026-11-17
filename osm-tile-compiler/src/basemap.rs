@@ -188,6 +188,13 @@ pub fn pbf_bounds(input: &Path) -> Result<CompileBounds, String> {
 ///
 /// The library prints nothing, never exits the process, and installs no
 /// allocator; paths are used as given, so pass absolute ones.
+///
+/// That clean-up relies on unwinding: a panic in the compile is caught and
+/// returned as [`CompileError::Failed`]. In a build with `panic = "abort"`,
+/// common in mobile release profiles, a panic ends the app instead. Its
+/// scratch directory (`<temp_dir>/compile-<pid>-<n>`) then stays until the
+/// app clears `temp_dir`, for example at launch, before starting a compile;
+/// the next compile to the same output removes the abandoned partial archive.
 pub fn compile_basemap(
     request: &BasemapRequest,
     progress: impl FnMut(&CompileProgress),
@@ -205,7 +212,7 @@ pub fn compile_basemap(
     ];
     for archive in archives.into_iter().flatten() {
         if archive.exists() {
-            return Err(CompileError::Failed(format!(
+            return Err(CompileError::InvalidRequest(format!(
                 "refusing to replace existing archive {}",
                 archive.display()
             )));

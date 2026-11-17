@@ -5,8 +5,9 @@
 2. Bump the workspace version and update `CHANGELOG.md`.
 3. Tag `v<version>` and push the tag. The release workflow refuses a tag that does
    not match the crate version, runs the CI checks, then builds the compiler
-   binary for Linux (x86_64 and arm64) and attaches the archives and their
-   SHA-256 checksums to the GitHub release.
+   binary for Linux (x86_64 and arm64), macOS (arm64 and x86_64) and Windows
+   (x86_64) and attaches the archives and their SHA-256 checksums to the
+   GitHub release.
 4. Publish `osm-tile-compiler` to crates.io.
 
 Each archive carries `THIRD-PARTY-LICENSES`, the licenses of the crates

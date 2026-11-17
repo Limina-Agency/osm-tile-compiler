@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.1 (2026-11-17)
+
+- `CompileError` says what went wrong, and is `#[non_exhaustive]`:
+  `InvalidRequest` (found before any work), `Download`, `OutOfSpace`, or
+  `Failed { stage, message }`, with `kind()` and `message()`. Code that
+  matched `Failed(message)` needs a change; 0.1.0 was out for a few hours.
+- The worker's error events carry `errorKind`, one of those kinds.
+- Release binaries for macOS (arm64 and x86_64) and Windows (x86_64), besides
+  Linux.
+- CI checks the declared minimum Rust (1.95), builds the library for iOS
+  devices and the simulator, and runs `cargo deny`; its actions are pinned by
+  commit.
+- One changelog: this file. The crate no longer ships an internal
+  development log.
+- Documentation: what `panic = "abort"` means for the clean-up, which setup
+  each README figure comes from, measurements on Apple silicon (macOS and the
+  iOS simulator), and no references to pull requests or commits outside this
+  repository.
+
 ## 0.1.0 (2026-11-17)
 
 First public release: OpenMapTiles-schema basemaps from OSM PBF into PMTiles,

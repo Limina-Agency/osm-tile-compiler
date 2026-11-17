@@ -21,8 +21,7 @@ deliberate and explained in its pull request.
    (`benchmarks/compiler-parity/setup-linux.sh`); results in
    `docs/parity.md`.
 2. ~~Define the parity bar~~: proposed in `docs/parity.md`.
-3. ~~Close the differences the 2026-11-03 baseline lists~~ (#7, #8, #13,
-   #14, #15); what is left, and the accepted differences, are in
+3. ~~Close the differences the 2026-11-03 baseline lists~~; what is left, and the accepted differences, are in
    `docs/parity.md`.
 4. ~~Add two or three regions to the comparison~~: Berlin and Pomorskie, in
    `docs/parity.md`, with the differences they add.
@@ -31,18 +30,18 @@ deliberate and explained in its pull request.
 ## Lane B — Area and extent (no content change)
 
 1. ~~`--polygon <file.geojson|.poly>`: emit only tiles touching the polygon, as
-   Planetiler does; also filter the supplemental datasets by it.~~ (#4)
+   Planetiler does; also filter the supplemental datasets by it.~~
 2. ~~Bounds crossing the antimeridian (`west > east`): two tile ranges.~~
    Also polygons crossing it, and wrapped PBF header boxes.
 3. ~~Archive center and center zoom derived from the area, with `--center` to
-   override, instead of the mean of the zoom range.~~ (#4)
-4. ~~The same options in the worker request.~~ (#4, #11)
+   override, instead of the mean of the zoom range.~~
+4. ~~The same options in the worker request.~~
 
 ## Lane C — Tile size observability (no content change)
 
 1. ~~Per-tile, per-layer and per-zoom size statistics in `Store::finish`.~~
 2. ~~Warnings above a threshold (1 MB by default) in the compile result.~~
-3. ~~Statistics in `--json` and the worker manifest.~~ (#3)
+3. ~~Statistics in `--json` and the worker manifest.~~
 4. Optional, flagged, lane A sign-off: a size budget that drops low-priority
    features.
 
@@ -50,7 +49,7 @@ deliberate and explained in its pull request.
 
 1. ~~Configurable metadata (name, description, attribution); one layer list.~~
 2. ~~Selectable gzip level.~~
-3. ~~`inspect` and `verify` commands.~~ (#5)
+3. ~~`inspect` and `verify` commands.~~
 4. MBTiles output, only if the desktop app needs it.
 
 ## Lane E — Configurability

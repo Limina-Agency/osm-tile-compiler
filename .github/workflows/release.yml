@@ -1,9 +1,11 @@
 name: Release
 
-# A `v*` tag builds the compiler binary for each target and attaches it to the
-# GitHub release. Each archive carries LICENSE, NOTICE, README, the licenses of
-# the code the OpenMapTiles port derives from, that of the embedded OSM Bright
+# A `v*` tag builds the compiler binary for Linux, macOS and Windows and
+# attaches it to the GitHub release (tar.gz, zip on Windows, each with its
+# SHA-256). Each archive carries LICENSE, NOTICE, README, the licenses of the
+# code the OpenMapTiles port derives from, that of the embedded OSM Bright
 # style, and THIRD-PARTY-LICENSES for the crates the binary includes.
+# Actions are pinned by commit; the comment names the tag.
 
 on:
   push:
@@ -17,7 +19,7 @@ jobs:
   version:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: useblacksmith/checkout@v1
+      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1
       - run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
           if [ "$GITHUB_REF_NAME" != "v$version" ]; then
@@ -40,12 +42,15 @@ jobs:
         include:
           - { os: blacksmith-4vcpu-ubuntu-2404, target: x86_64-unknown-linux-gnu }
           - { os: blacksmith-4vcpu-ubuntu-2404-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: windows-2025, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # The toolchain rust-toolchain.toml pins, plus this build's target.
       - run: |
           rustup toolchain install
@@ -58,7 +63,7 @@ jobs:
           out="osm-tile-compiler-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
           mkdir "$out"
           cp target/${{ matrix.target }}/release/osm-tile-compiler* "$out/"
-          rm -f "$out"/*.d
+          rm -f "$out"/*.d "$out"/*.pdb
           "$out"/osm-tile-compiler --version
           cp LICENSE NOTICE README.md "$out/"
           mkdir "$out/third-party"
@@ -66,10 +71,21 @@ jobs:
           cp osm-tile-compiler/style/LICENSE.md "$out/third-party/LICENSE.osm-bright.md"
           cargo about generate --locked -m osm-tile-compiler/Cargo.toml about.hbs \
             -o "$out/THIRD-PARTY-LICENSES"
-          tar czf "$out.tar.gz" "$out"
-          sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
-      - uses: softprops/action-gh-release@v2
+          if [ "$RUNNER_OS" = Windows ]; then
+            archive="$out.zip"
+            7z a -bso0 "$archive" "$out"
+          else
+            archive="$out.tar.gz"
+            tar czf "$archive" "$out"
+          fi
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             *.tar.gz
-            *.tar.gz.sha256
+            *.zip
+            *.sha256

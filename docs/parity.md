@@ -9,7 +9,8 @@ The latest measurement is the release check of 2026-11-17, before the bar.
 
 Malopolskie extract downloaded 2026-11-03 (SHA-256 `def1eb00…eb1f46c`),
 bounds 18.87522 49.02835 21.43328 50.53221, zooms 0–14, four threads,
-Linux x86_64 (16 cores, 15 GiB). Native build `e0de1c6`. Prepared with
+Linux x86_64 (16 cores, 15 GiB). Native build of that day, before the
+fixes below. Prepared with
 `benchmarks/compiler-parity/setup-linux.sh`, run with `run_omt.py`, compared
 with `compare.py --all-tiles` and `diagnose_all_omt.py` over every tile.
 
@@ -53,11 +54,11 @@ layer, ID and geometry type.
   tile-grid snapping, in the same places. Matching Planetiler reproduces them;
   they are a separate quality question from parity.
 
-## Current: after #7 and #8
+## After merged-feature IDs and polygon merging (2026-11-03)
 
-The same extract, reference and comparison, native at `e149955` (#7 keeps
-Planetiler's IDs where features merge; #8 merges nearby polygons through a
-port of JTS's buffer and union). Compile 31–46 s, archive 153.6 MB (Planetiler
+The same extract, reference and comparison, with two fixes: native keeps
+Planetiler's IDs where features merge, and merges nearby polygons through a
+port of JTS's buffer and union. Compile 31–46 s, archive 153.6 MB (Planetiler
 152.1 MB); tile sizes are within 0.7% of Planetiler's at every zoom.
 
 | Layer | Geometry differs | Unpaired (each side) | Attributes differ |
@@ -79,8 +80,8 @@ it to a near-empty triangle, native keeps the buildings.
 
 ## More regions: 2026-11-03
 
-Two more regions, compared the same way, native at `bf4b53a` (main after
-#9): Berlin, a dense city, and Pomorskie, the Baltic coast with the Gulf of
+Two more regions, compared the same way, with the native build of that day:
+Berlin, a dense city, and Pomorskie, the Baltic coast with the Gulf of
 Gdańsk, the Hel peninsula, the Vistula Lagoon and the Kashubian lakes. Each was
 prepared with `setup-linux.sh BENCH_DIR PBF_URL` and needed no harness change.
 Other compilations shared the machine (load average 14–21 during the runs), so
@@ -226,10 +227,10 @@ at z1–13, 1.5% smaller at z0 and 1.3% larger at z14.
   the merge attaches a hole to a shell that does not contain it. 6 are the
   other way round.
 
-## Current: after #13, #14 and #15
+## After the region, landcover and tile-edge fixes (2026-11-03)
 
-Native after the region fixes (#13), landcover through the JTS port (#14),
-and #15: merged polygons that fill the tile become Planetiler's canonical
+Native after three more fixes: the region differences below, landcover
+through the JTS port, and merged polygons that fill the tile become Planetiler's canonical
 square, and invalid tile slices are snapped with the JTS repair, whose empty
 result is kept. Same references and comparison as above.
 
@@ -247,7 +248,8 @@ result is kept. Same references and comparison as above.
 Validity counts are unchanged on every side. Pomorskie's full comparison
 takes over 10 minutes and was not rerun; its water and landcover were
 compared tile by tile with Planetiler's (landcover 2,182 differing features
-after #13, 1,915 after #14, 151 now; water 211, 54, 2).
+after the region fixes, 1,915 after the landcover port, 151 now; water 211,
+54, 2).
 
 Accepted differences, not counted against the bar:
 
@@ -259,16 +261,16 @@ Accepted differences, not counted against the bar:
 - **13/4571/2774** (Małopolskie building cluster): JTS reduces it to a
   near-empty triangle; native keeps the buildings.
 
-## Current: measured against the bar
+## Measured against the bar (2026-11-03)
 
-Native after #15 plus this change, against the same Planetiler references,
+Native after the fixes above and the three below, against the same Planetiler references,
 every tile of all three regions. Each region was compared whole (`compare.py
 --all-tiles`), and each differing pair measured (`pairdiff.py`; the one pair
 too large for its distance cap was measured separately). Earlier counts
 above that were taken without ring normalisation overstate the difference;
 Pomorskie's "151 landcover" was such a count.
 
-This change fixes three things:
+The three fixes:
 
 - **Route order** (`transport.rs`): Planetiler's `RELATION_ORDERING` compares
   `ref` by Java string length, in UTF-16 units; native counted UTF-8 bytes,
@@ -310,7 +312,7 @@ Outside the bar, and not accepted:
   which the accepted differences below cover; this is not yet confirmed.
 
 On Monaco with the real supplemental sources, native was already
-geometrically identical to Planetiler in every tile. With this change, the
+geometrically identical to Planetiler in every tile. With the three fixes, the
 landcover and transportation features whose encoding changed are now
 byte-identical to Planetiler's, where before they were not.
 
@@ -357,15 +359,14 @@ Timing and size are reported but not part of the bar.
 
 ## Order of work
 
-1. ~~IDs of merged and deduplicated features~~ (#7).
-2. ~~Building merge geometry~~ (#8, #14, #15).
-3. ~~Landuse and landcover merging~~ (#14, #15); ~~the boundary~~ (#14).
-4. ~~Two more regions~~ (#12) and ~~their profile differences~~ (#13):
+1. ~~IDs of merged and deduplicated features~~.
+2. ~~Building merge geometry~~.
+3. ~~Landuse and landcover merging~~; ~~the boundary~~.
+4. ~~Two more regions~~ and ~~their profile differences~~:
    ocean IDs, `name:latin`, junction `layer`, bridge class, `layer`
    parsing, bus stop IDs, the bay label.
-5. ~~Full-tile squares and tile-edge slivers~~ (#15).
-6. ~~Measure the rest against the bar~~ (see "Current: measured against
-   the bar"); route order, JTS depth order and ring winding fixed. Left: Berlin
+5. ~~Full-tile squares and tile-edge slivers~~.
+6. ~~Measure the rest against the bar~~ (see "Measured against the bar"); route order, JTS depth order and ring winding fixed. Left: Berlin
    13/4402/2684 and 5/17/10.
 7. ~~A full Pomorskie rerun~~ (every tile, above). Then decide
    `parity_verified`: either close or accept the two Berlin cases.

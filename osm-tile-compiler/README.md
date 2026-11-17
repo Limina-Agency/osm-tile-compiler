@@ -37,7 +37,7 @@ match compile_basemap(
 ) {
     Ok(output) => println!("{} tiles", output.result.tiles),
     Err(CompileError::Cancelled) => println!("stopped"),
-    Err(CompileError::Failed(message)) => println!("failed: {message}"),
+    Err(error) => println!("{}: {error}", error.kind()), // invalid_request, download, …
 }
 ```
 

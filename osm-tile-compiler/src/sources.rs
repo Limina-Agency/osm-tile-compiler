@@ -251,7 +251,7 @@ pub fn fetch_sources(
         if should_cancel() || error == CANCELLED {
             CompileError::Cancelled
         } else {
-            CompileError::Failed(error)
+            CompileError::classify(error, Some(crate::CompileStage::FetchSources))
         }
     })
 }

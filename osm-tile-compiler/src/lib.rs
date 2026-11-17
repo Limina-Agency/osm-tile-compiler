@@ -37,7 +37,9 @@
 //! ) {
 //!     Ok(output) => println!("{} tiles", output.result.tiles),
 //!     Err(CompileError::Cancelled) => println!("stopped"),
-//!     Err(CompileError::Failed(message)) => println!("failed: {message}"),
+//!     // InvalidRequest, Download, OutOfSpace, Failed { stage, .. }, and any
+//!     // kind added later; `kind()` gives a stable identifier.
+//!     Err(error) => println!("{}: {error}", error.kind()),
 //! }
 //! ```
 //!

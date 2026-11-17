@@ -71,7 +71,41 @@ fn progress(message: &str, percent: Option<f64>) {
     }));
 }
 
-fn run() -> Result<(), String> {
+/// Why the worker stopped: the error event's `message` and `errorKind`
+/// (one of [`CompileError::kind`]'s identifiers).
+struct WorkerError {
+    kind: &'static str,
+    message: String,
+}
+
+impl WorkerError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            kind: "invalid_request",
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for WorkerError {
+    fn from(message: String) -> Self {
+        Self {
+            kind: "failed",
+            message,
+        }
+    }
+}
+
+impl From<CompileError> for WorkerError {
+    fn from(error: CompileError) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+}
+
+fn run() -> Result<(), WorkerError> {
     const USAGE: &str = "usage: osm-tile-compiler [--parent-stdin] --request <request.json>";
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().map(|arg| arg.as_os_str()) == Some(std::ffi::OsStr::new("--parent-stdin")) {
@@ -93,24 +127,30 @@ fn run() -> Result<(), String> {
         });
     }
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--request")) {
-        return Err(USAGE.into());
+        return Err(WorkerError::invalid(USAGE));
     }
     let Some(request_path) = args.next().map(PathBuf::from) else {
-        return Err(USAGE.into());
+        return Err(WorkerError::invalid(USAGE));
     };
     if args.next().is_some() {
-        return Err(USAGE.into());
+        return Err(WorkerError::invalid(USAGE));
     }
-    let bytes = std::fs::read(&request_path)
-        .map_err(|error| format!("Failed to read compiler request {request_path:?}: {error}"))?;
-    let request: CompilerProcessRequest = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("Invalid compiler request {request_path:?}: {error}"))?;
+    let bytes = std::fs::read(&request_path).map_err(|error| {
+        WorkerError::invalid(format!(
+            "Failed to read compiler request {request_path:?}: {error}"
+        ))
+    })?;
+    let request: CompilerProcessRequest = serde_json::from_slice(&bytes).map_err(|error| {
+        WorkerError::invalid(format!(
+            "Invalid compiler request {request_path:?}: {error}"
+        ))
+    })?;
     let omit_sources = request
         .omit_sources
         .iter()
         .map(|id| {
             SupplementalDataset::from_id(id)
-                .ok_or_else(|| format!("unknown supplemental dataset '{id}'"))
+                .ok_or_else(|| WorkerError::invalid(format!("unknown supplemental dataset '{id}'")))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -142,11 +182,7 @@ fn run() -> Result<(), String> {
             }
         },
         || CANCELLED.load(Ordering::Relaxed),
-    )
-    .map_err(|error| match error {
-        CompileError::Cancelled => "The compile was cancelled".to_string(),
-        CompileError::Failed(message) => message,
-    })?;
+    )?;
     std::fs::write(
         &request.manifest_path,
         serde_json::to_vec_pretty(&output.manifest()).map_err(|e| e.to_string())?,
@@ -157,7 +193,8 @@ fn run() -> Result<(), String> {
         "event": "complete",
         "tilesWritten": output.result.tiles,
         "featuresEmitted": output.result.profile_features,
-    }))
+    }))?;
+    Ok(())
 }
 
 fn main() {
@@ -174,13 +211,14 @@ fn main() {
     // error event its host waits for; the panic hook still prints the location.
     let result = std::panic::catch_unwind(run).unwrap_or_else(|payload| {
         let message = osm_tile_compiler::panic_message(&*payload);
-        Err(format!("The compiler crashed: {message}"))
+        Err(format!("The compiler crashed: {message}").into())
     });
-    if let Err(message) = result {
+    if let Err(WorkerError { kind, message }) = result {
         let _ = emit(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "event": "error",
             "message": message,
+            "errorKind": kind,
         }));
         std::process::exit(if CANCELLED.load(Ordering::Relaxed) {
             130

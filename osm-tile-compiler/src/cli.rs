@@ -963,7 +963,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     };
     let output = output.map_err(|error| match error {
         CompileError::Cancelled => "the compile was cancelled".to_string(),
-        CompileError::Failed(message) => message,
+        error => error.to_string(),
     })?;
     cleanup?;
     let result = &output.result;

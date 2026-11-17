@@ -506,6 +506,7 @@ fn worker_mode_still_reports_bad_arguments_as_error_events() {
         "protocolVersion": 1,
         "event": "error",
         "message": "usage: osm-tile-compiler [--parent-stdin] --request <request.json>",
+        "errorKind": "invalid_request",
     });
     for args in [&["--request"][..], &["--request", "a.json", "extra"]] {
         let output = run(args);
@@ -553,6 +554,7 @@ fn worker_mode_still_reports_bad_arguments_as_error_events() {
         assert_eq!(event["event"], "error", "{selection}");
         let message = event["message"].as_str().unwrap();
         assert!(message.contains(expected), "{selection}: {message}");
+        assert_eq!(event["errorKind"], "invalid_request", "{selection}");
         assert!(!temp.path().join("sources").exists(), "{selection}");
     }
 
@@ -562,6 +564,7 @@ fn worker_mode_still_reports_bad_arguments_as_error_events() {
     let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(event["event"], "error");
     assert_eq!(event["protocolVersion"], 1);
+    assert_eq!(event["errorKind"], "invalid_request");
     assert!(
         event["message"]
             .as_str()

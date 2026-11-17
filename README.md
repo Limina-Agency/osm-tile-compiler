@@ -15,8 +15,9 @@ field laptop or a phone at the edge, not on a server it may not reach. That
 set the design:
 
 - **In-process.** The compile is a library that runs inside the app that
-  shows the map, on iOS too, with no separate service, database or Java
-  runtime to ship or start. The command line is a thin layer over the same
+  shows the map, with no separate service, database or Java runtime to
+  ship or start. CI builds it for iOS devices and the simulator, and it has
+  run in an app in the simulator; it has not yet been measured on a phone. The command line is a thin layer over the same
   call.
 - **Speed and memory first.** A region compiles in seconds to a minute, in
   a fraction of the memory a server-side tool expects, so it fits on the
@@ -29,8 +30,9 @@ set the design:
 
 ## Why use it
 
-- **Fast and light.** On the Małopolskie extract from Geofabrik, on four
-  threads, a compile takes 41.6 s and peaks at 0.86 GiB of memory, where
+- **Fast and light.** On the Małopolskie extract from Geofabrik, with the
+  benchmark harness on four threads (Linux, command line, no building
+  levels), a compile takes 41.6 s and peaks at 0.86 GiB of memory, where
   Planetiler takes 93.0 s and 2.9 GiB on the same machine: more than twice
   as fast in under a third of the memory.
 - **Close to Planetiler's output.** On that run both archives hold the same
@@ -74,7 +76,8 @@ Each stage runs in parallel on the threads you give it.
 
 ## Quick start
 
-Install the binary (prebuilt Linux binaries are on the releases page):
+Install the binary (prebuilt binaries for Linux, macOS and Windows are on
+the releases page):
 
 ```sh
 cargo install osm-tile-compiler
@@ -240,6 +243,14 @@ let output: Result<BasemapOutput, CompileError> =
   the binary's mimalloc) and never reads the working directory, so pass
   absolute paths. While the PBF is read, up to about twice `threads` threads
   are busy.
+- **Panics.** The clean-up relies on unwinding: a panic in the compile is
+  caught and returned as an error. Built with `panic = "abort"`, common in
+  mobile release profiles, a panic ends the app instead and leaves its
+  scratch directory in `temp_dir`; clear that directory at launch.
+- **Errors.** `CompileError` says what went wrong: `InvalidRequest` (found
+  before any work), `Download`, `OutOfSpace`, or `Failed` with the stage it
+  happened in. `kind()` gives a stable identifier, and new kinds may be
+  added, so match with a wildcard arm.
 
 Apps that would rather run a separate process can start the binary as a
 worker (`--request <request.json>`), which reports progress as JSON lines on
@@ -248,11 +259,22 @@ formats the compiler writes, and how their versions change.
 
 ## Performance
 
-On a Ryzen 7 5800H laptop with the real supplemental datasets and building
-levels on, Małopolskie compiles in 61 s on 2 threads and 22 s on 16, peaking at 0.7 to 1.3 GiB of
-memory and about 1 GB of scratch disk; the basemap is 147 MiB and its
-building levels 26 MiB. Monaco takes half a second. [`docs/performance.md`](docs/performance.md)
-has the measurements, per stage and thread count.
+Times depend on the setup. The comparison above is the benchmark harness on
+Linux: the command line with mimalloc, without building levels. Inside an
+app's process, with the system allocator, the real supplemental datasets and
+building levels on, Małopolskie took:
+
+- on a Ryzen 7 5800H laptop (Linux): 61 s on 2 threads, 34 s on 4 and 22 s
+  on 16, peaking at 0.7 to 1.3 GiB of memory;
+- on an Apple M5 (an app in the iOS simulator, 4 threads): 20.5 s, peaking
+  at 0.87 GiB for the whole app. The macOS command line took 16.1 s and
+  0.78 GiB, writing the same bytes.
+
+The basemap is 147 MiB and its building levels 26 MiB; Monaco takes well
+under a second. A phone has not been measured yet: its CPU is slower than
+the simulator's (which is the Mac's) and its memory limit stricter.
+[`docs/performance.md`](docs/performance.md) has the measurements, per stage
+and thread count.
 
 Plan disk for the supplemental datasets: 1.45 GB of downloads, unpacked once
 into another 2.23 GB. Scratch disk peaks at about five times the extract.
