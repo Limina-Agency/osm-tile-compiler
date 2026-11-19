@@ -16,9 +16,11 @@
 //! of 4096 units, whatever the source extent. A tile with no boxes is not
 //! written.
 //!
-//! Tiles are worked on in groups of one z11 tile, in tile order within a
-//! group, so the bytes do not depend on the number of threads, and memory is
-//! bounded by one z11 tile a thread, plus the archive and the finished tiles.
+//! Tiles are worked on in groups of one z11 tile, in a fixed order within a
+//! group, so the bytes do not depend on the number of threads. The source
+//! archive is read a tile at a time, and a group's z14 tiles go quadrant by
+//! quadrant, so it has one grid a zoom open: memory is bounded by three grids
+//! a thread, plus the finished tiles.
 
 use crate::control::Control;
 use crate::omt::PartialArchive;
@@ -27,7 +29,6 @@ use flate2::{read::GzDecoder, write::GzEncoder};
 use pmtiles::{Compression, PmTilesWriter, TileCoord, TileId, TileType};
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::f32::consts::PI;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -152,13 +153,12 @@ pub(crate) fn write_levels(
             output.display()
         ));
     }
-    let data =
-        std::fs::read(input).map_err(|e| format!("Failed to read {}: {e}", input.display()))?;
-    let header = Header::parse(&data)?;
+    let archive = Archive::open(input)?;
+    let header = Header::parse(&archive.section(0, HEADER_BYTES as u64)?)?;
     if header.tile_type != TILE_TYPE_MVT {
         return Err(format!("{} holds no vector tiles", input.display()));
     }
-    let mut tiles = source_tiles(&data, &header)?;
+    let mut tiles = source_tiles(&archive, &header)?;
     tiles.sort_unstable_by_key(|tile| (tile.x >> 3, tile.y >> 3, tile.x, tile.y));
     let groups: Vec<&[SourceTile]> = tiles
         .chunk_by(|a, b| (a.x >> 3, a.y >> 3) == (b.x >> 3, b.y >> 3))
@@ -167,9 +167,9 @@ pub(crate) fn write_levels(
     let levels = || {
         groups
             .par_iter()
-            .map(|group| {
+            .map_init(OpenGrids::default, |grids, group| {
                 control.check()?;
-                let levels = group_levels(&data, header.tile_compression, group);
+                let levels = group_levels(&archive, header.tile_compression, group, grids);
                 control.add_done(1);
                 levels
             })
@@ -332,24 +332,104 @@ struct DirectoryEntry {
     length: u64,
 }
 
-fn section(data: &[u8], offset: u64, length: u64) -> Result<&[u8], String> {
-    let range = || {
-        let start = usize::try_from(offset).ok()?;
-        let end = usize::try_from(offset.checked_add(length)?).ok()?;
-        data.get(start..end)
-    };
-    range().ok_or_else(|| format!("{length} bytes at {offset} are outside the archive"))
+/// The source archive, read a part at a time: holding a whole basemap would
+/// cost its size in memory.
+struct Archive {
+    file: File,
+    length: u64,
+    path: PathBuf,
+}
+
+impl Archive {
+    fn open(path: &Path) -> Result<Self, String> {
+        let failed = |e: std::io::Error| format!("Failed to read {}: {e}", path.display());
+        let file = File::open(path).map_err(failed)?;
+        let length = file.metadata().map_err(failed)?.len();
+        Ok(Self {
+            file,
+            length,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// `length` bytes at `offset`. Safe to call from several threads at once.
+    fn section(&self, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        self.section_into(offset, length, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// [`Archive::section`] into `bytes`, reusing its room.
+    fn section_into(&self, offset: u64, length: u64, bytes: &mut Vec<u8>) -> Result<(), String> {
+        let outside = || format!("{length} bytes at {offset} are outside the archive");
+        let end = offset.checked_add(length).ok_or_else(outside)?;
+        if end > self.length {
+            return Err(outside());
+        }
+        bytes.clear();
+        bytes.resize(usize::try_from(length).map_err(|_| outside())?, 0);
+        read_exact_at(&self.file, bytes, offset)
+            .map_err(|e| format!("Failed to read {}: {e}", self.path.display()))
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, bytes, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::windows::fs::FileExt;
+    while !bytes.is_empty() {
+        match file.seek_read(bytes, offset) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(read) => {
+                bytes = &mut bytes[read..];
+                offset += read as u64;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Elsewhere, through a handle of its own, so threads do not share a position.
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(bytes)
 }
 
 fn unpack(bytes: &[u8], compression: u8) -> Result<Cow<'_, [u8]>, String> {
     match compression {
         COMPRESSION_NONE => Ok(Cow::Borrowed(bytes)),
-        COMPRESSION_GZIP => {
+        _ => {
             let mut raw = Vec::with_capacity(bytes.len() * 4);
-            GzDecoder::new(bytes)
-                .read_to_end(&mut raw)
-                .map_err(|e| format!("Failed to gunzip part of the archive: {e}"))?;
+            unpack_into(bytes, compression, &mut raw)?;
             Ok(Cow::Owned(raw))
+        }
+    }
+}
+
+/// [`unpack`] into `raw`, reusing its room; `bytes` themselves if they are
+/// not compressed.
+fn unpack_into<'a>(
+    bytes: &'a [u8],
+    compression: u8,
+    raw: &'a mut Vec<u8>,
+) -> Result<&'a [u8], String> {
+    match compression {
+        COMPRESSION_NONE => Ok(bytes),
+        COMPRESSION_GZIP => {
+            raw.clear();
+            GzDecoder::new(bytes)
+                .read_to_end(raw)
+                .map_err(|e| format!("Failed to gunzip part of the archive: {e}"))?;
+            Ok(raw)
         }
         other => Err(format!("Unsupported PMTiles compression {other}")),
     }
@@ -384,14 +464,14 @@ fn directory(bytes: &[u8]) -> Option<Vec<DirectoryEntry>> {
     Some(entries)
 }
 
-fn source_tiles(data: &[u8], header: &Header) -> Result<Vec<SourceTile>, String> {
+fn source_tiles(archive: &Archive, header: &Header) -> Result<Vec<SourceTile>, String> {
     let wanted = pmtiles::PYRAMID_SIZE_BY_ZOOM[usize::from(SOURCE_ZOOM)]
         ..pmtiles::PYRAMID_SIZE_BY_ZOOM[usize::from(SOURCE_ZOOM) + 1];
     let mut directories = vec![header.root];
     let mut tiles = Vec::new();
     while let Some((offset, length)) = directories.pop() {
-        let stored = section(data, offset, length)?;
-        let bytes = unpack(stored, header.internal_compression)?;
+        let stored = archive.section(offset, length)?;
+        let bytes = unpack(&stored, header.internal_compression)?;
         let entries = directory(&bytes).ok_or("Malformed PMTiles directory")?;
         for entry in entries {
             if entry.run == 0 {
@@ -898,44 +978,29 @@ fn rasterise(
     }
 }
 
-/// One grid from its four children, each parent the mean of four cells, with
-/// overlapping building parts counted once.
-fn reduce(children: &[Option<&Grid>; 4]) -> Grid {
-    let mut grid = vec![Cell::default(); GRID * GRID];
-    for (quadrant, child) in children.iter().enumerate() {
-        let Some(child) = child else { continue };
-        let (ox, oy) = ((quadrant & 1) * GRID / 2, (quadrant >> 1) * GRID / 2);
-        for (index, cell) in child.iter().enumerate() {
-            if cell.cover <= 0.0 {
-                continue;
-            }
-            let (x, y) = (index % GRID, index / GRID);
-            let weight = 0.25 / cell.cover.max(1.0);
-            let at = [
-                weight * (cell.at[0] / 2.0 + ox as f32 * cell.cover),
-                weight * (cell.at[1] / 2.0 + oy as f32 * cell.cover),
-            ];
-            let parent = &mut grid[(oy + y / 2) * GRID + ox + x / 2];
-            parent.add(cell, weight, at);
-            if cell.tallest > parent.tallest {
-                parent.tallest = cell.tallest;
-                parent.building = cell.building;
-            }
+/// Adds the finished grid of tile `(x, y)` to its quarter of its parent's
+/// `grid`, each parent cell the mean of four cells, with overlapping
+/// building parts counted once. A quarter touches no other quarter's cells, so
+/// children can come in any order, each as soon as it is finished.
+fn reduce_into(child: &[Cell], (x, y): (u32, u32), grid: &mut [Cell]) {
+    let (ox, oy) = ((x & 1) as usize * GRID / 2, (y & 1) as usize * GRID / 2);
+    for (index, cell) in child.iter().enumerate() {
+        if cell.cover <= 0.0 {
+            continue;
+        }
+        let (x, y) = (index % GRID, index / GRID);
+        let weight = 0.25 / cell.cover.max(1.0);
+        let at = [
+            weight * (cell.at[0] / 2.0 + ox as f32 * cell.cover),
+            weight * (cell.at[1] / 2.0 + oy as f32 * cell.cover),
+        ];
+        let parent = &mut grid[(oy + y / 2) * GRID + ox + x / 2];
+        parent.add(cell, weight, at);
+        if cell.tallest > parent.tallest {
+            parent.tallest = cell.tallest;
+            parent.building = cell.building;
         }
     }
-    grid
-}
-
-fn parent_grids(level: &BTreeMap<(u32, u32), Grid>) -> BTreeMap<(u32, u32), Grid> {
-    let mut parents: BTreeMap<(u32, u32), [Option<&Grid>; 4]> = BTreeMap::new();
-    for (&(x, y), grid) in level {
-        let quadrant = (x & 1) | ((y & 1) << 1);
-        parents.entry((x >> 1, y >> 1)).or_default()[quadrant as usize] = Some(grid);
-    }
-    parents
-        .into_iter()
-        .map(|(tile, children)| (tile, reduce(&children)))
-        .collect()
 }
 
 /// Hands thin cells on, then gives every cell left a key: equal keys may
@@ -1023,14 +1088,16 @@ struct BoxedTile {
 /// Adds the boxes of `landmarks` to the tile z/x/y, unmerged.
 fn landmark_boxes(
     landmarks: &[(u32, u32)],
-    sources: &[BoxedTile],
+    sources: &[Option<BoxedTile>],
     (zoom, x, y): (u8, u32, u32),
     boxes: &mut Vec<LevelBox>,
 ) {
     let shift = SOURCE_ZOOM - zoom;
     let scale = 1.0 / (1_u32 << shift) as f32;
     for &(tile, footprint) in landmarks {
-        let source = &sources[tile as usize];
+        let Some(source) = &sources[tile as usize] else {
+            continue;
+        };
         let ox = (source.x - (x << shift)) as f32 * EXTENT;
         let oy = (source.y - (y << shift)) as f32 * EXTENT;
         for boxed in &source.boxes[source.spans[footprint as usize].clone()] {
@@ -1056,7 +1123,13 @@ struct LevelTile {
     kept_m2: f64,
 }
 
-fn far_tile(mut grid: Grid, zoom: u8, x: u32, y: u32, sources: &[BoxedTile]) -> LevelTile {
+fn far_tile(
+    grid: &mut [Cell],
+    zoom: u8,
+    x: u32,
+    y: u32,
+    sources: &[Option<BoxedTile>],
+) -> LevelTile {
     let cell_m = tile_width_m(zoom, y) / GRID as f32;
     let cell_area_m2 = f64::from(cell_m) * f64::from(cell_m);
     let mut truth = 0.0;
@@ -1069,10 +1142,10 @@ fn far_tile(mut grid: Grid, zoom: u8, x: u32, y: u32, sources: &[BoxedTile]) -> 
     }
     landmarks.sort_unstable();
     landmarks.dedup();
-    let mut keys = merge_keys(&mut grid, (cell_m * 0.5).max(MIN_HEIGHT_STEP_M));
+    let mut keys = merge_keys(grid, (cell_m * 0.5).max(MIN_HEIGHT_STEP_M));
     let gain = if zoom == 11 { Z11_COVER_GAIN } else { 1.0 };
     let mut boxes = Vec::new();
-    let kept = merged_boxes(&grid, &mut keys, gain, &mut boxes);
+    let kept = merged_boxes(grid, &mut keys, gain, &mut boxes);
     landmark_boxes(&landmarks, sources, (zoom, x, y), &mut boxes);
     LevelTile {
         zoom,
@@ -1177,19 +1250,26 @@ impl LevelStats {
 struct GroupLevels {
     tiles: Vec<(u64, Vec<u8>)>,
     stats: [LevelStats; LEVEL_ZOOMS.len()],
+    /// Each tile's level, x, y and areas, summed into `stats` in tile order
+    /// by [`GroupLevels::finish`], so the sums do not depend on the order the
+    /// tiles were made in.
+    areas: Vec<(usize, u32, u32, f64, f64)>,
 }
 
 impl GroupLevels {
     fn add(&mut self, tile: &LevelTile) -> Result<(), String> {
         let level = LEVEL_ZOOMS.iter().position(|&zoom| zoom == tile.zoom);
-        let stats = &mut self.stats[level.ok_or("A zoom the pass does not write")?];
-        stats.truth_m2 += tile.truth_m2;
-        stats.kept_m2 += tile.kept_m2;
+        let level = level.ok_or("A zoom the pass does not write")?;
+        self.areas
+            .push((level, tile.x, tile.y, tile.truth_m2, tile.kept_m2));
         if tile.boxes.is_empty() {
             return Ok(());
         }
         let raw = encode_tile(&tile.boxes);
-        let gz = gzip(&raw)?;
+        let mut gz = gzip(&raw)?;
+        // Held until the archive is written: the encoder's spare room adds up.
+        gz.shrink_to_fit();
+        let stats = &mut self.stats[level];
         stats.tiles += 1;
         stats.boxes += tile.boxes.len() as u64;
         stats.raw_bytes += raw.len() as u64;
@@ -1200,18 +1280,116 @@ impl GroupLevels {
         self.tiles.push((TileId::from(coord).value(), gz));
         Ok(())
     }
+
+    fn finish(mut self) -> Self {
+        self.areas
+            .sort_unstable_by_key(|&(level, x, y, ..)| (level, x, y));
+        for &(level, _, _, truth_m2, kept_m2) in &self.areas {
+            self.stats[level].truth_m2 += truth_m2;
+            self.stats[level].kept_m2 += kept_m2;
+        }
+        self.areas = Vec::new();
+        self
+    }
 }
 
-/// Everything under one z11 tile, from its z14 tiles in order.
-fn group_levels(data: &[u8], compression: u8, z14: &[SourceTile]) -> Result<GroupLevels, String> {
+/// The grids of one z11 tile still being filled: one each at z13, z12 and
+/// z11, as the z14 tiles come a quadrant at a time. Finished grids are kept
+/// to be filled again: a grid is megabytes, and an allocator that is handed
+/// one back often holds on to it for a while.
+#[derive(Default)]
+struct OpenGrids {
+    /// z13, z12 and z11, each with its tile.
+    open: [Option<((u32, u32), Grid)>; 3],
+    spare: Vec<Grid>,
+    /// A tile as stored, and unpacked.
+    stored: Vec<u8>,
+    raw: Vec<u8>,
+}
+
+impl OpenGrids {
+    /// The grid at `level` (0 for z13), which must be the tile `tile`'s if
+    /// one is open; empty if it is new.
+    fn grid(&mut self, level: usize, tile: (u32, u32)) -> &mut Grid {
+        let spare = &mut self.spare;
+        let (_, grid) = self.open[level].get_or_insert_with(|| {
+            let grid = match spare.pop() {
+                Some(mut grid) => {
+                    grid.fill(Cell::default());
+                    grid
+                }
+                None => vec![Cell::default(); GRID * GRID],
+            };
+            (tile, grid)
+        });
+        grid
+    }
+
+    /// Finishes every grid that does not hold the z14 tile `next`, or every
+    /// grid if there is none: each goes into its parent, and z12 and z11 into
+    /// tiles. The z14 tiles come a quadrant at a time, so a grid the next
+    /// tile is not in is complete.
+    fn finish_unless(
+        &mut self,
+        next: Option<(u32, u32)>,
+        sources: &[Option<BoxedTile>],
+        group: &mut GroupLevels,
+    ) -> Result<(), String> {
+        for level in 0..self.open.len() {
+            let shift = level + 1;
+            let holds_next =
+                |tile: (u32, u32)| next.is_some_and(|(x, y)| (x >> shift, y >> shift) == tile);
+            let finished = self.open[level]
+                .as_ref()
+                .is_some_and(|(tile, _)| !holds_next(*tile));
+            if !finished {
+                continue;
+            }
+            let Some(((x, y), mut grid)) = self.open[level].take() else {
+                continue;
+            };
+            // A grid goes into its parent before its tile, which changes it.
+            if level + 1 < self.open.len() {
+                reduce_into(&grid, (x, y), self.grid(level + 1, (x >> 1, y >> 1)));
+            }
+            if level > 0 {
+                let zoom = SOURCE_ZOOM - 1 - level as u8;
+                group.add(&far_tile(&mut grid, zoom, x, y, sources))?;
+            }
+            self.spare.push(grid);
+        }
+        Ok(())
+    }
+}
+
+/// Where a z14 tile comes in its z11 tile: quadrant by quadrant, so that only
+/// one grid a zoom is open at a time.
+fn quadrant_order(tile: &SourceTile) -> u32 {
+    (0..3).fold(0, |order, bit| {
+        order | ((tile.x >> bit) & 1) << (2 * bit) | ((tile.y >> bit) & 1) << (2 * bit + 1)
+    })
+}
+
+/// Everything under one z11 tile, from its z14 tiles in tile order.
+fn group_levels(
+    archive: &Archive,
+    compression: u8,
+    z14: &[SourceTile],
+    grids: &mut OpenGrids,
+) -> Result<GroupLevels, String> {
     let mut group = GroupLevels::default();
-    let mut sources: Vec<BoxedTile> = Vec::new();
-    let mut z13: BTreeMap<(u32, u32), Grid> = BTreeMap::new();
+    // By the tile's place in `z14`, which is what orders the landmarks.
+    let mut sources: Vec<Option<BoxedTile>> = Vec::new();
+    sources.resize_with(z14.len(), || None);
+    let mut order: Vec<usize> = (0..z14.len()).collect();
+    order.sort_unstable_by_key(|&index| quadrant_order(&z14[index]));
     let mut line = Vec::new();
-    for tile in z14 {
-        let stored = section(data, tile.offset, tile.length)?;
-        let bytes = unpack(stored, compression)?;
-        let footprints = parse_footprints(&bytes)
+    for &source in &order {
+        let tile = z14[source];
+        grids.finish_unless(Some((tile.x, tile.y)), &sources, &mut group)?;
+        archive.section_into(tile.offset, tile.length, &mut grids.stored)?;
+        let bytes = unpack_into(&grids.stored, compression, &mut grids.raw)?;
+        let footprints = parse_footprints(bytes)
             .ok_or_else(|| format!("Malformed tile 14/{}/{}", tile.x, tile.y))?;
         if footprints.is_empty() {
             continue;
@@ -1224,13 +1402,11 @@ fn group_levels(data: &[u8], compression: u8, z14: &[SourceTile]) -> Result<Grou
             fit_boxes(footprint, SPLIT_M / unit_m, &mut boxes);
             spans.push(first..boxes.len());
         }
-        let grid = z13
-            .entry((tile.x >> 1, tile.y >> 1))
-            .or_insert_with(|| vec![Cell::default(); GRID * GRID]);
+        let grid = grids.grid(0, (tile.x >> 1, tile.y >> 1));
         let half = (GRID / 2) as f32;
         let origin = [(tile.x & 1) as f32 * half, (tile.y & 1) as f32 * half];
         for (index, footprint) in footprints.iter().enumerate() {
-            let building = (sources.len() as u32, index as u32);
+            let building = (source as u32, index as u32);
             rasterise(footprint, building, origin, grid, &mut line);
         }
         let unit_area_m2 = f64::from(unit_m) * f64::from(unit_m);
@@ -1248,22 +1424,15 @@ fn group_levels(data: &[u8], compression: u8, z14: &[SourceTile]) -> Result<Grou
             kept_m2: kept * unit_area_m2,
         };
         group.add(&level)?;
-        sources.push(BoxedTile {
+        sources[source] = Some(BoxedTile {
             x: tile.x,
             y: tile.y,
             boxes: level.boxes,
             spans,
         });
     }
-    let z12 = parent_grids(&z13);
-    drop(z13);
-    let z11 = parent_grids(&z12);
-    for (zoom, grids) in [(12, z12), (11, z11)] {
-        for ((x, y), grid) in grids {
-            group.add(&far_tile(grid, zoom, x, y, &sources))?;
-        }
-    }
-    Ok(group)
+    grids.finish_unless(None, &sources, &mut group)?;
+    Ok(group.finish())
 }
 
 #[cfg(test)]
