@@ -154,35 +154,32 @@ fn layout(path: &Path) -> Result<Layout, String> {
     ];
     let mut tiles = Vec::new();
     reader.walk(|_, entry, leaf| {
-        if leaf {
-            segments.push(Segment {
-                offset: header.leaf_offset + entry.offset,
-                length: u64::from(entry.length),
-            });
+        let (section_offset, section_length, section) = if leaf {
+            (header.leaf_offset, header.leaf_length, "leaf directories")
         } else {
-            if entry.offset + u64::from(entry.length) > header.data_length {
-                return Err(format!(
-                    "tile {} lies beyond the data section",
-                    entry.tile_id
-                ));
-            }
-            tiles.push(Entry {
-                offset: header.data_offset + entry.offset,
-                ..entry
-            });
-            segments.push(Segment {
-                offset: header.data_offset + entry.offset,
-                length: u64::from(entry.length),
-            });
+            (header.data_offset, header.data_length, "data section")
+        };
+        let length = u64::from(entry.length);
+        let offset = entry
+            .offset
+            .checked_add(length)
+            .filter(|&end| end <= section_length)
+            .and_then(|_| section_offset.checked_add(entry.offset))
+            .ok_or_else(|| format!("an entry at {} lies beyond the {section}", entry.offset))?;
+        if !leaf {
+            tiles.push(Entry { offset, ..entry });
         }
+        segments.push(Segment { offset, length });
         Ok(())
     })?;
     segments.retain(|s| s.length > 0);
     segments.sort_unstable();
     segments.dedup();
-    if let Some(last) = segments.last()
-        && last.offset + last.length > reader.file_length
-    {
+    if segments.iter().any(|s| {
+        s.offset
+            .checked_add(s.length)
+            .is_none_or(|end| end > reader.file_length)
+    }) {
         return Err(format!("{} is truncated", path.display()));
     }
     tiles.sort_unstable_by_key(|e| e.tile_id);

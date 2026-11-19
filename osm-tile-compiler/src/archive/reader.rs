@@ -197,16 +197,20 @@ impl ArchiveReader {
 
     /// The stored bytes of an entry's tile.
     pub fn tile(&mut self, entry: &Entry) -> Result<Vec<u8>, String> {
-        if entry.offset + u64::from(entry.length) > self.header.data_length {
-            return Err(format!(
-                "tile {} lies beyond the data section",
-                entry.tile_id
-            ));
+        let beyond = || format!("tile {} lies beyond the data section", entry.tile_id);
+        if entry
+            .offset
+            .checked_add(u64::from(entry.length))
+            .is_none_or(|end| end > self.header.data_length)
+        {
+            return Err(beyond());
         }
-        self.read(
-            self.header.data_offset + entry.offset,
-            u64::from(entry.length),
-        )
+        let offset = self
+            .header
+            .data_offset
+            .checked_add(entry.offset)
+            .ok_or_else(beyond)?;
+        self.read(offset, u64::from(entry.length))
     }
 
     fn directory(&mut self, offset: u64, length: u64) -> Result<Vec<(Entry, bool)>, String> {
@@ -245,7 +249,10 @@ impl ArchiveReader {
         for i in 0..count {
             let value = varint(&bytes, at)?;
             entries[i].offset = if value == 0 && i > 0 {
-                entries[i - 1].offset + u64::from(entries[i - 1].length)
+                entries[i - 1]
+                    .offset
+                    .checked_add(u64::from(entries[i - 1].length))
+                    .ok_or("entry offset overflows")?
             } else {
                 value.checked_sub(1).ok_or("offset 0 for the first entry")?
             };
@@ -295,16 +302,25 @@ impl ArchiveReader {
             if depth + 1 >= MAX_DIRECTORY_DEPTH {
                 return Err("leaf directories nest too deep".into());
             }
-            if entry.offset + u64::from(entry.length) > self.header.leaf_length {
-                return Err(format!(
+            let beyond = || {
+                format!(
                     "leaf directory at {} lies beyond the leaf section",
                     entry.offset
-                ));
+                )
+            };
+            if entry
+                .offset
+                .checked_add(u64::from(entry.length))
+                .is_none_or(|end| end > self.header.leaf_length)
+            {
+                return Err(beyond());
             }
-            let leaf = self.directory(
-                self.header.leaf_offset + entry.offset,
-                u64::from(entry.length),
-            )?;
+            let offset = self
+                .header
+                .leaf_offset
+                .checked_add(entry.offset)
+                .ok_or_else(beyond)?;
+            let leaf = self.directory(offset, u64::from(entry.length))?;
             stack.push((leaf.into_iter(), depth + 1));
         }
         Ok(())

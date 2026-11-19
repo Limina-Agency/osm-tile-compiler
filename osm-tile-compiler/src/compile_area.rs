@@ -43,6 +43,12 @@ impl CompileArea {
     pub fn from_geojson(text: &str) -> Result<Self, String> {
         let geojson: geojson::GeoJson =
             text.parse().map_err(|e| format!("invalid GeoJSON: {e}"))?;
+        // The conversion below indexes each position's first two numbers.
+        if let Some(position) = short_position(&geojson) {
+            return Err(format!(
+                "invalid GeoJSON: a position needs a longitude and a latitude, found {position:?}"
+            ));
+        }
         let collection = geo_types::GeometryCollection::<f64>::try_from(&geojson)
             .map_err(|e| format!("invalid GeoJSON geometry: {e}"))?;
         let mut polygons = Vec::new();
@@ -241,6 +247,40 @@ impl Region {
             .as_ref()
             .is_none_or(|coverage| coverage.contains(z, x, y))
     }
+}
+
+/// The first position with fewer than two numbers, if any.
+fn short_position(geojson: &geojson::GeoJson) -> Option<Vec<f64>> {
+    use geojson::{GeoJson, GeometryValue};
+    let mut pending: Vec<&geojson::Geometry> = match geojson {
+        GeoJson::Geometry(geometry) => vec![geometry],
+        GeoJson::Feature(feature) => feature.geometry.iter().collect(),
+        GeoJson::FeatureCollection(collection) => collection
+            .features
+            .iter()
+            .filter_map(|feature| feature.geometry.as_ref())
+            .collect(),
+    };
+    while let Some(geometry) = pending.pop() {
+        let positions: Box<dyn Iterator<Item = &geojson::Position>> = match &geometry.value {
+            GeometryValue::Point { coordinates } => Box::new(std::iter::once(coordinates)),
+            GeometryValue::MultiPoint { coordinates }
+            | GeometryValue::LineString { coordinates } => Box::new(coordinates.iter()),
+            GeometryValue::MultiLineString { coordinates }
+            | GeometryValue::Polygon { coordinates } => Box::new(coordinates.iter().flatten()),
+            GeometryValue::MultiPolygon { coordinates } => {
+                Box::new(coordinates.iter().flatten().flatten())
+            }
+            GeometryValue::GeometryCollection { geometries } => {
+                pending.extend(geometries);
+                Box::new(std::iter::empty())
+            }
+        };
+        if let Some(short) = positions.into_iter().find(|p| p.len() < 2) {
+            return Some(short.as_slice().to_vec());
+        }
+    }
+    None
 }
 
 fn geometry_name(geometry: &Geometry<f64>) -> &'static str {
@@ -508,6 +548,20 @@ END
         );
         let empty = r#"{"type":"FeatureCollection","features":[]}"#;
         assert_eq!(CompileArea::from_geojson(empty).unwrap_err(), "no polygons");
+    }
+
+    /// Found by the polygon_geojson fuzz target: the geojson crate's
+    /// conversion panicked on a position with fewer than two numbers.
+    #[test]
+    fn geojson_positions_without_a_latitude_are_errors() {
+        for text in [
+            r#"{"type":"MultiPolygon","coordinates":[[[[1719]]],[[[-180,-19],[],[-177,-16],[-180,-16],[-180,-19]]]]}"#,
+            r#"{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1],[0,0]]]}}"#,
+            r#"{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[]}]}"#,
+        ] {
+            let error = CompileArea::from_geojson(text).unwrap_err();
+            assert!(error.starts_with("invalid GeoJSON"), "{error}");
+        }
     }
 
     /// Every tile whose square, or one of its copies a world's width east or
