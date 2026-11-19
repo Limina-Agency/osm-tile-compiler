@@ -40,3 +40,8 @@ unused_must_use = "warn"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+
+# The changes module (OSM change files) is not released yet; switch back to
+# the crates.io version, and drop deny.toml's allow-git, once it is.
+[patch.crates-io]
+osm-pbf-ingest = { git = "https://github.com/Limina-Agency/osm-pbf-ingest", branch = "feat/osm-change-files" }

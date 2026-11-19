@@ -243,6 +243,40 @@ directories, entry order, clustering, the header's counts) and decodes every
 tile, checking its MVT encoding and that its layers are declared in the
 metadata. Tiles over 1 MiB compressed produce a warning at compile time.
 
+## Keeping an extract fresh (experimental)
+
+An extract can be brought up to date from OpenStreetMap's change files
+(`.osc`, `.osc.gz`) without a database or osmium:
+
+```sh
+# Apply every hourly planet diff published since the extract was cut
+osm-tile-compiler update malopolskie.osm.pbf --replication hour --output malopolskie-now.osm.pbf
+# Or recorded change files, oldest first
+osm-tile-compiler update malopolskie.osm.pbf 124335.osc.gz 124336.osc.gz --output malopolskie-now.osm.pbf
+# Or apply them while compiling, and write the delta from yesterday's archive
+osm-tile-compiler compile malopolskie.osm.pbf --replication hour --delta-from old.pmtiles \
+  --output new.pmtiles --sources sources/
+```
+
+`--replication` takes `minute`, `hour` or `day` (the planet's servers), a
+server's URL, or `header` for the server the PBF's header names (Geofabrik
+extracts name their `-updates` server). Where to start comes from the
+header's sequence number on its own server, otherwise from its timestamp, and
+the updated file's header records where it ended, so the next `update`
+continues from there.
+
+Only the PBF blocks a change touches are decoded and written again; the rest
+are copied as they are. On a 4-core cloud VM, bringing Małopolskie forward by
+13 hours of hourly planet diffs (3.3 million changes, of which 4,800 touch the
+region) took 23 s including the downloads. Without the clip below, the result
+holds exactly the objects `osmium apply-changes` writes. Planet diffs are
+clipped to the extract: every change to an object it holds is kept, and
+new objects are kept when they reach into it or are created inside its header
+box; `--no-clip` keeps every change, for diffs already cut to the region.
+Recompiling and diffing against the archive from before gave an 88 kB delta
+(240 tiles changed, 38 added). From Rust, the same is
+`update_extract`, built on `osm_pbf_ingest::changes`.
+
 ## Updating archives in the field (experimental)
 
 A device that already holds an archive can update to a newer compile by
