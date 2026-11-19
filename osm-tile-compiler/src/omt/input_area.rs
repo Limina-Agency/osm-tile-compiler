@@ -9,6 +9,7 @@
 use crate::CompileBounds;
 use crate::coordinate_groups::lng_lat_to_world;
 use geo_types::Coord;
+use osm_pbf_ingest::node_store::DecimicroBox;
 
 /// The margin around the written tiles, in tiles at the highest zoom: the
 /// widest buffer, 256 pixels, and a little for the point buffer's epsilon.
@@ -106,6 +107,15 @@ impl InputArea {
         }
     }
 
+    /// The box as node-store boxes, one per longitude range, each holding
+    /// every location in 1e-7 degrees that the range holds.
+    pub(crate) fn decimicro_boxes(&self) -> Vec<DecimicroBox> {
+        self.longitudes
+            .iter()
+            .map(|&(west, east)| DecimicroBox::around_degrees(self.south, west, self.north, east))
+            .collect()
+    }
+
     pub(crate) fn contains(&self, latitude: f64, longitude: f64) -> bool {
         (self.south..=self.north).contains(&latitude)
             && self
@@ -154,6 +164,37 @@ mod tests {
         let beside = Extent::of(&[Coord { x: 21.0, y: 49.0 }, Coord { x: 22.0, y: 50.0 }]);
         assert!(!area.intersects(&beside));
         assert!(!area.intersects(&Extent::EMPTY));
+    }
+
+    #[test]
+    fn node_store_boxes_hold_every_location_the_area_holds() {
+        let areas = [
+            InputArea::new(CompileBounds::new(49.32, 49.25, 20.02, 19.90), 14),
+            InputArea::new(CompileBounds::new(-12.0, -21.0, -178.0, 177.0), 14),
+        ];
+        for area in areas {
+            let boxes = area.decimicro_boxes();
+            assert_eq!(boxes.len(), area.longitudes.len());
+            // Locations on a grid of 1e-7 degrees, as nodes have them, at the
+            // area's edges and between.
+            for lat in [area.south, area.north, (area.south + area.north) / 2.0] {
+                for &(west, east) in &area.longitudes {
+                    for lng in [west, east, (west + east) / 2.0] {
+                        for (dlat, dlng) in [(-1, -1), (0, 0), (1, 1), (-1, 1), (1, -1)] {
+                            let lat7 = (lat * 1e7).round() as i32 + dlat;
+                            let lng7 = (lng * 1e7).round() as i32 + dlng;
+                            let (lat, lng) = (lat7 as f64 / 1e7, lng7 as f64 / 1e7);
+                            if area.contains(lat, lng) {
+                                assert!(
+                                    boxes.iter().any(|b| b.contains(lat7, lng7)),
+                                    "{lat} {lng}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

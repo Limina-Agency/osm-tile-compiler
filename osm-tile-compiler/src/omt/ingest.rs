@@ -15,10 +15,11 @@ use geo::{Area, BoundingRect, Contains, CoordinatePosition};
 use geo_types::{Coord, Geometry, LineString, MultiPolygon, Point, Polygon, Rect};
 use osm_pbf_ingest::IngestStage;
 use osm_pbf_ingest::blob_index::ObjectKind;
+use osm_pbf_ingest::node_store::DecimicroBox;
 use osm_pbf_ingest::{
-    IngestBuildProfile, NodeBatch, NodeTags, NormalizedNode, NormalizedRelation, Pass2Sink,
-    PreparedIngestIndex, RelationBatch, RelationMemberType, WayBatch,
-    prepare_ingest_index_with_threads, run_pass2_with_threads,
+    IngestBuildProfile, NodeBatch, NodeTags, NormalizedNode, NormalizedRelation, Pass2Options,
+    Pass2Sink, PrepareOptions, PreparedIngestIndex, RelationBatch, RelationMemberType, WayBatch,
+    WayRef, prepare_ingest_index_with_options, run_pass2_with_options,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -229,8 +230,13 @@ pub(super) struct Index {
     missing_relations: AtomicUsize,
     skipped_ways: AtomicUsize,
     skipped_node_references: AtomicUsize,
+    /// Ways of an area-only compile that the node store placed outside the
+    /// area without resolving their nodes.
+    outside_ways: AtomicUsize,
     /// In an area-only compile, the box whose objects become sources.
     area: Option<InputArea>,
+    /// `area` rounded outwards to whole 1e-7 degrees, for the node store.
+    area_boxes: Vec<DecimicroBox>,
 }
 
 /// A unit of source assembly that runs on a render worker.
@@ -259,6 +265,9 @@ struct MemberWays {
     /// Each way's extent, in an area-only compile.
     extents: HashMap<i64, Extent>,
 }
+
+/// Tagged nodes per job when an area-only read hands on pass 1's nodes.
+const AREA_NODES_PER_BATCH: usize = 8_000;
 
 /// Share of the read-OSM stage given to the ways of pass 2; the relations
 /// assembled after it have the rest.
@@ -290,6 +299,9 @@ pub fn read_osm(
             .map_or(0, |index| index.blobs_containing_any(kinds).count() as u64)
     };
     let pass1_blobs = count(&[ObjectKind::Node, ObjectKind::Relation]);
+    // An area-only read takes the area's tagged nodes from pass 1 and skips
+    // the node blobs in pass 2, which then reads these.
+    let pass2_area_blobs = count(&[ObjectKind::Way, ObjectKind::Relation]).max(1) as f64;
     // The index cannot tell which blocks hold ways without decoding them, so
     // pass 2 counts them as all blocks but those its nodes came in.
     let all_blobs = blobs.as_ref().map_or(1, |index| index.len()).max(1) as f64;
@@ -300,15 +312,24 @@ pub fn read_osm(
     // before its directory goes, which Windows needs.
     let node_store_dir = NodeStoreDir(temp.join(NODE_STORE_DIR));
     let prepare_phase = crate::profiling::Phase::start("omt_prepare_index");
-    let prepared = prepare_ingest_index_with_threads(
+    let area_boxes = area
+        .as_ref()
+        .map_or_else(Vec::new, InputArea::decimicro_boxes);
+    let mut options = PrepareOptions::new().worker_threads(workers);
+    if area.is_some() {
+        // Every tagged node near the area; `Index::node_in_area` picks.
+        options = options.keep_nodes_within(&area_boxes);
+    }
+    let mut prepared = prepare_ingest_index_with_options(
         pbf,
         IngestBuildProfile::DesktopFull,
         temp,
-        workers,
+        options,
         |report| control.set_done(report.batches_read as u64),
         || control.is_cancelled(),
     )?;
     drop(prepare_phase);
+    let area_nodes = std::mem::take(&mut prepared.tagged_nodes);
     let message = "Reading OSM and preparing vector tiles";
     progress(message);
     control.stage(CompileStage::ReadOsm, message)?;
@@ -337,6 +358,8 @@ pub fn read_osm(
         missing_relations: AtomicUsize::new(0),
         skipped_ways: AtomicUsize::new(0),
         skipped_node_references: AtomicUsize::new(0),
+        outside_ways: AtomicUsize::new(0),
+        area_boxes,
         area,
     });
     let mut sink = SourceSink {
@@ -347,10 +370,27 @@ pub fn read_osm(
         junctions: HashMap::new(),
         junction_ids: Arc::new(HashSet::new()),
     };
-    run_pass2_with_threads(
+    let mut options = Pass2Options::new().worker_threads(workers);
+    if index.area.is_some() {
+        // The nodes came from pass 1, in file order as pass 2 would hand them.
+        for nodes in area_nodes.chunks(AREA_NODES_PER_BATCH) {
+            sink.on_node_batch(NodeBatch {
+                nodes: nodes.to_vec(),
+                estimated_bytes: 0,
+            })?;
+        }
+        node_batches = all_blobs - pass2_area_blobs;
+        let filter = index.clone();
+        options = options
+            .skip_nodes()
+            .keep_ways_where(Arc::new(move |way| !filter.outside_area(way)));
+    }
+    drop(area_nodes);
+    let ways_phase = crate::profiling::Phase::start("omt_pass2_ways");
+    run_pass2_with_options(
         pbf,
         IngestBuildProfile::DesktopFull,
-        workers,
+        options,
         &mut sink,
         |report| {
             let share = match report.stage {
@@ -371,6 +411,8 @@ pub fn read_osm(
     control.set_done(PASS2_SHARE);
     sink.finish()?;
     drop(sink);
+    drop(ways_phase);
+    let _relations_phase = crate::profiling::Phase::start("omt_relations");
     let first = pipeline.processed();
     pipeline.sync_with(|done, sent| {
         let share = (done - first) as f64 / (sent - first).max(1) as f64;
@@ -381,6 +423,7 @@ pub fn read_osm(
         "{}",
         serde_json::json!({"benchmark_counts":"omt_early_way_filter",
         "skipped_ways":index.skipped_ways.load(Ordering::Relaxed),
+        "outside_ways":index.outside_ways.load(Ordering::Relaxed),
         "skipped_node_references":index.skipped_node_references.load(Ordering::Relaxed)})
     );
     let missing_ways = index.missing_ways.load(Ordering::Relaxed);
@@ -576,6 +619,46 @@ impl Job {
 }
 
 impl Index {
+    /// Whether some relation in `parents` is a boundary, whose rings then
+    /// need the way.
+    fn has_boundary_parent(&self, parents: &[i64]) -> bool {
+        parents.iter().any(|id| {
+            self.relations.get(id).is_some_and(|&r| {
+                self.prepared.supported_relations[r]
+                    .tags
+                    .get("type")
+                    .is_some_and(|t| t == "boundary")
+            })
+        })
+    }
+
+    /// In an area-only compile, whether pass 2 can drop `way` before it
+    /// reaches `ways`: no relation needs it, and the node store places all
+    /// its nodes outside the area, so no source and no junction inside the
+    /// area comes from it. Ways that `ways` skips anyway stay, for its tally.
+    fn outside_area(&self, way: &WayRef<'_>) -> bool {
+        if self.area.is_none() {
+            return false;
+        }
+        let polygon_member = self
+            .prepared
+            .multipolygon_way_ids
+            .contains(way.way_id as u64);
+        let parents = self.prepared.way_relation_memberships.get(way.way_id);
+        if skip_way_geometry(way.tags.is_empty(), parents.is_empty(), polygon_member)
+            || polygon_member
+            || self.has_boundary_parent(parents)
+            || self
+                .prepared
+                .node_store
+                .may_touch(way.node_ids, &self.area_boxes)
+        {
+            return false;
+        }
+        self.outside_ways.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     fn node_in_area(&self, node: &NormalizedNode) -> bool {
         self.area
             .as_ref()
@@ -612,17 +695,12 @@ impl Index {
             .collect()
     }
     fn coordinates(&self, ids: &[i64]) -> Option<Vec<Coord<f64>>> {
-        ids.iter()
-            .map(|id| {
-                self.prepared
-                    .node_store
-                    .get(*id)
-                    .map(|(lat, lng)| Coord { x: lng, y: lat })
-            })
-            .collect()
+        let mut nodes = self.prepared.node_store.cursor();
+        way_coordinates(ids, |id| nodes.get(id))
     }
     fn try_close_ring(&self, ring: &mut [i64]) -> bool {
-        try_close_ring(ring, |id| self.prepared.node_store.get(id))
+        let mut nodes = self.prepared.node_store.cursor();
+        try_close_ring(ring, |id| nodes.get(id))
     }
 
     /// One way's sources are `base + 2 * position + view`.
@@ -650,25 +728,16 @@ impl Index {
                 skipped_nodes += way.node_ids.len();
                 continue;
             }
-            let prepared = &self.prepared;
-            let Some(coords) = way_coordinates(&way.node_ids, |id| prepared.node_store.get(id))
-            else {
+            let member = polygon_member || self.has_boundary_parent(parents);
+            let mut nodes = self.prepared.node_store.cursor();
+            let Some(coords) = way_coordinates(&way.node_ids, |id| nodes.get(id)) else {
                 missing += 1;
                 continue;
             };
             if coords.len() < 2 {
                 continue;
             }
-            if polygon_member
-                || parents.iter().any(|id| {
-                    self.relations.get(id).is_some_and(|&r| {
-                        self.prepared.supported_relations[r]
-                            .tags
-                            .get("type")
-                            .is_some_and(|t| t == "boundary")
-                    })
-                })
-            {
+            if member {
                 let extent = match self.area {
                     Some(_) => Extent::of(&coords),
                     None => Extent::EMPTY,
