@@ -3,6 +3,82 @@
 Measurements of the compiler's time, memory and disk use. The comparison with
 Planetiler is in `parity.md`.
 
+## Baseline for 0.1.3
+
+The numbers later changes are measured against. Measured on 2026-11-19 on a
+laptop: AMD Ryzen 7 5800H (8 cores, 16 threads), 16 GiB of RAM, Windows 11,
+NVMe SSD (NTFS), otherwise idle. Command line (mimalloc) built from `main`
+at 0.1.3 (`45dee3c`), `--building-levels`, the real supplemental datasets
+(already unpacked and cached). Extracts from Geofabrik: Małopolskie
+(2026-11-17, 194 MiB) and Poland (2026-11-18, 2022 MiB). Each figure is the
+median of three runs (four for the area-only compile), interleaved so that
+every thread count saw the same machine; 16 threads is all the cores.
+
+- Time is wall-clock for the whole process. Peak RSS is the peak working
+  set, which counts the memory-mapped extract; peak private is the peak
+  commit charge (`PeakPagefileUsage`), the nearer figure to anonymous memory.
+- Peak scratch is the output's directory (scratch, archive and building
+  levels as they are written), sampled every 0.25 s.
+- Every run of a compile wrote the same archive, byte for byte, at every
+  thread count.
+
+### Małopolskie
+
+| Threads | Time | Peak RSS | Peak private | Peak scratch |
+|---|---|---|---|---|
+| 2 | 46.0 s | 474 MiB | 435 MiB | 365 MiB (1.9×) |
+| 4 | 24.9 s | 570 MiB | 558 MiB | 361 MiB (1.9×) |
+| 8 | 16.7 s | 735 MiB | 804 MiB | 357 MiB (1.8×) |
+| 16 | 15.5 s | 1190 MiB | 1364 MiB | 335 MiB (1.7×) |
+
+- 146.6 MiB archive (11,293 tiles) and 26.3 MiB of building levels.
+- Runs varied by under 1% in time.
+- Stages with 2 threads: `index_osm` 0.8 s, `read_osm` 24.7 s,
+  `write_tiles` 17.8 s, `building_levels` 2.4 s. With 16: 0.3, 6.5, 6.8 and
+  1.6 s.
+- The scratch peaks twice, about equally: at the end of `read_osm` (the
+  packed node store, about 125 MiB, and the compressed sort runs) and at the
+  end of `write_tiles` (the runs and the finished archive).
+
+### Poland, whole extract
+
+| Threads | Time | Peak RSS | Peak private | Peak scratch |
+|---|---|---|---|---|
+| 2 | 537.1 s | 2891 MiB | 2536 MiB | 4598 MiB (2.3×) |
+| 4 | 295.6 s | 3003 MiB | 2703 MiB | 4639 MiB (2.3×) |
+| 8 | 213.7 s | 3229 MiB | 3073 MiB | 4631 MiB (2.3×) |
+| 16 | 200.5 s | 3636 MiB | 3550 MiB | 4639 MiB (2.3×) |
+
+- 1654 MiB archive (222,127 tiles, 58.9 million features) and 305.5 MiB of
+  building levels.
+- The first two rounds agreed within 6%; the third ran 20–30% slower at 4,
+  8 and 16 threads, probably from other work on the machine, so the median is the
+  slower of the first two.
+- Stages with 2 threads: `index_osm` 7.7 s, `read_osm` 253 s, `write_tiles`
+  235 s, `building_levels` 32 s. With 16: 2.9, 70, 90 and 26 s.
+- Past 8 threads, time barely improves while memory still grows.
+
+### Poland, `--area-only` of a small box
+
+`--bounds 19.90 50.04 19.98 50.08 --area-only` (central Kraków, about 6 by
+4 km) from the whole Poland extract:
+
+| Threads | Time (range) | Peak RSS | Peak private | Peak scratch |
+|---|---|---|---|---|
+| 2 | 31.6 s (22.8–45.2) | 2700 MiB | 1341 MiB | 1556 MiB |
+| 4 | 15.1 s (13.8–17.2) | 2772 MiB | 1447 MiB | 1550 MiB |
+| 8 | 11.6 s (11.0–45.2) | 2935 MiB | 1673 MiB | 1550 MiB |
+| 16 | 12.9 s (11.4–29.2) | 3204 MiB | 2033 MiB | 1550 MiB |
+
+- 4.0 MiB archive (44 tiles) and 0.7 MiB of building levels.
+- Times spread widely because most of the work is reading the 2 GiB extract:
+  the slow runs found it out of the page cache (one 2-thread run spent 7 s
+  reading the supplemental datasets and 18 s indexing, against 0.3 s and
+  8 s). With a warm cache, `read_osm` takes 7.5 s on 16 threads and
+  `write_tiles` under 0.5 s.
+- A small area-only compile still uses more memory and scratch than the
+  whole of Małopolskie: the cost scales with the extract read, not the area.
+
 ## Memory
 
 Peak resident memory of a whole process (`ru_maxrss`), from two runs each
