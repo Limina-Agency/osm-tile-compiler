@@ -31,6 +31,9 @@ struct CompilerProcessRequest {
     /// A GeoJSON or Osmosis `.poly` file limiting the compile to its area.
     #[serde(default)]
     polygon_path: Option<PathBuf>,
+    /// Read only the OSM data in and near the polygon [default: no].
+    #[serde(default)]
+    area_only: bool,
     /// Layers to write [default: all]; not together with `excludeLayers`.
     #[serde(default)]
     layers: Option<Vec<String>>,
@@ -163,6 +166,7 @@ fn run() -> Result<(), WorkerError> {
     compile.sources_policy = SourcesPolicy::FetchAndVerify;
     compile.omit_sources = omit_sources;
     compile.polygon = request.polygon_path;
+    compile.area_only = request.area_only;
     compile.layers = request.layers;
     compile.exclude_layers = request.exclude_layers;
     compile.languages = request.languages;

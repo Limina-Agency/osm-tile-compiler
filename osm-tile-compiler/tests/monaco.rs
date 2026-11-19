@@ -63,6 +63,7 @@ fn compile_selected(
         layers,
         languages,
         omit_sources: Vec::new(),
+        area_only: false,
     })
     .unwrap();
     (result, output)

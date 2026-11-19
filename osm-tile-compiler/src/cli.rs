@@ -74,6 +74,10 @@ Compile options:
                         W > E crosses the antimeridian
   --polygon <FILE>      Write only the tiles that a polygon covers, read from
                         GeoJSON or an Osmosis .poly file
+  --area-only           Read only the OSM data in and near the area: a small
+                        area compiles from a country extract in seconds. The
+                        highest zoom's tiles are as in a full read; lower
+                        zooms show only the area's surroundings
   --center <LON LAT Z>  Where viewers start [default: the middle of the area,
                         at the highest zoom that shows all of it]
   --min-zoom <N>        Lowest zoom, 0-14 [default: 0]
@@ -132,6 +136,7 @@ struct CompileArgs {
     omit_sources: Vec<SupplementalDataset>,
     bounds: Option<CompileBounds>,
     polygon: Option<PathBuf>,
+    area_only: bool,
     center: Option<ArchiveCenter>,
     archive: ArchiveOptions,
     min_zoom: u8,
@@ -290,6 +295,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut sources = None;
     let mut bounds = None;
     let mut polygon = None;
+    let mut area_only = false;
     let mut center = None;
     let mut archive = ArchiveOptions::default();
     let mut min_zoom = 0;
@@ -342,6 +348,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 bounds = Some(CompileBounds::new(north, south, east, west));
             }
             "--polygon" => polygon = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--area-only" => area_only = true,
             "--name" => archive.name = value(&mut args, &flag)?.to_string_lossy().into_owned(),
             "--description" => {
                 archive.description = value(&mut args, &flag)?.to_string_lossy().into_owned()
@@ -458,6 +465,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         omit_sources,
         bounds,
         polygon,
+        area_only,
         center,
         archive,
         min_zoom,
@@ -927,6 +935,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.omit_sources = args.omit_sources;
     request.bounds = Some(bounds);
     request.polygon = args.polygon;
+    request.area_only = args.area_only;
     request.center = args.center;
     request.archive = args.archive;
     request.min_zoom = args.min_zoom;

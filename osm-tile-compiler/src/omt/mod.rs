@@ -7,6 +7,7 @@ mod f64_arrangement;
 mod f64_buffer;
 mod float_repair;
 mod ingest;
+mod input_area;
 mod interior_point;
 mod java_hashmap;
 mod jts_buffer;
@@ -100,6 +101,11 @@ pub struct OpenMapTilesRequest {
     /// them, and [`SupplementalDataset::without_warning`] says what the map
     /// lacks.
     pub omit_sources: Vec<SupplementalDataset>,
+    /// Reads only the OSM objects in and near the area (`bounds`, within
+    /// `area`'s box), so a small area compiles from a large extract in
+    /// seconds. The tiles at `max_zoom` keep the content a full read gives
+    /// them; lower zooms show only what lies near the area.
+    pub area_only: bool,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenMapTilesResult {
@@ -487,6 +493,9 @@ pub(crate) fn compile(
         &mut pipeline,
         &profile,
         control,
+        request
+            .area_only
+            .then(|| input_area::InputArea::new(bounds, request.max_zoom)),
         &mut progress,
         &mut warnings,
     )?;
