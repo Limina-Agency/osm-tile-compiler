@@ -149,7 +149,7 @@ show everything in the extract that they reach. `--area-only` reads only
 the OSM objects in and near the area: those whose bounding box touches the
 tiles written at the highest zoom, or the tile around them, each read whole.
 A small area then compiles from a large extract in seconds: a 9 by 8 km box
-in the Tatras takes 4.5 s from the Małopolskie extract instead of 11.9 s
+in the Tatras takes 2.5 s from the Małopolskie extract instead of 9.9 s
 (four threads, Linux, no supplemental datasets). The tiles at the highest
 zoom are the same as from a full read, byte for byte; lower zooms show only
 what lies near the area, besides the supplemental datasets.
