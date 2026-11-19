@@ -145,9 +145,15 @@ The result is the basemap manifest the worker writes (`format`,
 the `bounds` compiled.
 
 The field layout follows the 0.2 request types (`ZoomRange`,
-`LayerSelection`, `Area` with its `ReadScope`), so it does not change when
-they land. Until then the library maps it onto today's `BasemapRequest`;
-afterwards it deserializes the 0.2 request directly (roadmap item A9).
+`LayerSelection`, `Area` with its `ReadScope`), and the library maps it onto
+`BasemapRequest` field by field. `otc_job_start` then runs
+`BasemapRequest::validate()`, so whatever needs no reading or network fails
+synchronously: unknown layers or languages, zooms outside 0 to 14,
+`threads` of 0, a gzip level above 9, bad bounds or center, `near_area`
+without bounds or a polygon, an output that already exists. What needs
+reading (a PBF or polygon that cannot be opened, missing datasets) fails the
+job instead, with `error.kind` `invalid_request`. Once the request types get
+serde support with these names (roadmap item A9), the mapping goes away.
 
 ## Versioning
 
@@ -162,7 +168,7 @@ semantic versioning, like the Rust API.
 - Request kinds: `fetch_sources` (download the supplemental datasets ahead of
   a compile, with byte progress), `fetch_extract` (a Geofabrik area), then
   `verify`/`inspect` and delta `apply`.
-- `otc_validate(json, &error)`: the 0.2 `BasemapRequest::validate()` without
+- `otc_validate(json, &error)`: the same checks as `otc_job_start` without
   starting a job, for forms that check as the user types.
 - Packaging: an XCFramework for iOS and a JNI-ready `.so` per Android ABI
   (with the CI thread's iOS and Android builds), then the Swift package (F4)

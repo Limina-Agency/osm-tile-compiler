@@ -2,15 +2,16 @@
 //! parses its request when the job starts, so a malformed one fails
 //! `otc_job_start` at once, and returns the work the job runs.
 //!
-//! The `compile_basemap` request below mirrors today's
-//! `osm_tile_compiler::BasemapRequest`. It is provisional: once the 0.2 API
-//! gives the request types serde support (roadmap item A9), it becomes that
-//! request, deserialized as is.
+//! The `compile_basemap` request below is a JSON mirror of
+//! `osm_tile_compiler::BasemapRequest`, mapped onto it field by field and
+//! checked with `BasemapRequest::validate` before the job starts. Once the
+//! request types get serde support with these names (roadmap item A9), the
+//! mirror can go.
 
 use crate::job::{JobError, Progress, Work};
 use osm_tile_compiler::{
-    ArchiveCenter, BasemapRequest, CompileBounds, CompileError, SourcesPolicy, SupplementalDataset,
-    compile_basemap,
+    ArchiveCenter, Area, AreaPolygon, BasemapRequest, CompileBounds, CompileError, LayerSelection,
+    ReadScope, SourcesPolicy, SupplementalDataset, ZoomRange, compile_basemap,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -142,8 +143,8 @@ struct AreaJson {
 }
 
 /// `compile_basemap`'s request. Every field but the four paths is optional
-/// and defaults as `BasemapRequest::new` does. Its shape follows the 0.2
-/// request types (`zoom`, `layers`, `area`), so it stays when they land.
+/// and defaults as `BasemapRequest::new` does. Its shape follows the request
+/// types (`ZoomRange`, `LayerSelection`, `Area`).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompileBasemapJson {
@@ -188,17 +189,20 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
             })
         })
         .collect::<Result<_, _>>()?;
-    request.bounds = json
+    let mut area = Area::whole_extract();
+    area.bounds = json
         .area
         .bounds
         .map(|b| CompileBounds::new(b.north, b.south, b.east, b.west));
-    request.polygon = json.area.polygon;
-    request.area_only = matches!(json.area.read, ReadScopeJson::NearArea);
-    request.center = json.center.map(|c| ArchiveCenter {
-        longitude: c.longitude,
-        latitude: c.latitude,
-        zoom: c.zoom,
-    });
+    area.polygon = json.area.polygon.map(AreaPolygon::File);
+    area.read = match json.area.read {
+        ReadScopeJson::WholeExtract => ReadScope::WholeExtract,
+        ReadScopeJson::NearArea => ReadScope::NearArea,
+    };
+    request.area = area;
+    request.center = json
+        .center
+        .map(|c| ArchiveCenter::new(c.longitude, c.latitude, c.zoom));
     let (archive, given) = (&mut request.archive, json.archive);
     if let Some(name) = given.name {
         archive.name = name;
@@ -210,22 +214,21 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
         archive.attribution = attribution;
     }
     archive.gzip_level = given.gzip_level.unwrap_or(archive.gzip_level);
-    request.min_zoom = json.zoom.min.unwrap_or(request.min_zoom);
-    request.max_zoom = json.zoom.max.unwrap_or(request.max_zoom);
-    if request.min_zoom > request.max_zoom {
-        return Err(JobError::invalid_request(format!(
-            "zoom.min ({}) is above zoom.max ({})",
-            request.min_zoom, request.max_zoom
-        )));
-    }
+    let zoom = ZoomRange::default();
+    request.zoom = ZoomRange::new(
+        json.zoom.min.unwrap_or(zoom.min()),
+        json.zoom.max.unwrap_or(zoom.max()),
+    )?;
     request.threads = json.threads.unwrap_or(request.threads);
-    match json.layers {
-        None => {}
-        Some(LayersJson::Only(layers)) => request.layers = Some(layers),
-        Some(LayersJson::Except(layers)) => request.exclude_layers = Some(layers),
-    }
+    request.layers = match json.layers {
+        None => LayerSelection::All,
+        Some(LayersJson::Only(layers)) => LayerSelection::only(layers),
+        Some(LayersJson::Except(layers)) => LayerSelection::except(layers),
+    };
     request.languages = json.languages;
     request.building_levels = json.building_levels;
+    // Everything that needs no reading or network fails the start, not the job.
+    request.validate()?;
     Ok(request)
 }
 
@@ -321,11 +324,10 @@ mod tests {
             request.omit_sources,
             vec![SupplementalDataset::from_id("water_polygons").unwrap()]
         );
-        assert_eq!(request.bounds.unwrap().west, 3.0);
-        assert!(request.area_only);
-        assert_eq!(request.exclude_layers, Some(vec!["poi".to_string()]));
-        assert_eq!(request.layers, None);
-        assert_eq!((request.min_zoom, request.max_zoom), (2, 12));
+        assert_eq!(request.area.bounds.unwrap().west, 3.0);
+        assert_eq!(request.area.read, ReadScope::NearArea);
+        assert_eq!(request.layers, LayerSelection::except(["poi"]));
+        assert_eq!(request.zoom, ZoomRange::new(2, 12).unwrap());
         assert_eq!(request.threads, 3);
         assert_eq!(request.archive.name, "Test");
         assert_eq!(request.archive.gzip_level, 6);
@@ -347,7 +349,11 @@ mod tests {
         );
         assert!(parse_request(r#","colour":"red""#).contains("unknown field `colour`"));
         assert!(parse_request(r#","sourcesPolicy":"always""#).contains("unknown variant"));
-        assert!(parse_request(r#","zoom":{"min":9,"max":3}"#).contains("zoom.min (9) is above"));
+        assert!(parse_request(r#","zoom":{"min":9,"max":3}"#).contains("zooms must satisfy"));
+        // BasemapRequest::validate runs at start too.
+        assert!(parse_request(r#","layers":{"only":["roads"]}"#).contains("roads"));
+        assert!(parse_request(r#","threads":0"#).contains("threads must be positive"));
+        assert!(parse_request(r#","area":{"read":"near_area"}"#).contains("bounds or a polygon"));
         assert!(
             error(r#"{"abiVersion":1,"kind":"compile_basemap"}"#)
                 .message

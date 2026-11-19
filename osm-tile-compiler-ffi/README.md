@@ -13,5 +13,4 @@ back into the host.
 The crate builds a `staticlib` (for an iOS XCFramework), a `cdylib` (for
 Android and dynamic links) and an `rlib`. It installs no allocator.
 
-Experimental: the request kinds follow the 0.2 API, and the crate is not
-published until that settles.
+Experimental: not published until the 0.2 API is released.

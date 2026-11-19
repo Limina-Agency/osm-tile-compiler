@@ -130,10 +130,10 @@ fn a_freed_running_job_cleans_up() {
 }
 
 #[test]
-fn a_request_the_compiler_rejects_fails_the_job() {
+fn a_request_that_fails_once_it_reads_fails_the_job() {
     let dir = tempfile::tempdir().unwrap();
     let mut envelope = compile(dir.path());
-    envelope["request"]["layers"] = json!({ "only": ["no_such_layer"] });
+    envelope["request"]["inputPbf"] = json!(dir.path().join("missing.osm.pbf"));
     let job = start(&envelope).unwrap();
     assert_eq!(unsafe { otc_job_wait(job, 30_000) }, 2);
     let error = &result(job)["error"];
@@ -147,6 +147,17 @@ fn bad_requests_fail_to_start() {
     assert_eq!(status, OTC_ERROR_INVALID_REQUEST);
     assert_eq!(error["kind"], "invalid_request");
     assert!(error["message"].as_str().unwrap().contains("nope"));
+
+    // What BasemapRequest::validate refuses fails the start, not the job.
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelope = compile(dir.path());
+    envelope["request"]["layers"] = json!({ "only": ["no_such_layer"] });
+    let (status, error) = start(&envelope).unwrap_err();
+    assert_eq!(status, OTC_ERROR_INVALID_REQUEST);
+    assert!(
+        error["message"].as_str().unwrap().contains("no_such_layer"),
+        "{error}"
+    );
 
     let mut job = null_mut();
     let status = unsafe { otc_job_start(std::ptr::null(), &mut job, null_mut()) };
