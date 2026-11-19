@@ -450,32 +450,125 @@ pub(super) fn read_record(reader: &mut impl Read) -> Result<Option<EncodedRecord
 
 /// One worker's in-memory run buffer. Full buffers are sorted and spilled to
 /// run files by the owning thread; unfinished runs are deleted on drop.
+///
+/// Records are kept as the frames a run file holds, one after another in
+/// `frames`, with a 32-byte sort entry each: a record costs its frame and its
+/// entry, where an `EncodedRecord` costs 80 bytes and a heap block for its
+/// payload besides.
 pub(super) struct Sorter {
     directory: PathBuf,
     worker: usize,
     budget: usize,
-    buffer: Vec<EncodedRecord>,
-    bytes: usize,
+    frames: Vec<u8>,
+    entries: Vec<SortEntry>,
     runs: Vec<PathBuf>,
     spilled: Arc<AtomicU64>,
 }
+
+/// A buffered record's sort key, less what the frame at `offset` holds: the
+/// name of a layer outside the table, and the sequence, which decides only
+/// between records equal in the rest.
+#[derive(Clone, Copy)]
+struct SortEntry {
+    tile_id: u64,
+    sort_key: i64,
+    id: u64,
+    offset: u32,
+    /// The layer's table index, or `LAYER_VERBATIM` for a named layer.
+    layer: u8,
+}
+
+/// The parts of a buffered frame's key that `SortEntry` leaves out.
+struct FrameKey<'a> {
+    layer: Option<&'a str>,
+    seq: Seq,
+}
+
+impl FrameKey<'_> {
+    /// Reads the key of the frame at the start of `frame`, which
+    /// `write_record` wrote.
+    fn of(frame: &[u8]) -> FrameKey<'_> {
+        let parse = || -> Result<FrameKey<'_>, String> {
+            let header = frame
+                .get(2..2 + usize::from(*frame.get(1).ok_or("Truncated OMT frame")?))
+                .ok_or("Truncated OMT frame")?;
+            let mut header = Reader::new(header);
+            header.varint()?;
+            header.varint()?;
+            let layer = match header.u8()? {
+                LAYER_VERBATIM => Some(header.str()?),
+                _ => None,
+            };
+            header.zigzag()?;
+            header.varint()?;
+            let seq = Seq {
+                source: header.varint()?,
+                feature: u32::try_from(header.varint()?).map_err(|e| e.to_string())?,
+                record: u32::try_from(header.varint()?).map_err(|e| e.to_string())?,
+            };
+            Ok(FrameKey { layer, seq })
+        };
+        parse().expect("Sorter frames are written by write_record")
+    }
+}
+
+impl SortEntry {
+    /// The order of `SortKey`, on buffered frames.
+    fn cmp(&self, other: &Self, frames: &[u8]) -> Ordering {
+        let frame = |entry: &Self| FrameKey::of(&frames[entry.offset as usize..]);
+        self.tile_id
+            .cmp(&other.tile_id)
+            .then_with(|| {
+                if self.layer != LAYER_VERBATIM && other.layer != LAYER_VERBATIM {
+                    return self.layer.cmp(&other.layer);
+                }
+                let name = |entry: &Self| {
+                    frame(entry)
+                        .layer
+                        .unwrap_or_else(|| LAYER_NAMES[usize::from(entry.layer)])
+                };
+                name(self).cmp(name(other))
+            })
+            .then_with(|| self.sort_key.cmp(&other.sort_key))
+            .then_with(|| self.id.cmp(&other.id))
+            .then_with(|| frame(self).seq.cmp(&frame(other).seq))
+    }
+}
+
 impl Sorter {
     pub(super) fn add(&mut self, record: EncodedRecord) -> Result<(), String> {
         let bytes = record.frame_bytes();
-        if self.bytes.saturating_add(bytes) > self.budget && !self.buffer.is_empty() {
+        if self.frames.len().saturating_add(bytes) > self.budget && !self.entries.is_empty() {
             self.spill()?;
         }
-        self.bytes += bytes;
-        self.buffer.push(record);
+        if self.frames.capacity() == 0 {
+            // The buffer fills to the budget before it spills; reserving it
+            // whole saves growing (and holding up to twice) as it fills.
+            self.frames.reserve(self.budget.min(MAX_RECORD_BYTES));
+        }
+        let offset = u32::try_from(self.frames.len())
+            .map_err(|_| "OMT sort buffer exceeds 4 GiB".to_string())?;
+        write_record(&mut self.frames, &record)?;
+        self.entries.push(SortEntry {
+            tile_id: record.key.tile_id,
+            sort_key: record.key.sort_key,
+            id: record.key.id,
+            offset,
+            layer: match record.key.layer {
+                Layer::Known(id) => id,
+                Layer::Other(_) => LAYER_VERBATIM,
+            },
+        });
         Ok(())
     }
     fn spill(&mut self) -> Result<(), String> {
-        if self.buffer.is_empty() {
+        if self.entries.is_empty() {
             return Ok(());
         }
         let _phase = crate::profiling::Phase::start("omt_spill_sort_write");
         // Keys are unique (they end in the insertion sequence).
-        self.buffer.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        let frames = &self.frames;
+        self.entries.sort_unstable_by(|a, b| a.cmp(b, frames));
         let path = self.directory.join(format!(
             "run-w{:03}-{:06}.bin",
             self.worker,
@@ -483,13 +576,17 @@ impl Sorter {
         ));
         let mut writer = RunWriter::create(&path)?;
         self.runs.push(path);
-        for record in &self.buffer {
-            write_record(&mut writer, record)?;
+        for entry in &self.entries {
+            let frame = &frames[entry.offset as usize..];
+            let mut header = Reader::new(&frame[2..]);
+            let payload = usize::try_from(header.varint()?).map_err(|e| e.to_string())?;
+            let len = 2 + usize::from(frame[1]) + payload;
+            writer.write_all(&frame[..len]).map_err(|e| e.to_string())?;
         }
         let spilled = writer.finish()?;
         self.spilled.fetch_add(spilled, AtomicOrdering::Relaxed);
-        self.buffer.clear();
-        self.bytes = 0;
+        self.entries.clear();
+        self.frames.clear();
         Ok(())
     }
     /// Spills the remainder and hands the run files to the caller.
@@ -562,8 +659,8 @@ impl Store {
             directory: self.directory.clone(),
             worker,
             budget,
-            buffer: vec![],
-            bytes: 0,
+            frames: vec![],
+            entries: vec![],
             runs: vec![],
             spilled: self.spilled.clone(),
         }
@@ -3350,6 +3447,46 @@ mod tests {
         malformed.payload.truncate(3);
         assert!(malformed.decode().is_err());
     }
+    #[test]
+    fn sorter_runs_hold_the_records_in_sort_key_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path()).unwrap();
+        // Table and named layers, equal keys apart from the sequence, and a
+        // budget small enough to spill several runs.
+        let layers = ["poi", "zzz_custom", "building", "aaa_custom", "water"];
+        let mut expected = vec![];
+        let mut sorter = store.sorter(0, 600);
+        for i in 0..200u64 {
+            let mut r = record(i % 3);
+            r.tile_id = (i * 7) % 4;
+            r.layer = layers[(i as usize * 3) % layers.len()].into();
+            r.sort_key = (i % 5) as i64 - 2;
+            let seq = Seq {
+                source: (i * 13) % 17,
+                feature: (i % 2) as u32,
+                record: i as u32,
+            };
+            let encoded = EncodedRecord::encode(&r, seq).unwrap();
+            expected.push(encoded.key.clone());
+            sorter.add(encoded).unwrap();
+        }
+        let runs = sorter.finish().unwrap();
+        assert!(runs.len() > 1, "{} runs", runs.len());
+        let mut found = vec![];
+        for run in &runs {
+            let mut reader = RunReader::open(run).unwrap();
+            let mut keys = vec![];
+            while let Some(record) = read_record(&mut reader).unwrap() {
+                keys.push(record.key);
+            }
+            assert!(keys.is_sorted(), "a run out of order");
+            found.extend(keys);
+        }
+        found.sort();
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
     #[test]
     fn opaque_merge_orders_equal_keys_by_sequence_across_multiple_passes() {
         let temp = tempfile::tempdir().unwrap();
