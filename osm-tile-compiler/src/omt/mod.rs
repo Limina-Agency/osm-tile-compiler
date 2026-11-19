@@ -22,6 +22,7 @@ mod repair;
 mod selection;
 mod simplify;
 mod snap_round;
+mod spill;
 mod store;
 mod supplements;
 mod transport;
