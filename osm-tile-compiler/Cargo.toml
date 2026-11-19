@@ -19,12 +19,17 @@ workspace = true
 [features]
 # The binary's allocator. Apps that link the library leave it out with
 # `default-features = false`: the library itself never installs one.
-default = ["mimalloc"]
+default = ["mimalloc", "ctrlc"]
 mimalloc = ["dep:mimalloc"]
+# The binary's Ctrl-C, SIGTERM and SIGHUP handler, which cancels a running
+# command so that it removes its scratch space and partial outputs. The
+# library never installs one.
+ctrlc = ["dep:ctrlc"]
 benchmark-profiling = []
 
 [dependencies]
 mimalloc = { version = "0.1", default-features = false, optional = true }
+ctrlc = { version = "3.5", features = ["termination"], optional = true }
 ureq.workspace = true
 sha2.workspace = true
 hex = "0.4"

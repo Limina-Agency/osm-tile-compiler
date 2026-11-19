@@ -664,3 +664,51 @@ fn worker_mode_still_reports_bad_arguments_as_error_events() {
         "{event}"
     );
 }
+
+/// Ctrl-C during a compile stops it with status 130 and leaves nothing
+/// behind: no archive, no partial archive, no scratch directory.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_cancels_a_compile_and_removes_its_scratch() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.pmtiles");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_osm-tile-compiler"))
+        .args(["compile".as_ref(), monaco_pbf().as_os_str()])
+        .args(["--output".as_ref(), output.as_os_str()])
+        .args(["--omit-sources", "all", "--threads", "2"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The first stage line means the compile is under way, with its scratch
+    // directory claimed.
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut seen = String::new();
+    loop {
+        let mut line = String::new();
+        assert!(stderr.read_line(&mut line).unwrap() > 0, "{seen}");
+        seen.push_str(&line);
+        if line.starts_with('[') {
+            break;
+        }
+    }
+    assert!(dir.path().join("out.pmtiles.tmp").is_dir(), "{seen}");
+    let kill = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
+    seen.push_str(&rest);
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(130), "{seen}");
+    assert!(seen.contains("the compile was cancelled"), "{seen}");
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}\n{seen}");
+}

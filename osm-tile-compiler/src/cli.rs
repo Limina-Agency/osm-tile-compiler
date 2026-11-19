@@ -1,7 +1,9 @@
 //! The human command line: `compile`, `building-levels`, `fetch-sources`,
 //! `style`, `inspect`, `verify`, `diff`, `apply`, `help`, `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
-//! the version, `--json`). Usage errors exit with 2, failures with 1.
+//! the version, `--json`). Usage errors exit with 2, failures with 1, and
+//! a command stopped by Ctrl-C with 130 (see `interrupt`).
+use crate::interrupt;
 use osm_tile_compiler::{
     ArchiveCenter, BasemapRequest, BuildingLevelsReport, CompileBounds, CompileError, CompileStage,
     ExtractEvent, FetchEvent, FetchMode, SourcesPolicy, SupplementalDataset,
@@ -12,7 +14,7 @@ use osm_tile_compiler::{
     building_levels_path, compile_basemap, fetch_extract, fetch_sources as fetch_datasets,
     omt::{LANGUAGES, LAYERS, resolve_languages, select_layers},
     tile_stats::kib,
-    write_building_levels,
+    write_building_levels_cancellable,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -151,7 +153,8 @@ Layers: {LAYERS}
 Languages: {LANGUAGES}
 
 Progress goes to stderr. Exit status: 0 on success, 1 on failure, 2 on a usage
-error.
+error, 130 when stopped by Ctrl-C. Ctrl-C stops a compile and removes its
+scratch space and partial outputs; press it twice to quit at once.
 
 Apps can run this binary as a worker with
 `[--parent-stdin] --request <request.json>`; that mode reports JSON lines on
@@ -263,7 +266,11 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Ok(()) => 0,
         Err(message) => {
             eprintln!("error: {message}");
-            1
+            if interrupt::requested() {
+                interrupt::EXIT_STATUS
+            } else {
+                1
+            }
         }
     }
 }
@@ -790,13 +797,14 @@ fn fetch(directory: &Path, status: &mut Status) -> Result<(), String> {
                 megabytes(bytes)
             )),
         },
-        || false,
+        interrupt::requested,
     )
     .map(drop)
     .map_err(String::from)
 }
 
 fn fetch_sources(directory: &Path) -> Result<(), String> {
+    let _cooperating = interrupt::cooperate();
     let mut status = Status::new();
     status.line(&format!(
         "Fetching supplemental datasets into {}",
@@ -951,7 +959,15 @@ fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
         args.input.display(),
         args.output.display()
     ));
-    let report = write_building_levels(&args.input, &args.output, threads)?;
+    let _cooperating = interrupt::cooperate();
+    let report =
+        write_building_levels_cancellable(&args.input, &args.output, threads, interrupt::requested)
+            .map_err(|error| match error {
+                CompileError::Cancelled => {
+                    format!("cancelled; {} was not written", args.output.display())
+                }
+                error => error.to_string(),
+            })?;
     report_levels(&mut status, &args.output, &report);
     Ok(())
 }
@@ -1005,12 +1021,14 @@ fn area_extract(name: &str, directory: &Path, status: &mut Status) -> Result<Pat
                 megabytes(bytes)
             )),
         },
-        || false,
+        interrupt::requested,
     )
     .map_err(String::from)
 }
 
 fn compile(args: CompileArgs) -> Result<(), String> {
+    // Downloads and the compile stop when asked, removing what they wrote.
+    let _cooperating = interrupt::cooperate();
     let levels = building_levels_path(&args.output);
     for archive in [&args.output, &levels] {
         if archive.exists() {
@@ -1074,6 +1092,9 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     } else {
         None
     };
+    // A second Ctrl-C ends the process without waiting for the compile to
+    // clean up; a default scratch directory is then removed at least.
+    let _scratch_on_exit = owned_temp.then(|| interrupt::remove_on_exit(temp_dir.clone()));
     let threads = args
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -1127,14 +1148,17 @@ fn compile(args: CompileArgs) -> Result<(), String> {
             }
             stage = Some(progress.stage);
         },
-        || false,
+        interrupt::requested,
     );
     let cleanup = match scratch {
         Some(marker) => release_scratch(&temp_dir, marker),
         None => Ok(()),
     };
     let output = output.map_err(|error| match error {
-        CompileError::Cancelled => "the compile was cancelled".to_string(),
+        CompileError::Cancelled => format!(
+            "the compile was cancelled; {} was not written",
+            args.output.display()
+        ),
         error => error.to_string(),
     })?;
     cleanup?;
@@ -1238,6 +1262,7 @@ fn delta_summary(manifest: &DeltaManifest, delta_bytes: u64) -> String {
 }
 
 fn diff(args: DeltaArgs) -> Result<(), String> {
+    let _partial = interrupt::remove_on_exit(delta::partial_path(&args.output));
     let report = delta::diff(&args.base, &args.other, &args.output)?;
     if args.json {
         println!(
@@ -1255,6 +1280,7 @@ fn diff(args: DeltaArgs) -> Result<(), String> {
 }
 
 fn apply(args: DeltaArgs) -> Result<(), String> {
+    let _partial = interrupt::remove_on_exit(delta::partial_path(&args.output));
     let report = delta::apply(&args.base, &args.other, &args.output)?;
     if args.json {
         println!(

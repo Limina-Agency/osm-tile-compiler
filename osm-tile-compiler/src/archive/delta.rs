@@ -560,17 +560,23 @@ struct PendingFile {
     kept: bool,
 }
 
+/// Where [`diff`] and [`apply`] write `output` until it is complete:
+/// `<output>.partial`, removed if they fail.
+pub fn partial_path(output: &Path) -> PathBuf {
+    let mut name = output.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    output.with_file_name(name)
+}
+
 impl PendingFile {
     fn create(destination: &Path) -> Result<(Self, File), String> {
         if destination.exists() {
             return Err(format!("{} already exists", destination.display()));
         }
-        let mut name = destination
-            .file_name()
-            .ok_or_else(|| format!("{} is not a file path", destination.display()))?
-            .to_os_string();
-        name.push(".partial");
-        let temporary = destination.with_file_name(name);
+        if destination.file_name().is_none() {
+            return Err(format!("{} is not a file path", destination.display()));
+        }
+        let temporary = partial_path(destination);
         let file = File::options()
             .write(true)
             .create_new(true)

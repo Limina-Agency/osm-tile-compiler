@@ -20,7 +20,7 @@
 //! group, so the bytes do not depend on the number of threads, and memory is
 //! bounded by one z11 tile a thread, plus the archive and the finished tiles.
 
-use crate::control::Control;
+use crate::control::{CompileError, Control};
 use crate::omt::PartialArchive;
 use fast_mvt::{MvtFeatureRef, MvtReaderRef, MvtValueRef};
 use flate2::{read::GzDecoder, write::GzEncoder};
@@ -132,6 +132,24 @@ pub fn write_building_levels(
     threads: usize,
 ) -> Result<BuildingLevelsReport, String> {
     write_levels(input, output, threads, &Control::detached())
+}
+
+/// [`write_building_levels`], stopping when `should_cancel` returns true,
+/// which it is asked every 50 ms or so. Whatever the outcome, no partial
+/// archive is left at `output`.
+pub fn write_building_levels_cancellable(
+    input: &Path,
+    output: &Path,
+    threads: usize,
+    should_cancel: impl Fn() -> bool,
+) -> Result<BuildingLevelsReport, CompileError> {
+    crate::control::run(
+        threads,
+        false,
+        |_| {},
+        should_cancel,
+        |control| write_levels(input, output, threads, control),
+    )
 }
 
 /// [`write_building_levels`], with progress and cancelling. Inside a rayon
