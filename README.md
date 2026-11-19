@@ -91,6 +91,12 @@ osm-tile-compiler fetch-sources sources/
 osm-tile-compiler compile monaco-latest.osm.pbf --output monaco.pmtiles --sources sources/
 ```
 
+Or let `compile` download the extract by its region's name:
+
+```sh
+osm-tile-compiler compile --area monaco --output monaco.pmtiles --sources sources/
+```
+
 This writes `monaco.pmtiles`, zooms 0 to 14. `compile --fetch` downloads any dataset missing from
 `sources/` instead. Progress goes to stderr; `--json` prints the result,
 with tile size statistics, on stdout. `osm-tile-compiler --help` lists every
@@ -132,6 +138,15 @@ licenses require.
 ## Choosing what to compile
 
 ### Area
+
+`--area NAME` compiles a Geofabrik extract instead of a local PBF, as
+Planetiler's `--area` does. NAME is looked up in Geofabrik's index: an
+identifier (`malopolskie`, `us/georgia`), a name with or without accents
+(`Małopolskie`, `Lesser Poland Voivodeship`) or an ISO code (`PL-12`). A
+name that several regions share, such as `Georgia`, is refused with their
+identifiers. The extract is saved in `--download-dir` (by default the
+`--sources` directory) as `<ID>.osm.pbf` and reused by later compiles;
+delete it to download a newer one.
 
 By default the area is the PBF header's bounding box. `--bounds W S E N`
 sets another box, and `--polygon FILE` (GeoJSON, or the Osmosis `.poly`

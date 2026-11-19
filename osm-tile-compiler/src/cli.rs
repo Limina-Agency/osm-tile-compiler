@@ -4,12 +4,12 @@
 //! the version, `--json`). Usage errors exit with 2, failures with 1.
 use osm_tile_compiler::{
     ArchiveCenter, BasemapRequest, BuildingLevelsReport, CompileBounds, CompileError, CompileStage,
-    FetchEvent, FetchMode, SourcesPolicy, SupplementalDataset,
+    ExtractEvent, FetchEvent, FetchMode, SourcesPolicy, SupplementalDataset,
     archive::{
         ArchiveOptions, ArchiveReport,
         delta::{self, DeltaManifest},
     },
-    building_levels_path, compile_basemap, fetch_sources as fetch_datasets,
+    building_levels_path, compile_basemap, fetch_extract, fetch_sources as fetch_datasets,
     omt::{LANGUAGES, LAYERS, resolve_languages, select_layers},
     tile_stats::kib,
     write_building_levels,
@@ -33,6 +33,7 @@ const STYLE_SPRITE: &str = "https://openmaptiles.github.io/osm-bright-gl-style/s
 const USAGE: &str = "\
 Usage:
   osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
@@ -49,6 +50,7 @@ basemap, written as one PMTiles archive.
 
 Usage:
   osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
@@ -60,7 +62,8 @@ Usage:
   osm-tile-compiler --version
 
 Commands:
-  compile          Compile INPUT.pbf into a new PMTiles archive
+  compile          Compile INPUT.pbf, or the Geofabrik extract of a region,
+                   into a new PMTiles archive
   building-levels  Write the building levels of a compiled archive to a new
                    PMTiles archive: its buildings as boxes for far views
   fetch-sources    Download, or verify, the supplemental datasets into DIR:
@@ -80,6 +83,14 @@ Commands:
                    leaves nothing behind on failure
 
 Compile options:
+  --area <NAME>         Instead of INPUT.pbf, compile Geofabrik's extract of a
+                        region: its identifier (malopolskie, us/georgia), its
+                        name (Małopolskie) or its ISO code (PL-12). It is
+                        downloaded into --download-dir as <ID>.osm.pbf, or
+                        the one already there is used; remove it to download
+                        a newer one
+  --download-dir <DIR>  Where --area keeps extracts [default: --sources, or
+                        the current directory with --omit-sources all]
   --output <FILE>       Archive to write; must not exist yet
   --sources <DIR>       Directory holding the supplemental datasets
   --bounds <W S E N>    Area to compile, in degrees [default: the PBF header's box];
@@ -148,7 +159,7 @@ stdout.";
 
 #[derive(Debug)]
 struct CompileArgs {
-    input: PathBuf,
+    input: Input,
     output: PathBuf,
     sources: PathBuf,
     omit_sources: Vec<SupplementalDataset>,
@@ -166,6 +177,13 @@ struct CompileArgs {
     json: bool,
     layers: Option<Vec<String>>,
     languages: Option<Vec<String>>,
+}
+
+/// What `compile` reads: a PBF, or a region's extract to download.
+#[derive(Debug)]
+enum Input {
+    Pbf(PathBuf),
+    Area { name: String, directory: PathBuf },
 }
 
 #[derive(Debug)]
@@ -324,6 +342,8 @@ fn number<T: std::str::FromStr>(arg: &OsString, flag: &str) -> Result<T, String>
 
 fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut input = None;
+    let mut area = None;
+    let mut download_dir = None;
     let mut output = None;
     let mut sources = None;
     let mut bounds = None;
@@ -358,6 +378,8 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
             "--help" | "-h" => return Ok(Command::Help),
             "--output" => output = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--sources" => sources = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--area" => area = Some(value(&mut args, &flag)?.to_string_lossy().into_owned()),
+            "--download-dir" => download_dir = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--temp-dir" => temp_dir = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--bounds" => {
                 let mut wsen = [0.0_f64; 4];
@@ -477,7 +499,16 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
             };
             format!("{flag}: {e}")
         })?;
-    let input = input.ok_or("compile needs an input PBF")?;
+    if input.is_some() && area.is_some() {
+        return Err("compile takes an input PBF or --area, not both".into());
+    }
+    if area.is_none() && download_dir.is_some() {
+        return Err("--download-dir is only used with --area".into());
+    }
+    let input_given = input.is_some() || area.is_some();
+    if !input_given {
+        return Err("compile needs an input PBF or --area <NAME>".into());
+    }
     let output = output.ok_or("compile needs --output <FILE.pmtiles>")?;
     if output.file_name().is_none() {
         return Err(format!(
@@ -490,6 +521,14 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         // Nothing is read from it.
         None if omit_sources.len() == SupplementalDataset::ALL.len() => PathBuf::new(),
         None => return Err("compile needs --sources <DIR>".into()),
+    };
+    let input = match (input, area) {
+        (Some(path), _) => Input::Pbf(path),
+        (None, Some(name)) => Input::Area {
+            name,
+            directory: download_dir.unwrap_or_else(|| sources.clone()),
+        },
+        (None, None) => unreachable!("checked above"),
     };
     Ok(Command::Compile(Box::new(CompileArgs {
         input,
@@ -917,6 +956,60 @@ fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Downloads the Geofabrik extract `name` names into `directory`, or finds
+/// it there, and returns its path.
+fn area_extract(name: &str, directory: &Path, status: &mut Status) -> Result<PathBuf, String> {
+    let mut file = String::new();
+    fetch_extract(
+        directory,
+        name,
+        |event| match event {
+            ExtractEvent::Resolving { url } => {
+                status.line(&format!("Looking up '{name}' in {url}"))
+            }
+            ExtractEvent::Found { extract } => {
+                file = extract.file_name();
+                status.line(&format!(
+                    "'{name}' is Geofabrik's {} ({}{})",
+                    extract.id,
+                    extract.name,
+                    extract
+                        .parent
+                        .as_deref()
+                        .map(|parent| format!(", in {parent}"))
+                        .unwrap_or_default()
+                ))
+            }
+            ExtractEvent::Downloading { url } => status.line(&format!("{file}: downloading {url}")),
+            ExtractEvent::Received { bytes, total } => status.update(&match total {
+                Some(total) if total > 0 => format!(
+                    "{file}: {} of {} ({:.0}%)",
+                    megabytes(bytes),
+                    megabytes(total),
+                    bytes as f64 / total as f64 * 100.0
+                ),
+                _ => format!("{file}: {}", megabytes(bytes)),
+            }),
+            ExtractEvent::Ready {
+                path,
+                bytes,
+                downloaded,
+            } => status.line(&format!(
+                "{}: {} ({})",
+                path.display(),
+                if downloaded {
+                    "downloaded"
+                } else {
+                    "already present, not downloaded again"
+                },
+                megabytes(bytes)
+            )),
+        },
+        || false,
+    )
+    .map_err(String::from)
+}
+
 fn compile(args: CompileArgs) -> Result<(), String> {
     let levels = building_levels_path(&args.output);
     for archive in [&args.output, &levels] {
@@ -927,10 +1020,6 @@ fn compile(args: CompileArgs) -> Result<(), String> {
             ));
         }
     }
-    let bounds = match args.bounds {
-        Some(bounds) => bounds,
-        None => pbf_bounds(&args.input)?,
-    };
     if let Some(polygon) = &args.polygon {
         // Read here too, so a bad polygon fails before any download.
         osm_tile_compiler::CompileArea::read(polygon)?;
@@ -961,6 +1050,15 @@ fn compile(args: CompileArgs) -> Result<(), String> {
             dataset.without_warning()
         ));
     }
+    // After the checks above, so that none fails after a long download.
+    let input = match args.input {
+        Input::Pbf(path) => path,
+        Input::Area { name, directory } => area_extract(&name, &directory, &mut status)?,
+    };
+    let bounds = match args.bounds {
+        Some(bounds) => bounds,
+        None => pbf_bounds(&input)?,
+    };
     // A default scratch directory is ours alone, and it is removed afterwards
     // whether or not the compile succeeds. Its marker file, locked for the
     // whole compile, tells one left by an interrupted compile, which is
@@ -981,7 +1079,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     status.line(&format!(
         "Compiling {} into {} (bounds {} {} {} {}, zooms {}-{}, {threads} threads)",
-        args.input.display(),
+        input.display(),
         args.output.display(),
         bounds.west,
         bounds.south,
@@ -990,12 +1088,8 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         args.min_zoom,
         args.max_zoom,
     ));
-    let mut request = BasemapRequest::new(
-        args.input,
-        args.output.clone(),
-        args.sources,
-        temp_dir.clone(),
-    );
+    let mut request =
+        BasemapRequest::new(input, args.output.clone(), args.sources, temp_dir.clone());
     request.sources_policy = if args.fetch {
         SourcesPolicy::FetchMissing
     } else {

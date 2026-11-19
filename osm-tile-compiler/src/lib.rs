@@ -65,6 +65,7 @@ mod compile_area;
 mod compile_bounds;
 mod control;
 mod coordinate_groups;
+pub mod extracts;
 mod generalization;
 pub mod omt;
 mod profiling;
@@ -84,4 +85,5 @@ pub use building_levels::{
 pub use compile_area::CompileArea;
 pub use compile_bounds::{ArchiveCenter, CompileBounds};
 pub use control::{CompileError, CompileProgress, CompileStage};
+pub use extracts::{Extract, ExtractEvent, fetch_extract};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
