@@ -1,0 +1,24 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Actions are pinned by commit; the comment names the tag.
+jobs:
+  # `compile --area monaco` against download.geofabrik.de itself: the index
+  # lookup, the download and the compile, and a check that the recorded index
+  # the CI tests use (fixtures/geofabrik-index-v1-nogeom.json) still matches
+  # the live one. CI covers the same path against a local server.
+  live-area-download:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo test --locked -p osm-tile-compiler --test area_download -- --ignored --nocapture

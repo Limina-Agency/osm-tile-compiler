@@ -90,5 +90,5 @@ pub use building_levels::{
 pub use compile_area::CompileArea;
 pub use compile_bounds::{ArchiveCenter, CompileBounds};
 pub use control::{CompileError, CompileProgress, CompileStage};
-pub use extracts::{Extract, ExtractEvent, fetch_extract};
+pub use extracts::{Extract, ExtractEvent, fetch_extract, fetch_extract_from};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
