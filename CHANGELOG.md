@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.2.0 (2026-11-19)
+
+### Breaking: one entry point with a typed request
+
+`compile_basemap` is the library's one compile entry point, and
+`BasemapRequest` its typed request. To migrate:
+
+- `omt::compile_openmaptiles`, `compile_openmaptiles_with_progress` and
+  `OpenMapTilesRequest` are no longer public: build a `BasemapRequest` and
+  call `compile_basemap`. `OpenMapTilesResult` is `CompileResult`.
+- The `omt`, `sources`, `extracts` and `tile_stats` modules are private and
+  their public items are re-exported at the crate root (`omt::LAYERS` is
+  `OMT_LAYERS`, `omt::LANGUAGES` is `OMT_LANGUAGES`, `omt::PROFILE_REVISION`
+  is `OMT_PROFILE_REVISION`).
+- `BasemapRequest`: `min_zoom` and `max_zoom` are `zoom: ZoomRange`;
+  `layers` and `exclude_layers` are `layers: LayerSelection` (`All`, `Only`
+  or `Except` a list of `LayerName`); `bounds`, `polygon` and `area_only` are
+  `area: Area`, with `polygon: Option<AreaPolygon>` (a file or a
+  `CompileArea` in memory) and `read: ReadScope` (`WholeExtract`, or
+  `NearArea` for the old `area_only`, which now needs bounds or a polygon).
+- Public structs and enums are `#[non_exhaustive]`: use
+  `BasemapRequest::new`, `ArchiveCenter::new`, `CompileBounds::new` and field
+  assignment, and match enums with a wildcard arm.
+- Every public fallible function returns `CompileError` instead of
+  `String`, and `CompileError` no longer converts from `String`.
+- `archive::delta::{diff, apply, read_manifest}` are
+  `archive::{diff, apply, read_delta_manifest}`; `omt::select_layers` is
+  `LayerSelection::resolve`.
+- New: `BasemapRequest::validate` runs the checks that need no reading or
+  network.
+
+The command line and the worker protocol are unchanged, except that
+`compile --area-only` now needs `--bounds` or `--polygon`.
+
+### New
+
+- A C ABI, the `osm-tile-compiler-ffi` crate (a staticlib and a cdylib, not
+  on crates.io yet): `otc_job_start` takes a JSON request and runs it on a
+  thread of its own, and the host polls progress, cancels and collects a
+  JSON result. Its first request, `compile_basemap`, maps onto the 0.2
+  request types. `docs/c-abi.md` describes it; CI builds it for iOS and
+  Android, and iOS hosts need a deployment target of 13.0 or later.
+- `compile --area NAME` downloads Geofabrik's extract of a region (by
+  identifier, name with or without accents, or ISO code) into
+  `--download-dir` and compiles it, reusing an extract already there. The
+  library has the same as `find_extract` and `fetch_extract`.
+- Experimental: `update` applies OSM change files, or every diff a
+  replication server published since the extract, and writes the updated
+  PBF without a database; planet diffs are clipped to the extract.
+  `compile --changes` and `--replication` compile from the updated data, and
+  `--delta-from OLD.pmtiles` writes the delta from the previous archive
+  beside the new one. The library side is `update_extract`, on
+  `osm-pbf-ingest` 0.4's change files.
+- Ctrl-C, SIGTERM and SIGHUP cancel `compile`, `fetch-sources`, `--area`
+  downloads and `building-levels` cleanly: scratch and partial outputs are
+  removed and the exit code is 130. A second Ctrl-C quits at once. The
+  handler is the binary's default `ctrlc` feature; the library never
+  installs one.
+
+### Performance
+
+- Reading OSM takes less memory: pass 2 no longer decodes relations again
+  (they come from pass 1), holds two decoded blocks per worker instead of
+  16, and the render workers keep their sort buffers as frames with 32-byte
+  sort entries instead of an 80-byte record and a heap block each. On Linux
+  the binary has mimalloc commit memory on demand, so memory a compile
+  frees leaves the RSS. Berlin on four threads peaks at 350 MiB instead of
+  494 MiB in the same time, with the archive byte-identical.
+- Sort runs are stored as columnar blocks, seven zstd streams per block: on
+  Małopolskie they shrink from 225 to 168 MiB and peak scratch disk drops
+  from 369 to 312 MiB, 1.7 times the extract. The archive is
+  byte-identical.
+- `building-levels` reads the basemap tile by tile instead of whole and
+  keeps one grid per zoom open: on Małopolskie, peak RSS drops from 541 to
+  195 MiB on four threads (310 to 88 MiB on one, 1179 to 544 MiB on 16), and
+  the pass is about 15% faster. The output is byte-identical.
+- `diff` and `apply` work on every thread: on Małopolskie with four cores,
+  a delta that rewrites every tile takes 4.9 s instead of 17.1 s to diff and
+  2.2 s instead of 6.9 s to apply. Deltas are byte-identical to 0.1.3's.
+- Area-only reads drop the ways outside the area exactly before resolving
+  them: central Kraków from the Małopolskie extract keeps 150 thousand of
+  3.16 million ways instead of 1.16 million, and takes 2.40 s instead of
+  2.63 s on four threads with `osm-pbf-ingest` 0.4. Archives are
+  byte-identical.
+- OSM is read with `osm-pbf-ingest` 0.4, which reads way groups straight
+  from the wire.
+
+### Fixes
+
+- A GeoJSON `--polygon` with a too-short position, and PMTiles section or
+  directory offsets that overflow, are errors instead of panics. Found by
+  the new cargo-fuzz targets in `fuzz/`.
+- A scratch directory's lock is released before its marker is closed, so a
+  process spawned during a compile no longer keeps the next compile out.
+
+### Other
+
+- Our own overlay calls use `i_overlay` 9.2 (geo's still use 4.5).
+- Parity with Planetiler 0.10.2 is verified on every tile of Małopolskie,
+  Berlin and Pomorskie (`parity_verified` in the result), measured with
+  `benchmarks/compiler-parity/pairdiff.py`.
+- CI runs clippy and the tests on Windows and macOS, builds for Android and
+  iOS, and reports public API changes with cargo-semver-checks on pull
+  requests.
+
 ## 0.1.3 (2026-11-19)
 
 - The disk node store (about twice the extract, 370 MiB for Małopolskie) is
