@@ -1,16 +1,18 @@
 //! The human command line: `compile`, `building-levels`, `fetch-sources`,
-//! `style`, `inspect`, `verify`, `diff`, `apply`, `help`, `--version`.
+//! `style`, `inspect`, `verify`, `diff`, `apply`, `update`, `help`,
+//! `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
 //! the version, `--json`). Usage errors exit with 2, failures with 1, and
 //! a command stopped by Ctrl-C with 130 (see `interrupt`).
 use crate::interrupt;
 use osm_tile_compiler::{
-    ArchiveCenter, Area, BasemapRequest, BuildingLevelsReport, CompileBounds, CompileError,
-    CompileStage, ExtractEvent, FetchEvent, FetchMode, LayerSelection, OMT_LANGUAGES as LANGUAGES,
-    OMT_LAYERS as LAYERS, ReadScope, SourcesPolicy, SupplementalDataset, ZoomRange,
+    ArchiveCenter, Area, BasemapRequest, BuildingLevelsReport, ClipTo, CompileBounds, CompileError,
+    CompileStage, DEFAULT_MAX_DIFFS, ExtractEvent, FetchEvent, FetchMode, LayerSelection,
+    OMT_LANGUAGES as LANGUAGES, OMT_LAYERS as LAYERS, ReadScope, Replication, SourcesPolicy,
+    SupplementalDataset, UpdateEvent, UpdateReport, UpdateRequest, ZoomRange,
     archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
-    kib, resolve_languages, write_building_levels_cancellable,
+    kib, resolve_languages, update_extract, write_building_levels_cancellable,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -21,6 +23,8 @@ use std::time::{Duration, Instant};
 const NAME: &str = "osm-tile-compiler";
 /// Marks a default scratch directory (`<output>.tmp`) as this tool's.
 const SCRATCH_MARKER: &str = ".osm-tile-compiler-scratch";
+/// The updated PBF `compile --changes` writes in the scratch directory.
+const UPDATED_PBF: &str = ".osm-tile-compiler-updated.osm.pbf";
 /// OSM Bright, adapted to the archives `compile` writes (`style/LICENSE.md`).
 /// `style` replaces its three URLs, each one JSON string in the template.
 const STYLE: &str = include_str!("../style/osm-bright.json");
@@ -43,6 +47,7 @@ Usage:
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
+  osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
   osm-tile-compiler help | --help
   osm-tile-compiler --version";
 
@@ -60,6 +65,7 @@ Usage:
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
+  osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
   osm-tile-compiler help | --help
   osm-tile-compiler --version
 
@@ -83,6 +89,9 @@ Commands:
   apply            Experimental: rebuild NEW.pmtiles from OLD.pmtiles and a
                    delta, byte for byte; checks both archives' SHA-256 and
                    leaves nothing behind on failure
+  update           Experimental: apply OSM change files, or the diffs a
+                   replication server published since INPUT.pbf, and write
+                   the updated extract to NEW.pbf, without a database
 
 Compile options:
   --area <NAME>         Instead of INPUT.pbf, compile Geofabrik's extract of a
@@ -134,12 +143,45 @@ Compile options:
                         all, '-xx' leaves one out (so 'default,-ru'), and an
                         empty list writes none. name, name_en, name_de,
                         name_int, name:latin and name:nonlatin stay
+  --changes <FILE>      Experimental: apply an OSM change file (.osc, .osc.gz)
+                        to the input before compiling; repeat for more, oldest
+                        first. The input itself is left as it is
+  --replication <SOURCE>
+                        Experimental: also apply the diffs a replication
+                        server published since the input; as for update
+  --until <SEQ>, --max-diffs <N>, --no-clip
+                        As for update
+  --delta-from <OLD.pmtiles>
+                        Experimental: also write <NAME>.delta beside the
+                        archive, the delta that turns OLD.pmtiles into it
 
 Diff and apply options:
   --output <FILE>       File to write; must not exist yet
   --json                Print the delta's manifest and size as JSON on stdout
   The delta format is experimental and may change between releases; a delta
   applies only with a build that reads its version.
+
+Update options (experimental):
+  --output <FILE>       Updated PBF to write; must not exist yet
+  CHANGES.osc...        Change files to apply first, oldest first, gzipped or not
+  --replication <SOURCE>
+                        Also download and apply every diff published since
+                        INPUT.pbf: header (the server its header names, as
+                        Geofabrik extracts do), minute, hour or day (the
+                        planet's servers), or a server's URL. Where to start
+                        comes from the header's sequence number for its own
+                        server, otherwise from its timestamp
+  --until <SEQ>         Last diff to apply [default: the server's latest]
+  --max-diffs <N>       Refuse to download more diffs than this [default: 2000]
+  --bounds <W S E N>    Keep only changes that touch this box [default: the
+                        header's box]
+  --no-clip             Keep every change, for diffs already cut to the region;
+                        planet diffs need the clip
+  --threads <N>         Worker threads [default: available cores]
+  --json                Print the update report as JSON on stdout
+  Changes to objects the input holds are always kept; new objects are kept
+  when they are inside the box or reach into the extract. Rewritten blocks
+  carry no object metadata.
 
 Building levels options:
   --threads <N>         Worker threads [default: available cores]; the archive
@@ -181,6 +223,79 @@ struct CompileArgs {
     json: bool,
     layers: LayerSelection,
     languages: Option<Vec<String>>,
+    changes: ChangeArgs,
+    delta_from: Option<PathBuf>,
+}
+
+/// The change files and replication server `compile` and `update` apply.
+#[derive(Debug, Default)]
+struct ChangeArgs {
+    files: Vec<PathBuf>,
+    replication: Option<Replication>,
+    until: Option<u64>,
+    max_diffs: Option<u64>,
+    no_clip: bool,
+}
+
+impl ChangeArgs {
+    fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.replication.is_none()
+    }
+
+    /// Reads one of the shared options; false when `flag` is not one.
+    fn parse<'a>(
+        &mut self,
+        flag: &str,
+        args: &mut impl Iterator<Item = &'a OsString>,
+    ) -> Result<bool, String> {
+        match flag {
+            "--changes" => self.files.push(PathBuf::from(value(args, flag)?)),
+            "--replication" => {
+                let source = value(args, flag)?.to_string_lossy();
+                self.replication =
+                    Some(Replication::parse(&source).map_err(|e| format!("{flag}: {e}"))?);
+            }
+            "--until" => self.until = Some(number(value(args, flag)?, flag)?),
+            "--max-diffs" => self.max_diffs = Some(number(value(args, flag)?, flag)?),
+            "--no-clip" => self.no_clip = true,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// The options that only mean something with changes to apply.
+    fn check(&self, command: &str) -> Result<(), String> {
+        if self.replication.is_none() && (self.until.is_some() || self.max_diffs.is_some()) {
+            return Err(format!(
+                "{command}: --until and --max-diffs need --replication"
+            ));
+        }
+        if self.is_empty() && self.no_clip {
+            return Err(format!("{command}: --no-clip needs changes to apply"));
+        }
+        Ok(())
+    }
+
+    fn request(&self, input: &Path, output: &Path, clip: ClipTo, threads: usize) -> UpdateRequest {
+        let mut request = UpdateRequest::new(input, output);
+        request.change_files = self.files.clone();
+        request.replication = self.replication.clone();
+        request.until = self.until;
+        request.max_diffs = self.max_diffs.unwrap_or(DEFAULT_MAX_DIFFS);
+        request.clip = if self.no_clip { ClipTo::Nothing } else { clip };
+        request.threads = threads;
+        request
+    }
+}
+
+#[derive(Debug)]
+struct UpdateArgs {
+    input: PathBuf,
+    output: PathBuf,
+    changes: ChangeArgs,
+    bounds: Option<CompileBounds>,
+    threads: Option<usize>,
+    json: bool,
 }
 
 /// What `compile` reads: a PBF, or a region's extract to download.
@@ -216,6 +331,7 @@ enum Command {
     Verify { archive: PathBuf, json: bool },
     Diff(DeltaArgs),
     Apply(DeltaArgs),
+    Update(Box<UpdateArgs>),
 }
 
 /// `diff` and `apply`: the old archive, then the new archive (`diff`) or the
@@ -262,6 +378,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::Verify { archive, json } => verify(&archive, json),
         Command::Diff(args) => diff(args),
         Command::Apply(args) => apply(args),
+        Command::Update(args) => update(*args),
     };
     match result {
         Ok(()) => 0,
@@ -290,6 +407,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("style") => parse_style(rest),
         Some(name @ ("inspect" | "verify")) => parse_archive_command(name, rest),
         Some(name @ ("diff" | "apply")) => parse_delta_command(name, rest),
+        Some("update") => parse_update(rest),
         _ => Err(format!("unknown command '{}'", first.to_string_lossy())),
     }
 }
@@ -348,6 +466,32 @@ fn number<T: std::str::FromStr>(arg: &OsString, flag: &str) -> Result<T, String>
         .map_err(|_| format!("{flag} expects a number, got '{text}'"))
 }
 
+/// `--bounds W S E N`.
+fn parse_bounds<'a>(
+    args: &mut impl Iterator<Item = &'a OsString>,
+    flag: &str,
+) -> Result<CompileBounds, String> {
+    let mut wsen = [0.0_f64; 4];
+    for slot in &mut wsen {
+        let arg = args.next().ok_or("--bounds needs four numbers: W S E N")?;
+        *slot = number(arg, flag)?;
+    }
+    let [west, south, east, north] = wsen;
+    if !wsen.iter().all(|v| v.is_finite())
+        || west == east
+        || south >= north
+        || west.abs() > 180.0
+        || east.abs() > 180.0
+    {
+        return Err(format!(
+            "--bounds must be W S E N within -180..180 with S < N and W different \
+             from E (W > E crosses the antimeridian), got {west} {south} {east} \
+             {north}"
+        ));
+    }
+    Ok(CompileBounds::new(north, south, east, west))
+}
+
 fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut input = None;
     let mut area = None;
@@ -370,6 +514,8 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut only_layers = None;
     let mut excluded_layers = None;
     let mut languages = None;
+    let mut changes = ChangeArgs::default();
+    let mut delta_from = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -389,27 +535,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
             "--area" => area = Some(value(&mut args, &flag)?.to_string_lossy().into_owned()),
             "--download-dir" => download_dir = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--temp-dir" => temp_dir = Some(PathBuf::from(value(&mut args, &flag)?)),
-            "--bounds" => {
-                let mut wsen = [0.0_f64; 4];
-                for slot in &mut wsen {
-                    let arg = args.next().ok_or("--bounds needs four numbers: W S E N")?;
-                    *slot = number(arg, &flag)?;
-                }
-                let [west, south, east, north] = wsen;
-                if !wsen.iter().all(|v| v.is_finite())
-                    || west == east
-                    || south >= north
-                    || west.abs() > 180.0
-                    || east.abs() > 180.0
-                {
-                    return Err(format!(
-                        "--bounds must be W S E N within -180..180 with S < N and W different \
-                         from E (W > E crosses the antimeridian), got {west} {south} {east} \
-                         {north}"
-                    ));
-                }
-                bounds = Some(CompileBounds::new(north, south, east, west));
-            }
+            "--bounds" => bounds = Some(parse_bounds(&mut args, &flag)?),
             "--polygon" => polygon = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--area-only" => area_only = true,
             "--name" => archive.name = value(&mut args, &flag)?.to_string_lossy().into_owned(),
@@ -483,6 +609,8 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 resolve_languages(&list).map_err(|e| format!("--languages: {}", e.message()))?;
                 languages = Some(list);
             }
+            "--delta-from" => delta_from = Some(PathBuf::from(value(&mut args, &flag)?)),
+            _ if changes.parse(&flag, &mut args)? => {}
             _ => return Err(format!("unknown compile option '{flag}'")),
         }
     }
@@ -506,6 +634,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     if area_only && bounds.is_none() && polygon.is_none() {
         return Err("--area-only needs --bounds or --polygon".into());
     }
+    changes.check("compile")?;
     if input.is_some() && area.is_some() {
         return Err("compile takes an input PBF or --area, not both".into());
     }
@@ -555,6 +684,61 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         json,
         layers,
         languages,
+        changes,
+        delta_from,
+    })))
+}
+
+fn parse_update(args: &[OsString]) -> Result<Command, String> {
+    let mut paths = Vec::new();
+    let mut output = None;
+    let mut changes = ChangeArgs::default();
+    let mut bounds = None;
+    let mut threads = None;
+    let mut json = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(flag) = option(arg) else {
+            paths.push(PathBuf::from(arg));
+            continue;
+        };
+        match flag.as_str() {
+            "--help" | "-h" => return Ok(Command::Help),
+            "--output" | "-o" => output = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--bounds" => bounds = Some(parse_bounds(&mut args, &flag)?),
+            "--threads" => {
+                let count: usize = number(value(&mut args, &flag)?, &flag)?;
+                if count == 0 {
+                    return Err("--threads must be at least 1".into());
+                }
+                threads = Some(count);
+            }
+            "--json" => json = true,
+            "--changes" => {
+                return Err("update takes change files as arguments, not --changes".into());
+            }
+            _ if changes.parse(&flag, &mut args)? => {}
+            _ => return Err(format!("unknown update option '{flag}'")),
+        }
+    }
+    let mut paths = paths.into_iter();
+    let input = paths.next().ok_or("update needs an input PBF")?;
+    changes.files.extend(paths);
+    if changes.is_empty() {
+        return Err("update needs change files or --replication".into());
+    }
+    changes.check("update")?;
+    if bounds.is_some() && changes.no_clip {
+        return Err("--bounds and --no-clip cannot be combined".into());
+    }
+    let output = output.ok_or("update needs --output <NEW.pbf>")?;
+    Ok(Command::Update(Box::new(UpdateArgs {
+        input,
+        output,
+        changes,
+        bounds,
+        threads,
+        json,
     })))
 }
 
@@ -1048,6 +1232,22 @@ fn compile(args: CompileArgs) -> Result<(), String> {
             ));
         }
     }
+    let delta = match &args.delta_from {
+        Some(old) => {
+            if !old.is_file() {
+                return Err(format!("--delta-from: {} does not exist", old.display()));
+            }
+            let delta = args.output.with_extension("delta");
+            if delta.exists() {
+                return Err(format!(
+                    "refusing to replace existing delta {}",
+                    delta.display()
+                ));
+            }
+            Some((old.clone(), delta))
+        }
+        None => None,
+    };
     if let Some(polygon) = &args.polygon {
         // Read here too, so a bad polygon fails before any download.
         osm_tile_compiler::CompileArea::read(polygon)?;
@@ -1108,6 +1308,33 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     let threads = args
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let input = if args.changes.is_empty() {
+        input
+    } else {
+        // The changes are clipped to the extract's header box, or to the
+        // compiled area when the header has none.
+        let path = temp_dir.join(UPDATED_PBF);
+        let clip = ClipTo::HeaderBounds {
+            fallback: Some(bounds),
+        };
+        let updated = std::fs::create_dir_all(&temp_dir)
+            .map_err(|e| format!("Failed to create {}: {e}", temp_dir.display()))
+            .and_then(|()| {
+                // One left by an interrupted compile.
+                let _ = std::fs::remove_file(&path);
+                let request = args.changes.request(&input, &path, clip, threads);
+                run_update(&request, &mut status)
+            });
+        if let Err(error) = updated {
+            let _ = std::fs::remove_file(&path);
+            if let Some(marker) = scratch {
+                let _ = release_scratch(&temp_dir, marker);
+            }
+            return Err(error);
+        }
+        path
+    };
+    let updated_input = (!args.changes.is_empty()).then(|| input.clone());
     status.line(&format!(
         "Compiling {} into {} (bounds {} {} {} {}, zooms {}-{}, {threads} threads)",
         input.display(),
@@ -1161,6 +1388,9 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         },
         interrupt::requested,
     );
+    if let Some(updated) = &updated_input {
+        let _ = std::fs::remove_file(updated);
+    }
     let cleanup = match scratch {
         Some(marker) => release_scratch(&temp_dir, marker),
         None => Ok(()),
@@ -1194,11 +1424,107 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     if let Some((path, report)) = &output.building_levels {
         report_levels(&mut status, path, report);
     }
+    if let Some((old, delta_path)) = &delta {
+        let _partial = interrupt::remove_on_exit(archive::partial_path(delta_path));
+        let report = archive::diff(old, &args.output, delta_path)?;
+        status.line(&format!(
+            "Wrote {}: {}",
+            delta_path.display(),
+            delta_summary(&report.manifest, report.delta_bytes)
+        ));
+    }
     if args.json {
         let json = serde_json::to_string_pretty(result).map_err(|e| e.to_string())?;
         println!("{json}");
     }
     Ok(())
+}
+
+fn update(args: UpdateArgs) -> Result<(), String> {
+    let threads = args
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let clip = match args.bounds {
+        Some(bounds) => ClipTo::Bounds(bounds),
+        None => ClipTo::HeaderBounds { fallback: None },
+    };
+    let request = args
+        .changes
+        .request(&args.input, &args.output, clip, threads);
+    let mut status = Status::new();
+    let report = run_update(&request, &mut status)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    }
+    Ok(())
+}
+
+/// Runs an update, reporting its progress on stderr.
+fn run_update(request: &UpdateRequest, status: &mut Status) -> Result<UpdateReport, String> {
+    status.line(&format!(
+        "Updating {} into {}",
+        request.input.display(),
+        request.output.display()
+    ));
+    let report = update_extract(
+        request,
+        |event| match event {
+            UpdateEvent::Scanned { objects, sorted } => status.line(&format!(
+                "Read {objects} objects{}",
+                if sorted {
+                    ""
+                } else {
+                    " (not sorted by type and id: new objects go last)"
+                }
+            )),
+            UpdateEvent::Replication {
+                url,
+                latest,
+                first,
+                last,
+            } => status.line(&if first > last {
+                format!("{url} is at {latest}: nothing newer than the input")
+            } else {
+                format!("{url} is at {latest}: applying diffs {first} to {last}")
+            }),
+            UpdateEvent::Read {
+                name,
+                index,
+                total,
+                report,
+            } => status.update(&format!(
+                "[{}/{total}] {name}: kept {} of {} changes",
+                index + 1,
+                report.kept,
+                report.objects
+            )),
+            UpdateEvent::Applying { changes } => {
+                status.line(&format!("Applying {changes} changes"))
+            }
+        },
+        || false,
+    )
+    .map_err(String::from)?;
+    status.line(&format!(
+        "Wrote {} in {:.1} s: {} objects created, {} modified, {} deleted; {} blocks \
+         rewritten, {} added, {} copied{}",
+        report.output.display(),
+        report.seconds,
+        report.created,
+        report.modified,
+        report.deleted,
+        report.blobs_rewritten,
+        report.blobs_added,
+        report.blobs_copied,
+        report
+            .diffs
+            .map(|[first, last]| format!("; now at diff {last} (from {first})"))
+            .unwrap_or_default()
+    ));
+    Ok(report)
 }
 
 fn inspect(path: &Path, json: bool) -> Result<(), String> {

@@ -39,6 +39,7 @@ fn help_and_version_print_to_stdout() {
         );
         assert!(stdout.contains("fetch-sources <DIR>"), "{args:?}: {stdout}");
         assert!(stdout.contains("style <ARCHIVE_URL>"), "{args:?}: {stdout}");
+        assert!(stdout.contains("update <INPUT.pbf>"), "{args:?}: {stdout}");
     }
     let output = run(["--version"]);
     assert!(output.status.success());
@@ -187,6 +188,52 @@ fn usage_errors_exit_with_2() {
         (
             &["compile", "in.pbf", "--languages"],
             "--languages needs a value",
+        ),
+        (&["update"], "update needs an input PBF"),
+        (
+            &["update", "in.pbf"],
+            "update needs change files or --replication",
+        ),
+        (&["update", "in.pbf", "c.osc"], "update needs --output"),
+        (
+            &["update", "in.pbf", "--replication", "weekly"],
+            "unknown replication source 'weekly'",
+        ),
+        (
+            &["update", "in.pbf", "c.osc", "--until", "5", "-o", "x"],
+            "--until and --max-diffs need --replication",
+        ),
+        (
+            &[
+                "update",
+                "in.pbf",
+                "c.osc",
+                "--no-clip",
+                "--bounds",
+                "1",
+                "2",
+                "3",
+                "4",
+                "-o",
+                "x",
+            ],
+            "--bounds and --no-clip cannot be combined",
+        ),
+        (
+            &["update", "in.pbf", "--changes", "c.osc"],
+            "update takes change files as arguments",
+        ),
+        (
+            &["update", "in.pbf", "c.osc", "--frob"],
+            "unknown update option '--frob'",
+        ),
+        (
+            &["compile", "in.pbf", "--no-clip"],
+            "--no-clip needs changes to apply",
+        ),
+        (
+            &["compile", "in.pbf", "--max-diffs", "3"],
+            "--until and --max-diffs need --replication",
         ),
     ];
     for (args, expected) in cases {
@@ -546,6 +593,109 @@ fn diff_and_apply_rebuild_a_compiled_archive() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(text(&output.stderr).contains("is not the archive this delta applies to"));
     assert!(!wrong.exists());
+}
+
+/// Two planet-style changes: a motorway drawn in Monaco, which the update
+/// keeps, and a node in Sydney, which it clips away.
+const MONACO_CHANGES: &str = r#"<?xml version='1.0' encoding='UTF-8'?>
+<osmChange version="0.6" generator="test">
+  <create>
+    <node id="99000000001" version="1" lat="43.7350" lon="7.4200"/>
+    <node id="99000000002" version="1" lat="43.7370" lon="7.4250"/>
+    <node id="99000000003" version="1" lat="-33.8688" lon="151.2093">
+      <tag k="amenity" v="cafe"/>
+    </node>
+    <way id="99000000010" version="1">
+      <nd ref="99000000001"/>
+      <nd ref="99000000002"/>
+      <tag k="highway" v="motorway"/>
+      <tag k="name" v="Test motorway"/>
+    </way>
+  </create>
+</osmChange>"#;
+
+#[test]
+fn change_files_update_an_extract_and_a_compile() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let pbf = monaco_pbf();
+    let changes = path("changes.osc");
+    std::fs::write(&changes, MONACO_CHANGES).unwrap();
+
+    let updated = path("updated.osm.pbf");
+    let output = run([
+        "update".as_ref(),
+        pbf.as_os_str(),
+        changes.as_os_str(),
+        "--output".as_ref(),
+        updated.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["changes_read"], 4, "{report}");
+    assert_eq!(report["changes_kept"], 3, "{report}");
+    assert_eq!(report["created"], 3, "{report}");
+    assert_eq!(report["modified"], 0, "{report}");
+    assert!(report["blobs_copied"].as_u64().unwrap() > 0, "{report}");
+    assert!(updated.is_file());
+    // Never over an existing file.
+    let output = run([
+        "update".as_ref(),
+        pbf.as_os_str(),
+        changes.as_os_str(),
+        "--output".as_ref(),
+        updated.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+
+    let compile = |output: &std::path::Path, extra: &[&OsStr]| {
+        let mut args = vec![
+            "compile".as_ref(),
+            pbf.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+            "--omit-sources".as_ref(),
+            "all".as_ref(),
+            "--max-zoom".as_ref(),
+            "12".as_ref(),
+        ];
+        args.extend(extra.iter().copied());
+        let output = run(args);
+        assert!(output.status.success(), "{output:?}");
+        output
+    };
+    let (old, new) = (path("old.pmtiles"), path("new.pmtiles"));
+    compile(&old, &[]);
+    let output = compile(
+        &new,
+        &[
+            "--changes".as_ref(),
+            changes.as_os_str(),
+            "--delta-from".as_ref(),
+            old.as_os_str(),
+        ],
+    );
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("3 objects created"), "{stderr}");
+    assert!(!path("new.pmtiles.tmp").exists(), "{stderr}");
+    let delta = path("new.delta");
+    assert!(stderr.contains("new.delta"), "{stderr}");
+    assert!(!stderr.contains(" 0 changed, 0 added"), "{stderr}");
+
+    let rebuilt = path("rebuilt.pmtiles");
+    let output = run([
+        "apply".as_ref(),
+        old.as_os_str(),
+        delta.as_os_str(),
+        "-o".as_ref(),
+        rebuilt.as_os_str(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read(&rebuilt).unwrap(),
+        std::fs::read(&new).unwrap()
+    );
 }
 
 #[test]

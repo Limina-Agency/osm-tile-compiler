@@ -96,6 +96,7 @@ mod sources;
 mod tile_geometry;
 mod tile_slicer;
 mod tile_stats;
+mod updates;
 
 pub use basemap::{
     BasemapOutput, BasemapRequest, MANIFEST_FORMAT, MANIFEST_VERSION, SourcesPolicy,
@@ -120,6 +121,10 @@ pub use omt::{
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
 pub use tile_stats::{LayerStats, TILE_WARNING_BYTES, TileSize, TileStats, ZoomStats};
+pub use updates::{
+    ClipTo, DEFAULT_MAX_DIFFS, PLANET_REPLICATION, Replication, UpdateEvent, UpdateReport,
+    UpdateRequest, update_extract,
+};
 
 /// The languages whose `name:<lang>` attributes a
 /// [`BasemapRequest::languages`] list keeps, in [`OMT_LANGUAGES`] order. It
