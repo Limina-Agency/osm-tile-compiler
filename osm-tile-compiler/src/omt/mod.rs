@@ -107,6 +107,17 @@ pub struct OpenMapTilesRequest {
     /// them; lower zooms show only what lies near the area.
     pub area_only: bool,
 }
+/// Whether a compile with these options is one the parity measurement covers
+/// (docs/parity.md): Planetiler's default languages, every supplemental
+/// dataset, a full read of the extract and zoom 14 at the top. A selection of
+/// layers is covered, since each layer is the same as in a full build.
+fn parity_verified(request: &OpenMapTilesRequest) -> bool {
+    request.languages.is_none()
+        && request.omit_sources.is_empty()
+        && !request.area_only
+        && request.max_zoom == 14
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenMapTilesResult {
     pub schema: String,
@@ -543,7 +554,7 @@ pub(crate) fn compile(
     Ok(OpenMapTilesResult {
         schema: format!("OpenMapTiles {OMT_SCHEMA_VERSION} (native experimental port)"),
         profile_revision: PROFILE_REVISION.into(),
-        parity_verified: false,
+        parity_verified: parity_verified(request),
         sources_processed,
         profile_features,
         tiles: tile_stats.tiles(),

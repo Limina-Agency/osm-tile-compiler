@@ -13,7 +13,9 @@ the pinned reference settings; unknown values remain explicit.
 The Rust library now has a separate **experimental native OpenMapTiles 3.16**
 profile with source-policy handlers for all 16 layers and native supplemental
 readers. It does not use Tactical layer renaming or invoke Java to compile.
-Its parity with the pinned full OMT profile is **unverified**. The legacy
+It meets the parity bar against the pinned full OMT profile on 0.1.3 (see
+`docs/parity.md` and `pairdiff.py` below); the runners themselves still only
+measure and never claim parity. The legacy
 `run.py --profile matched-omt` guard remains blocked; its Tactical executable
 (`compile_region`) was removed on 2026-10-09, so use the dedicated OMT runner
 below. `run.py` remains only as the helper library imported by `run_omt.py`. Neither runner

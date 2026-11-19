@@ -44,9 +44,11 @@ set the design:
 - **Checked output.** `verify` decodes every tile of an archive, and the
   test suite pins the Monaco build's features.
 
-It is pre-1.0. The OpenMapTiles profile is experimental: its output is
-compared with Planetiler's, but not claimed identical
-(`parity_verified: false`).
+It is pre-1.0. The OpenMapTiles profile meets the parity bar against
+Planetiler on three regions (`parity_verified: true`; see
+[docs/parity.md](docs/parity.md)): the same features and attributes, and
+polygons identical or within 1% of the area and 1 pixel, with a few
+accepted exceptions.
 
 ## How it works
 
@@ -342,11 +344,12 @@ extract with both and compares every tile; [`docs/parity.md`](docs/parity.md) ha
 for Małopolskie, Berlin and Pomorskie. In short: the same tiles and the same
 features. What differs is the shape of a few merged polygons, where
 Planetiler merges nearby buildings and landuse through JTS's buffer and
-union and the port comes out slightly different: 18 on Małopolskie
-(2026-11-17), 44 on Berlin and 15 on Pomorskie (2026-11-03), all but one of
-the latter within 1% of their area and a pixel. No polygon is invalid where
-Planetiler's is valid. Berlin also has two romanised Han names that ICU4X
-spaces differently from Java's ICU4J, and one ocean polygon without an ID.
+union and the port comes out slightly different: 18 on Małopolskie, 44 on
+Berlin and 15 on Pomorskie (0.1.3, 2026-11-19), all but two within 1% of
+their area and a pixel. No polygon is invalid where Planetiler's is valid.
+Berlin also has one motorway with a vertex 0.125 px away and a romanised Han
+name that ICU4X spaces differently from Java's ICU4J. These are accepted, and
+the profile reports `parity_verified: true`.
 
 Unlike Planetiler, a `--bounds` box with W greater than E crosses the
 antimeridian, and `--languages` refuses codes outside the schema's list.

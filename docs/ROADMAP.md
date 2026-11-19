@@ -25,7 +25,8 @@ deliberate and explained in its pull request.
    `docs/parity.md`.
 4. ~~Add two or three regions to the comparison~~: Berlin and Pomorskie, in
    `docs/parity.md`, with the differences they add.
-5. Set `parity_verified` once the bar is met, citing the run that met it.
+5. ~~Set `parity_verified` once the bar is met, citing the run that met it~~:
+   met on 0.1.3, 2026-11-19 ("Verified on 0.1.3" in `docs/parity.md`).
 
 ## Lane B — Area and extent (no content change)
 
