@@ -66,6 +66,9 @@ mod compile_bounds;
 mod control;
 mod coordinate_groups;
 pub mod extracts;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod generalization;
 pub mod omt;
 mod profiling;
@@ -81,6 +84,7 @@ pub use basemap::{
 pub use building_levels::{
     BUILDING_LEVELS_FORMAT, BUILDING_LEVELS_VERSION, BuildingLevelReport, BuildingLevelsReport,
     building_levels_path, write_building_levels, write_building_levels_beside,
+    write_building_levels_cancellable,
 };
 pub use compile_area::CompileArea;
 pub use compile_bounds::{ArchiveCenter, CompileBounds};

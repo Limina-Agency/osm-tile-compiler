@@ -210,7 +210,8 @@ gives these sentences for an app to show.
 the attribution must keep crediting OpenMapTiles and OpenStreetMap.
 `--gzip-level` trades compile time for size, `--threads` sets the worker
 threads (every core by default), and `--temp-dir` the scratch space
-(`<output>.tmp` by default, removed afterwards).
+(`<output>.tmp` by default, removed afterwards, also when Ctrl-C stops
+the compile; it then exits with status 130).
 
 ## Building levels
 

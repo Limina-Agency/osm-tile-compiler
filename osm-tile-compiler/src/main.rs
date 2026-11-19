@@ -3,6 +3,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cli;
+mod interrupt;
 use osm_tile_compiler::{
     BasemapRequest, CompileError, CompileStage, SourcesPolicy, SupplementalDataset, compile_basemap,
 };
@@ -109,6 +110,8 @@ impl From<CompileError> for WorkerError {
 }
 
 fn run() -> Result<(), WorkerError> {
+    // Ctrl-C, SIGTERM or SIGHUP cancel the compile like closing stdin does.
+    let _cooperating = interrupt::cooperate();
     const USAGE: &str = "usage: osm-tile-compiler [--parent-stdin] --request <request.json>";
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().map(|arg| arg.as_os_str()) == Some(std::ffi::OsStr::new("--parent-stdin")) {
@@ -185,7 +188,7 @@ fn run() -> Result<(), WorkerError> {
                 progress(&report.message, report.fraction);
             }
         },
-        || CANCELLED.load(Ordering::Relaxed),
+        || CANCELLED.load(Ordering::Relaxed) || interrupt::requested(),
     )?;
     std::fs::write(
         &request.manifest_path,
@@ -208,6 +211,7 @@ fn main() {
         let arg = arg.to_string_lossy();
         arg.starts_with("--request") || arg.starts_with("--parent-stdin")
     });
+    interrupt::install();
     if !worker {
         std::process::exit(cli::main(std::env::args_os().skip(1).collect()));
     }
@@ -224,10 +228,12 @@ fn main() {
             "message": message,
             "errorKind": kind,
         }));
-        std::process::exit(if CANCELLED.load(Ordering::Relaxed) {
-            130
-        } else {
-            1
-        });
+        std::process::exit(
+            if CANCELLED.load(Ordering::Relaxed) || interrupt::requested() {
+                interrupt::EXIT_STATUS
+            } else {
+                1
+            },
+        );
     }
 }

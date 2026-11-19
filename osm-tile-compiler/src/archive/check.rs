@@ -109,10 +109,13 @@ pub fn inspect(path: &Path) -> Result<ArchiveReport, String> {
     let mut problems = Vec::new();
     let walk = reader.visit_entries(|reader, entry| {
         entries += 1;
-        addressed += u64::from(entry.run_length);
+        addressed = addressed.saturating_add(u64::from(entry.run_length));
         let name = tile_name(entry.tile_id);
         if let Some(previous) = previous
-            && entry.tile_id < previous.tile_id + u64::from(previous.run_length)
+            && entry.tile_id
+                < previous
+                    .tile_id
+                    .saturating_add(u64::from(previous.run_length))
         {
             problems.push(format!(
                 "{name} is out of order or overlaps the entry before it"
@@ -132,7 +135,7 @@ pub fn inspect(path: &Path) -> Result<ArchiveReport, String> {
                     entry.offset
                 ));
             }
-            data_end = entry.offset + u64::from(entry.length);
+            data_end = entry.offset.saturating_add(u64::from(entry.length));
         }
         let Ok(id) = TileId::new(entry.tile_id) else {
             problems.push(format!("tile ID {} is not valid", entry.tile_id));
@@ -217,7 +220,7 @@ fn check_header(header: &super::reader::Header, file_length: u64, report: &mut A
     let mut used = sections
         .iter()
         .filter(|s| s.2 > 0)
-        .map(|s| (s.1, s.1 + s.2, s.0))
+        .map(|s| (s.1, s.1.saturating_add(s.2), s.0))
         .collect::<Vec<_>>();
     used.sort();
     for pair in used.windows(2) {
@@ -225,10 +228,10 @@ fn check_header(header: &super::reader::Header, file_length: u64, report: &mut A
             report.problem(format!("the {} overlaps the {}", pair[1].2, pair[0].2));
         }
     }
-    if header.root_offset + header.root_length > ROOT_LIMIT {
+    let root_end = header.root_offset.saturating_add(header.root_length);
+    if root_end > ROOT_LIMIT {
         report.problem(format!(
-            "the root directory ends at byte {}, past the first {ROOT_LIMIT}",
-            header.root_offset + header.root_length
+            "the root directory ends at byte {root_end}, past the first {ROOT_LIMIT}"
         ));
     }
     if header.min_zoom > header.max_zoom {
@@ -505,6 +508,69 @@ mod tests {
         feature.tag_string("name", "x").unwrap();
         feature.points([MvtCoord { x: 5, y: 5 }]).unwrap();
         feature.end().encode()
+    }
+
+    fn varint(out: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            out.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    /// An archive whose header sections and directory offsets are near
+    /// u64::MAX, so that offset + length overflows.
+    fn overflowing_archive(path: &Path, root_offset: u64) {
+        let mut root = Vec::new();
+        // One tile entry and one leaf pointer, each at offset u64::MAX - 1.
+        for value in [2, 0, 1, 1, 0, 10, 10, u64::MAX, u64::MAX] {
+            varint(&mut root, value);
+        }
+        let mut bytes = b"PMTiles\x03".to_vec();
+        let fields = [
+            root_offset,
+            root.len() as u64,
+            u64::MAX - 3,
+            8,
+            u64::MAX - 3,
+            u64::MAX,
+            u64::MAX - 3,
+            u64::MAX,
+        ];
+        for field in fields {
+            bytes.extend(field.to_le_bytes());
+        }
+        bytes.resize(127, 0);
+        bytes[97] = 1; // directories stored without compression
+        bytes[99] = 1;
+        bytes.extend(&root);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Found by the pmtiles_inspect fuzz target: these overflowed, which
+    /// panics in debug builds and wraps in release ones.
+    #[test]
+    fn offsets_near_the_end_of_u64_are_problems_not_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.pmtiles");
+        for root_offset in [127, u64::MAX - 1] {
+            overflowing_archive(&path, root_offset);
+            let report = inspect(&path).unwrap();
+            assert!(report.problem_count > 0, "{:?}", report.problems);
+        }
+        overflowing_archive(&path, 127);
+        let mut reader = ArchiveReader::open(&path).unwrap();
+        let mut leaves = 0;
+        let walked = reader.walk(|reader, entry, leaf| {
+            if leaf {
+                leaves += 1;
+            } else {
+                assert!(reader.tile(&entry).unwrap_err().contains("beyond"));
+            }
+            Ok(())
+        });
+        assert!(walked.unwrap_err().contains("beyond the leaf section"));
+        assert_eq!(leaves, 1);
     }
 
     #[test]
