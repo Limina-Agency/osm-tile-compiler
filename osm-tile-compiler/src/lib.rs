@@ -1,7 +1,7 @@
 //! Compiles an OpenStreetMap `.osm.pbf` into an OpenMapTiles-schema basemap,
-//! written as a single PMTiles archive. [`omt`] is a native Rust port of the
+//! written as a single PMTiles archive. Its profile is a native Rust port of the
 //! OpenMapTiles 3.16 profile as pinned by Planetiler 0.10.2, checked against
-//! Planetiler's output: `OpenMapTilesResult::parity_verified` is `true` for the
+//! Planetiler's output: [`CompileResult::parity_verified`] is `true` for the
 //! compiles the parity measurement covers (see `docs/parity.md`). An
 //! `osm-tile-compiler` binary is included.
 //!
@@ -9,28 +9,38 @@
 //! "© OpenStreetMap contributors". The OpenMapTiles schema and each
 //! supplemental dataset carry their own terms; see the crate README.
 //!
-//! An app runs a compile in its own process with [`compile_basemap`]: it
-//! reports [`CompileProgress`] (a [`CompileStage`], a message and fractions)
-//! and stops promptly with [`CompileError::Cancelled`] when asked:
+//! [`compile_basemap`] is the one entry point for a compile. An app runs it
+//! in its own process: it reports [`CompileProgress`] (a [`CompileStage`], a
+//! message and fractions) and stops promptly with [`CompileError::Cancelled`]
+//! when asked:
 //!
 //! ```no_run
 //! use osm_tile_compiler::{
-//!     BasemapRequest, CompileError, SourcesPolicy, SupplementalDataset, compile_basemap,
+//!     Area, BasemapRequest, CompileBounds, CompileError, LayerSelection, ReadScope,
+//!     SourcesPolicy, SupplementalDataset, ZoomRange, compile_basemap,
 //! };
 //! use std::sync::atomic::{AtomicBool, Ordering};
 //!
+//! # fn main() -> Result<(), CompileError> {
 //! let cancel = AtomicBool::new(false);
 //! let mut request = BasemapRequest::new(
-//!     "/data/monaco.osm.pbf",
-//!     "/data/maps/monaco.pmtiles",
+//!     "/data/poland.osm.pbf",
+//!     "/data/maps/krakow.pmtiles",
 //!     "/data/omt-sources",
 //!     "/data/tmp",
 //! );
 //! request.threads = 2;
+//! request.zoom = ZoomRange::new(0, 14)?;
+//! // A city from a country extract, reading only the data near it.
+//! request.area = Area::bounds(CompileBounds::new(50.13, 49.97, 20.22, 19.79))
+//!     .reading(ReadScope::NearArea);
+//! request.layers = LayerSelection::except(["housenumber"]);
 //! request.sources_policy = SourcesPolicy::UsePresent;
 //! // Without the shared map data: the map lacks what
 //! // `SupplementalDataset::without_warning` says.
 //! request.omit_sources = SupplementalDataset::ALL.to_vec();
+//! // Optional: compile_basemap runs the same checks first.
+//! request.validate()?;
 //! match compile_basemap(
 //!     &request,
 //!     |progress| println!("{} {:.0}%", progress.message, progress.overall * 100.0),
@@ -42,10 +52,18 @@
 //!     // kind added later; `kind()` gives a stable identifier.
 //!     Err(error) => println!("{}: {error}", error.kind()),
 //! }
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! [`omt::compile_openmaptiles`] is the compile alone, from local inputs, on
-//! the calling thread, without stages or cancelling.
+//! Every public type that may grow is `#[non_exhaustive]`: build requests
+//! with their constructors and set fields, and match enums with a wildcard
+//! arm. Every fallible function returns [`CompileError`].
+//!
+//! Besides compiling, the crate fetches the inputs ([`fetch_sources`],
+//! [`fetch_extract`]), writes building levels for an archive
+//! ([`write_building_levels`]), and inspects, diffs and patches archives
+//! ([`archive`]).
 
 /// The message a panic was raised with, for errors that report a caught
 /// panic. Shared with the binary.
@@ -66,17 +84,18 @@ mod compile_area;
 mod compile_bounds;
 mod control;
 mod coordinate_groups;
-pub mod extracts;
+mod extracts;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
 mod generalization;
-pub mod omt;
+mod omt;
 mod profiling;
-pub mod sources;
+mod request;
+mod sources;
 mod tile_geometry;
 mod tile_slicer;
-pub mod tile_stats;
+mod tile_stats;
 
 pub use basemap::{
     BasemapOutput, BasemapRequest, MANIFEST_FORMAT, MANIFEST_VERSION, SourcesPolicy,
@@ -90,5 +109,34 @@ pub use building_levels::{
 pub use compile_area::CompileArea;
 pub use compile_bounds::{ArchiveCenter, CompileBounds};
 pub use control::{CompileError, CompileProgress, CompileStage};
-pub use extracts::{Extract, ExtractEvent, fetch_extract, fetch_extract_from};
+pub use extracts::{
+    Extract, ExtractEvent, GEOFABRIK_INDEX_URL, fetch_extract, fetch_extract_from, find_extract,
+    parse_index,
+};
+pub use omt::{
+    CompileResult, LANGUAGES as OMT_LANGUAGES, LAYERS as OMT_LAYERS, OMT_SCHEMA_VERSION,
+    PROFILE_REVISION as OMT_PROFILE_REVISION,
+};
+pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
+pub use tile_stats::{LayerStats, TILE_WARNING_BYTES, TileSize, TileStats, ZoomStats};
+
+/// The languages whose `name:<lang>` attributes a
+/// [`BasemapRequest::languages`] list keeps, in [`OMT_LANGUAGES`] order. It
+/// reads like Planetiler's `--languages` with the profile's languages as the
+/// default set: a code, optionally prefixed with `name:`; `default` for every
+/// language of the profile; `-code` to leave a language out even if listed.
+/// As in Planetiler, a list of exclusions alone keeps nothing; `default,-ru`
+/// keeps all but Russian. Unlike Planetiler, codes outside the profile's
+/// languages, and `*` (every `name:*` tag), are refused with
+/// [`CompileError::InvalidRequest`]: the profile only ever writes its own
+/// languages.
+pub fn resolve_languages(languages: &[String]) -> Result<Vec<&'static str>, CompileError> {
+    omt::resolve_languages(languages).map_err(CompileError::InvalidRequest)
+}
+
+/// Formats a byte count in KiB, as the command line prints tile sizes.
+#[doc(hidden)]
+pub fn kib(bytes: u64) -> String {
+    tile_stats::kib(bytes)
+}

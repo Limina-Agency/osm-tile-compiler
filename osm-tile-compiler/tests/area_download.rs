@@ -15,9 +15,7 @@ mod common;
 
 use common::{monaco_pbf, synthetic_sources};
 use osm_tile_compiler::{
-    Extract, ExtractEvent,
-    extracts::{GEOFABRIK_INDEX_URL, find_extract, parse_index},
-    fetch_extract,
+    Extract, ExtractEvent, GEOFABRIK_INDEX_URL, fetch_extract, find_extract, parse_index,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};

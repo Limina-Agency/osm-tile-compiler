@@ -423,6 +423,7 @@ fn an_existing_archive_is_not_replaced() {
     let output = dir.path().join("levels.pmtiles");
     std::fs::write(&output, b"mine").unwrap();
     let error = write_building_levels(&input, &output, 2).unwrap_err();
-    assert!(error.contains("refusing to replace"), "{error}");
+    assert_eq!(error.kind(), "invalid_request");
+    assert!(error.message().contains("refusing to replace"), "{error}");
     assert_eq!(std::fs::read(&output).unwrap(), b"mine");
 }

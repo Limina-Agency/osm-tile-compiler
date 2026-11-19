@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// A box whose `west` is greater than its `east` crosses the antimeridian: it
 /// runs from `west` east to 180, then from -180 to `east`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CompileBounds {
     pub north: f64,
     pub south: f64,
@@ -220,10 +221,21 @@ pub(crate) fn narrowest_covering(mut pieces: Vec<(f64, f64)>) -> Option<(f64, f6
 
 /// Where a viewer opening an archive starts: the PMTiles header's center.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ArchiveCenter {
     pub longitude: f64,
     pub latitude: f64,
     pub zoom: u8,
+}
+
+impl ArchiveCenter {
+    pub const fn new(longitude: f64, latitude: f64, zoom: u8) -> Self {
+        Self {
+            longitude,
+            latitude,
+            zoom,
+        }
+    }
 }
 
 #[cfg(test)]

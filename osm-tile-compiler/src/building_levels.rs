@@ -100,6 +100,7 @@ const TILE_TYPE_MVT: u8 = 1;
 
 /// What one level of the archive holds.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct BuildingLevelReport {
     pub zoom: u8,
     pub tiles: u64,
@@ -117,6 +118,7 @@ pub struct BuildingLevelReport {
 
 /// What [`write_building_levels`] wrote.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct BuildingLevelsReport {
     /// One entry per zoom, lowest first.
     pub levels: Vec<BuildingLevelReport>,
@@ -131,8 +133,19 @@ pub fn write_building_levels(
     input: &Path,
     output: &Path,
     threads: usize,
-) -> Result<BuildingLevelsReport, String> {
-    write_levels(input, output, threads, &Control::detached())
+) -> Result<BuildingLevelsReport, CompileError> {
+    if threads == 0 {
+        return Err(CompileError::InvalidRequest(
+            "threads must be positive".into(),
+        ));
+    }
+    if output.exists() {
+        return Err(CompileError::InvalidRequest(format!(
+            "refusing to replace existing archive {}",
+            output.display()
+        )));
+    }
+    write_levels(input, output, threads, &Control::detached()).map_err(CompileError::other)
 }
 
 /// [`write_building_levels`], stopping when `should_cancel` returns true,
@@ -232,8 +245,8 @@ pub(crate) fn write_levels(
 pub fn write_building_levels_beside(
     archive: &Path,
     threads: usize,
-) -> Result<Option<BuildingLevelsReport>, String> {
-    if !has_building_layer(archive)? {
+) -> Result<Option<BuildingLevelsReport>, CompileError> {
+    if !has_building_layer(archive).map_err(CompileError::other)? {
         return Ok(None);
     }
     let output = building_levels_path(archive);

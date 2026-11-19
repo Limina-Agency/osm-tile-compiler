@@ -7,9 +7,9 @@
 //! express it: as rings whose longitudes run on past ±180 (from 170 to 190,
 //! say), or as polygons split at ±180 (RFC 7946 section 3.1.9). Either way the
 //! tiles on both sides are covered, and the bounds wrap.
-use crate::CompileBounds;
 use crate::compile_bounds::narrowest_covering;
 use crate::coordinate_groups::{WorldPoint, lng_lat_to_world};
+use crate::{CompileBounds, CompileError};
 use geo::{BoundingRect, Contains, InteriorPoint};
 use geo_types::{Coord, Geometry, LineString, MultiPolygon, Point, Polygon};
 use std::collections::BTreeMap;
@@ -28,19 +28,47 @@ pub struct CompileArea {
 impl CompileArea {
     /// Reads a GeoJSON file (a Polygon or MultiPolygon geometry, a Feature, or
     /// a FeatureCollection, whose polygons are all used) or an Osmosis `.poly`
+    /// file, told apart by their content. A file that cannot be read or
+    /// parsed is a [`CompileError::InvalidRequest`].
+    pub fn read(path: &Path) -> Result<Self, CompileError> {
+        Self::read_file(path).map_err(CompileError::InvalidRequest)
+    }
+
+    /// The polygons of a GeoJSON text, as [`read`](Self::read) takes it.
+    pub fn from_geojson(text: &str) -> Result<Self, CompileError> {
+        Self::parse_geojson(text).map_err(CompileError::InvalidRequest)
+    }
+
+    /// The polygons of an Osmosis `.poly` text, as [`read`](Self::read)
+    /// takes it.
+    pub fn from_poly(text: &str) -> Result<Self, CompileError> {
+        Self::parse_poly(text).map_err(CompileError::InvalidRequest)
+    }
+
+    /// An area of `polygons`, in degrees. There must be at least one, and
+    /// every ring needs three distinct points within latitude ±90 and
+    /// longitude ±540: a ring crossing the antimeridian may run on past
+    /// ±180, by less than one turn, as long as its polygon spans at most 360
+    /// degrees of longitude.
+    pub fn from_polygons(polygons: MultiPolygon<f64>) -> Result<Self, CompileError> {
+        Self::check_polygons(polygons).map_err(CompileError::InvalidRequest)
+    }
+
+    /// Reads a GeoJSON file (a Polygon or MultiPolygon geometry, a Feature, or
+    /// a FeatureCollection, whose polygons are all used) or an Osmosis `.poly`
     /// file, told apart by their content.
-    pub fn read(path: &Path) -> Result<Self, String> {
+    fn read_file(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
         let area = if text.trim_start().starts_with('{') {
-            Self::from_geojson(&text)
+            Self::parse_geojson(&text)
         } else {
-            Self::from_poly(&text)
+            Self::parse_poly(&text)
         };
         area.map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    pub fn from_geojson(text: &str) -> Result<Self, String> {
+    fn parse_geojson(text: &str) -> Result<Self, String> {
         let geojson: geojson::GeoJson =
             text.parse().map_err(|e| format!("invalid GeoJSON: {e}"))?;
         // The conversion below indexes each position's first two numbers.
@@ -67,14 +95,14 @@ impl CompileArea {
             }
         }
         polygons.reverse();
-        Self::from_polygons(MultiPolygon(polygons))
+        Self::check_polygons(MultiPolygon(polygons))
     }
 
     /// Parses the Osmosis polygon format: a name line, then sections of
     /// `lon lat` lines, each named on its own line and closed by `END`, the
     /// file closed by a final `END`. A section whose name starts with `!` is
     /// a hole in the polygon that contains it.
-    pub fn from_poly(text: &str) -> Result<Self, String> {
+    fn parse_poly(text: &str) -> Result<Self, String> {
         let mut lines = text
             .lines()
             .enumerate()
@@ -125,14 +153,14 @@ impl CompileArea {
                 .ok_or_else(|| format!("hole on line {number} lies in no polygon"))?;
             outer.interiors_push(hole);
         }
-        Self::from_polygons(MultiPolygon(outers))
+        Self::check_polygons(MultiPolygon(outers))
     }
 
     /// Checks that there is at least one polygon and that every ring has three
     /// distinct points within latitude ±90 and longitude ±540: a ring crossing
     /// the antimeridian may run on past ±180, by less than one turn, as long
     /// as its polygon spans at most 360 degrees of longitude.
-    pub fn from_polygons(polygons: MultiPolygon<f64>) -> Result<Self, String> {
+    fn check_polygons(polygons: MultiPolygon<f64>) -> Result<Self, String> {
         if polygons.0.is_empty() {
             return Err("no polygons".into());
         }
@@ -485,7 +513,7 @@ END
 
     #[test]
     fn reads_poly_files_with_holes() {
-        let area = CompileArea::from_poly(POLY).unwrap();
+        let area = CompileArea::parse_poly(POLY).unwrap();
         assert_eq!(area.polygons.0.len(), 2);
         assert_eq!(area.polygons.0[0].interiors().len(), 1);
         assert!(area.contains(7.41, 43.73));
@@ -515,7 +543,7 @@ END
                 "more than the world's",
             ),
         ] {
-            let error = CompileArea::from_poly(text).unwrap_err();
+            let error = CompileArea::parse_poly(text).unwrap_err();
             assert!(error.contains(message), "{text:?}: {error}");
         }
     }
@@ -530,24 +558,27 @@ END
                 {{"type":"Feature","properties":{{}},"geometry":{multi}}}]}}"#
         );
         assert_eq!(
-            CompileArea::from_geojson(square).unwrap().polygons.0.len(),
+            CompileArea::parse_geojson(square).unwrap().polygons.0.len(),
             1
         );
         assert_eq!(
-            CompileArea::from_geojson(multi).unwrap().polygons.0.len(),
+            CompileArea::parse_geojson(multi).unwrap().polygons.0.len(),
             2
         );
-        let area = CompileArea::from_geojson(&collection).unwrap();
+        let area = CompileArea::parse_geojson(&collection).unwrap();
         assert_eq!(area.polygons.0.len(), 3);
         assert_eq!(area.bounds(), CompileBounds::new(3., 0., 3., 0.));
         let line = r#"{"type":"LineString","coordinates":[[0,0],[1,1]]}"#;
         assert!(
-            CompileArea::from_geojson(line)
+            CompileArea::parse_geojson(line)
                 .unwrap_err()
                 .contains("found a LineString")
         );
         let empty = r#"{"type":"FeatureCollection","features":[]}"#;
-        assert_eq!(CompileArea::from_geojson(empty).unwrap_err(), "no polygons");
+        assert_eq!(
+            CompileArea::parse_geojson(empty).unwrap_err(),
+            "no polygons"
+        );
     }
 
     /// Found by the polygon_geojson fuzz target: the geojson crate's
@@ -560,7 +591,7 @@ END
             r#"{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[]}]}"#,
         ] {
             let error = CompileArea::from_geojson(text).unwrap_err();
-            assert!(error.starts_with("invalid GeoJSON"), "{error}");
+            assert!(error.message().starts_with("invalid GeoJSON"), "{error}");
         }
     }
 
@@ -630,7 +661,7 @@ END
         // A ring from 160.3 E to 190.7 (169.3 W) around a hole that itself
         // crosses 180, and one written the other way, from -200.3 (159.7 E)
         // to -170.1, further south.
-        let area = CompileArea::from_polygons(MultiPolygon(vec![
+        let area = CompileArea::check_polygons(MultiPolygon(vec![
             polygon!(
                 exterior: [
                     (x: 160.3, y: 50.1), (x: 190.7, y: 50.1), (x: 190.7, y: 71.3),
@@ -664,7 +695,7 @@ END
         let multi = r#"{"type":"MultiPolygon","coordinates":[
             [[[170.3,-20.1],[180,-20.1],[180,-10.7],[170.3,-15.2],[170.3,-20.1]]],
             [[[-180,-20.1],[-170.7,-20.1],[-175.2,-10.7],[-180,-10.7],[-180,-20.1]]]]}"#;
-        let area = CompileArea::from_geojson(multi).unwrap();
+        let area = CompileArea::parse_geojson(multi).unwrap();
         assert_eq!(
             area.bounds(),
             CompileBounds::new(-10.7, -20.1, -170.7, 170.3)
@@ -674,7 +705,7 @@ END
         // The same polygon as one ring running past 180, from a .poly file.
         let poly =
             "fiji\n1\n170.3 -20.1\n189.3 -20.1\n184.8 -10.7\n180 -10.7\n170.3 -15.2\nEND\nEND\n";
-        let continuous = CompileArea::from_poly(poly).unwrap();
+        let continuous = CompileArea::parse_poly(poly).unwrap();
         assert_eq!(continuous.bounds(), area.bounds());
         assert_covers_brute_force(&continuous);
         for z in 0..=7 {
@@ -706,7 +737,7 @@ END
     fn covers_exactly_the_tiles_a_polygon_intersects() {
         // An L-shape around a hole, plus a separate triangle, at coordinates
         // that do not fall on tile edges.
-        let area = CompileArea::from_polygons(MultiPolygon(vec![
+        let area = CompileArea::check_polygons(MultiPolygon(vec![
             polygon!(
                 exterior: [
                     (x: -71.3, y: -33.1), (x: 52.7, y: -33.1), (x: 52.7, y: 8.9),

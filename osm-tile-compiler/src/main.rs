@@ -5,7 +5,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod cli;
 mod interrupt;
 use osm_tile_compiler::{
-    BasemapRequest, CompileError, CompileStage, SourcesPolicy, SupplementalDataset, compile_basemap,
+    BasemapRequest, CompileError, CompileStage, LayerSelection, ReadScope, SourcesPolicy,
+    SupplementalDataset, compile_basemap,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -168,10 +169,24 @@ fn run() -> Result<(), WorkerError> {
     );
     compile.sources_policy = SourcesPolicy::FetchAndVerify;
     compile.omit_sources = omit_sources;
-    compile.polygon = request.polygon_path;
-    compile.area_only = request.area_only;
-    compile.layers = request.layers;
-    compile.exclude_layers = request.exclude_layers;
+    // `areaOnly` without a polygon reads the whole extract, as before.
+    let read = if request.area_only && request.polygon_path.is_some() {
+        ReadScope::NearArea
+    } else {
+        ReadScope::WholeExtract
+    };
+    compile.area.polygon = request.polygon_path.map(Into::into);
+    compile.area.read = read;
+    compile.layers = match (request.layers, request.exclude_layers) {
+        (Some(_), Some(_)) => {
+            return Err(WorkerError::invalid(
+                "give either the layers to write or those to leave out, not both",
+            ));
+        }
+        (Some(only), None) => LayerSelection::only(only),
+        (None, Some(except)) => LayerSelection::except(except),
+        (None, None) => LayerSelection::All,
+    };
     compile.languages = request.languages;
     compile.building_levels = request.building_levels;
     // Each stage is reported once, as before; downloads also with their

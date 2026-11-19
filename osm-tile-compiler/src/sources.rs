@@ -20,6 +20,7 @@ use std::{
 /// One of the three supplemental datasets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SupplementalDataset {
     /// OSM-derived ocean polygons from osmdata.openstreetmap.de, about 1 GB.
     WaterPolygons,
@@ -160,6 +161,7 @@ fn check_pin(dataset: SupplementalDataset, sha256: &str) -> Result<(), String> {
 /// Where a supplemental dataset in a compile came from: its record beside
 /// the download, `<file>.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CachedInput {
     pub file: String,
     pub url: String,
@@ -198,6 +200,7 @@ pub(crate) fn transfer(
 
 /// What [`fetch_sources`] is doing, for progress reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FetchEvent<'a> {
     /// Verifying a cached file against its recorded hash: `bytes` of
     /// `total` read, at most every 250 ms after the first.
@@ -227,6 +230,7 @@ pub enum FetchEvent<'a> {
 
 /// How [`fetch_sources`] treats files already in the directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FetchMode {
     /// Keep a file whose recorded hash still matches; download the others.
     Verify,

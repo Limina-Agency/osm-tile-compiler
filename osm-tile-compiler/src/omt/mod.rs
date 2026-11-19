@@ -40,12 +40,15 @@ use std::path::{Path, PathBuf};
 use std::{sync::Arc, time::Duration, time::Instant};
 
 pub use labels::LANGUAGES;
-pub use selection::{resolve_languages, select_layers};
+pub(crate) use selection::{resolve_languages, select_layers};
 
 /// The OpenMapTiles schema version the archives follow, written as the
 /// metadata's `version` as OpenMapTiles does.
 pub const OMT_SCHEMA_VERSION: &str = "3.16.0";
+/// The OpenMapTiles commit the profile ports, as pinned by Planetiler 0.10.2.
 pub const PROFILE_REVISION: &str = "91516fdf477915b1a985015811049b9b96c7f87e";
+/// The layers of the OpenMapTiles schema, in the order the archives hold
+/// them.
 pub const LAYERS: [&str; 16] = [
     "water",
     "waterway",
@@ -65,9 +68,11 @@ pub const LAYERS: [&str; 16] = [
     "aerodrome_label",
 ];
 
-/// All inputs are local. Supplemental archives are the pinned Planetiler inputs.
+/// The compile [`crate::compile_basemap`] runs once the request's datasets
+/// are in place and its area is read. All inputs are local. Supplemental
+/// archives are the pinned Planetiler inputs.
 #[derive(Debug, Clone)]
-pub struct OpenMapTilesRequest {
+pub(crate) struct OpenMapTilesRequest {
     pub input_pbf: PathBuf,
     pub sources: PathBuf,
     pub output: PathBuf,
@@ -118,13 +123,26 @@ fn parity_verified(request: &OpenMapTilesRequest) -> bool {
         && request.max_zoom == 14
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OpenMapTilesResult {
+/// What a compile wrote into the archive, and how long it took.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CompileResult {
+    /// The schema and its version, such as `OpenMapTiles 3.16.0 (native
+    /// experimental port)`.
     pub schema: String,
+    /// The profile's source revision ([`PROFILE_REVISION`]).
     pub profile_revision: String,
+    /// Whether this profile's output is verified against its reference
+    /// compiler (Planetiler for OpenMapTiles): `true` for the compiles the
+    /// parity measurement covers (`docs/parity.md`): Planetiler's default
+    /// languages, every supplemental dataset, a full read of the extract and
+    /// zoom 14 at the top.
     pub parity_verified: bool,
+    /// Source features read: OSM objects and supplemental records.
     pub sources_processed: u64,
+    /// Features the profile made from them.
     pub profile_features: u64,
+    /// Tiles written.
     pub tiles: u64,
     pub supplement_seconds: f64,
     pub osm_seconds: f64,
@@ -346,22 +364,6 @@ fn default_center(
     }
 }
 
-/// Compile using native OpenMapTiles source rules and bounded disk-backed tiles.
-pub fn compile_openmaptiles(request: &OpenMapTilesRequest) -> Result<OpenMapTilesResult, String> {
-    compile_openmaptiles_with_progress(request, |_| {})
-}
-
-/// Compiles, reporting each step's description to `progress`. It cannot be
-/// stopped and runs on the calling thread and threads it starts;
-/// [`crate::compile_basemap`] adds stages, fractions, cancelling and a
-/// thread pool of its own.
-pub fn compile_openmaptiles_with_progress(
-    request: &OpenMapTilesRequest,
-    progress: impl FnMut(&str),
-) -> Result<OpenMapTilesResult, String> {
-    compile(request, &Control::detached(), progress)
-}
-
 /// Checks the request's settings without reading anything.
 pub(crate) fn validate(request: &OpenMapTilesRequest) -> Result<(), String> {
     if request.min_zoom > request.max_zoom || request.max_zoom > 14 {
@@ -377,18 +379,20 @@ pub(crate) fn validate(request: &OpenMapTilesRequest) -> Result<(), String> {
         ));
     }
     selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?;
+    check_bounds(request.bounds)?;
+    if let Some(center) = request.center {
+        check_center(
+            center,
+            crate::ZoomRange::new(request.min_zoom, request.max_zoom).map_err(|e| e.to_string())?,
+        )?;
+    }
     Ok(())
 }
 
-pub(crate) fn compile(
-    request: &OpenMapTilesRequest,
-    control: &Control,
-    mut progress: impl FnMut(&str),
-) -> Result<OpenMapTilesResult, String> {
-    validate(request)?;
-    let selection =
-        selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?;
-    let b = request.bounds;
+/// Checks that `bounds` are finite and, once normalized, a box Web Mercator
+/// can tile.
+pub(crate) fn check_bounds(bounds: CompileBounds) -> Result<(), String> {
+    let b = bounds;
     if ![b.north, b.south, b.east, b.west]
         .iter()
         .all(|v| v.is_finite())
@@ -403,6 +407,33 @@ pub(crate) fn compile(
             b.west, b.south, b.east, b.north
         ));
     }
+    Ok(())
+}
+
+/// Checks that `center` is a point Web Mercator shows, at a zoom written.
+pub(crate) fn check_center(center: ArchiveCenter, zoom: crate::ZoomRange) -> Result<(), String> {
+    if !(center.longitude.abs() <= 180.0 && center.latitude.abs() <= 85.051129)
+        || !zoom.contains(center.zoom)
+    {
+        return Err(format!(
+            "the center must be a longitude, a latitude within Web Mercator's and a zoom from \
+             {} to {}",
+            zoom.min(),
+            zoom.max()
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn compile(
+    request: &OpenMapTilesRequest,
+    control: &Control,
+    mut progress: impl FnMut(&str),
+) -> Result<CompileResult, String> {
+    validate(request)?;
+    let selection =
+        selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?;
+    let b = request.bounds.normalized();
     let bounds = match &request.area {
         Some(area) => b
             .intersection(area.bounds())
@@ -410,18 +441,7 @@ pub(crate) fn compile(
         None => b,
     };
     let center = match request.center {
-        Some(center) => {
-            if !(center.longitude.abs() <= 180.0 && center.latitude.abs() <= 85.051129)
-                || !(request.min_zoom..=request.max_zoom).contains(&center.zoom)
-            {
-                return Err(format!(
-                    "the center must be a longitude, a latitude within Web Mercator's and a \
-                     zoom from {} to {}",
-                    request.min_zoom, request.max_zoom
-                ));
-            }
-            center
-        }
+        Some(center) => center,
         None => default_center(
             bounds,
             request.area.as_ref(),
@@ -551,7 +571,7 @@ pub(crate) fn compile(
     control.check()?;
     partial.persist(&request.output)?;
     warnings.extend(tile_stats.warning());
-    Ok(OpenMapTilesResult {
+    Ok(CompileResult {
         schema: format!("OpenMapTiles {OMT_SCHEMA_VERSION} (native experimental port)"),
         profile_revision: PROFILE_REVISION.into(),
         parity_verified: parity_verified(request),

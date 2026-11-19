@@ -14,6 +14,7 @@ const LARGEST_TILES: usize = 10;
 /// stored for a tile; layer sizes are uncompressed protobuf bytes, the
 /// measure that compares across layers.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TileStats {
     /// The compressed size above which a tile counts in `over_warning`.
     pub warning_bytes: u64,
@@ -26,6 +27,7 @@ pub struct TileStats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ZoomStats {
     pub zoom: u8,
     pub tiles: u64,
@@ -41,6 +43,7 @@ pub struct ZoomStats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LayerStats {
     /// Tiles that contain the layer.
     pub tiles: u64,
@@ -51,6 +54,7 @@ pub struct LayerStats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TileSize {
     /// `z/x/y`.
     pub tile: String,
