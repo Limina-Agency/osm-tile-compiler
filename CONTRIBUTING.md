@@ -13,6 +13,9 @@ Issues and pull requests are welcome.
   `test:`, `refactor:`; add `!` for a breaking change, as in `feat!:`) and
   put what users should know in the commit body, which the release notes
   are written from.
+- A change that breaks the library's public API (the semver job's summary
+  on the pull request lists it; `scripts/semver-report.sh` runs it locally)
+  says so in the commit subject with `!`.
 - Contributions are licensed under the Apache License, Version 2.0, as the
   license's section 5 describes.
 
