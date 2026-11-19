@@ -1301,15 +1301,16 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "osm-pbf-ingest"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df69d8b1afc54a1bf22ad255f879ebce5b5265b40ba1aebd13fa25753aad3780"
+checksum = "1059e10f34fd5234d50085bffccc53296197e0c2503379168627593325a0269b"
 dependencies = [
  "buffa",
  "compact_str",
  "crossbeam-channel",
  "flate2",
  "memmap2",
+ "quick-xml",
  "rayon",
  "roaring",
  "rustc-hash",
@@ -1518,6 +1519,15 @@ name = "pub-iterator-type"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "858afdbecdce657c6e32031348cf7326da7700c869c368a136d31565972f7018"
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "quote"
