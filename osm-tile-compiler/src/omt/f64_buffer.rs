@@ -145,7 +145,7 @@ pub(super) fn buffer_from_raw_curves(
             .collect::<Vec<_>>();
         std::fs::write(path, serde_json::to_vec(&bits).ok()?).ok()?;
     }
-    let curve_adapter = FloatPointAdapter::<Point, f64>::with_iter(curves.iter().flatten());
+    let curve_adapter = FloatPointAdapter::<Point, i32>::with_iter(curves.iter().flatten());
     let mut provenance = Provenance::default();
     for curve in &curves {
         add_curve_provenance(curve, &curve_adapter, &mut provenance);
@@ -206,9 +206,10 @@ fn raw_offset_curves(input: &MultiPolygon<f64>, distance: f64) -> Option<Vec<Vec
     {
         return None;
     }
-    let mut rect = FloatRect::with_iter(source.iter())?;
-    rect.add_offset(2.0 * 1.1 * MITRE_LIMIT * distance.abs());
-    let source_adapter = FloatPointAdapter::<Point, f64>::new(rect);
+    let mut rect = FloatRect::with_iter(source.iter()).ok()??;
+    rect.add_offset(2.0 * 1.1 * MITRE_LIMIT * distance.abs())
+        .ok()?;
+    let source_adapter = FloatPointAdapter::<Point, i32>::new(rect);
     let mut discarded = Provenance::default();
     let mut curves = Vec::<Vec<Point>>::new();
     for polygon in &oriented.0 {
@@ -251,11 +252,14 @@ pub(super) fn restore_buffer_coordinates(
     {
         return None;
     }
-    // OutlineSolver::prepare in i_overlay 4.5.2 adds the outer and inner
-    // miter builder offsets. For MITRE_LIMIT=5 each is 5.5*|distance|.
-    let mut rect = FloatRect::with_iter(source.iter())?;
-    rect.add_offset(2.0 * 1.1 * MITRE_LIMIT * distance.abs());
-    let adapter = FloatPointAdapter::<Point, f64>::new(rect);
+    // This mirrors the grid of geo::Buffer, which still runs on geo's own
+    // i_overlay 4.5.2: its OutlineSolver::prepare adds the outer and inner
+    // miter builder offsets. For MITRE_LIMIT=5 each is 5.5*|distance|. The
+    // i32 adapter in i_float 5 picks the same 2^(29 - log2 radius) scale.
+    let mut rect = FloatRect::with_iter(source.iter()).ok()??;
+    rect.add_offset(2.0 * 1.1 * MITRE_LIMIT * distance.abs())
+        .ok()?;
+    let adapter = FloatPointAdapter::<Point, i32>::new(rect);
     let mut provenance = Provenance::default();
     for polygon in &oriented.0 {
         add_ring(polygon.exterior(), distance, &adapter, &mut provenance)?;
@@ -282,7 +286,7 @@ pub(super) fn restore_buffer_coordinates(
 fn add_ring(
     ring: &LineString<f64>,
     distance: f64,
-    adapter: &FloatPointAdapter<Point, f64>,
+    adapter: &FloatPointAdapter<Point, i32>,
     provenance: &mut Provenance,
 ) -> Option<Vec<Point>> {
     let mut vertices = ring.0.iter().map(|p| [p.x, p.y]).collect::<Vec<_>>();
@@ -386,7 +390,7 @@ fn add_ring(
 
 fn add_curve_provenance(
     curve: &[Point],
-    adapter: &FloatPointAdapter<Point, f64>,
+    adapter: &FloatPointAdapter<Point, i32>,
     provenance: &mut Provenance,
 ) {
     for (i, &point) in curve.iter().enumerate() {
@@ -409,7 +413,7 @@ fn add_curve_provenance(
 
 fn restore_ring(
     ring: &LineString<f64>,
-    adapter: &FloatPointAdapter<Point, f64>,
+    adapter: &FloatPointAdapter<Point, i32>,
     provenance: &Provenance,
 ) -> LineString<f64> {
     LineString::new(
@@ -435,7 +439,7 @@ fn restore_ring(
 
 fn unique_intersection(
     output_key: Key,
-    adapter: &FloatPointAdapter<Point, f64>,
+    adapter: &FloatPointAdapter<Point, i32>,
     segments: &[(Point, Point)],
 ) -> Option<Point> {
     // Retain only segments whose quantized bounds can contain the output. This
@@ -483,7 +487,7 @@ fn unique_intersection(
     candidate
 }
 
-fn key(adapter: &FloatPointAdapter<Point, f64>, point: Point) -> Key {
+fn key(adapter: &FloatPointAdapter<Point, i32>, point: Point) -> Key {
     let grid = adapter.float_to_int(&point);
     (grid.x, grid.y)
 }

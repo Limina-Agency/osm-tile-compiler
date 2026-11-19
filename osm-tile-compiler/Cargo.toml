@@ -38,7 +38,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 shapefile = { version = "0.9", features = ["geo-types"] }
 rusqlite = { version = "0.43", features = ["bundled", "hooks"] }
 geo = { workspace = true }
-i_overlay = "4.5"
+i_overlay = "9.2"
 geo-types = { workspace = true }
 geojson = { workspace = true }
 flate2 = { workspace = true }
