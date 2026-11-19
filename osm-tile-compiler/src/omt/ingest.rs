@@ -281,6 +281,9 @@ pub fn read_osm(
     let mut node_batches = 0.0;
     drop(blobs);
     control.set_total(pass1_blobs);
+    // Declared before the index so that it outlives it: the store is unmapped
+    // before its directory goes, which Windows needs.
+    let node_store_dir = NodeStoreDir(temp.join(NODE_STORE_DIR));
     let prepare_phase = crate::profiling::Phase::start("omt_prepare_index");
     let prepared = prepare_ingest_index_with_threads(
         pbf,
@@ -366,6 +369,11 @@ pub fn read_osm(
     );
     let missing_ways = index.missing_ways.load(Ordering::Relaxed);
     let missing_relations = index.missing_relations.load(Ordering::Relaxed);
+    // Every job has finished, so this was the last reference: the node store
+    // goes now, not when the compile ends. It is the extract's biggest scratch
+    // file (about 2× the extract) and nothing after this stage reads it.
+    drop(index);
+    drop(node_store_dir);
     if missing_ways > 0 || missing_relations > 0 {
         warnings.push(format!(
             "skipped incomplete source geometries: {missing_ways} ways with nodes missing \
@@ -373,6 +381,21 @@ pub fn read_osm(
         ));
     }
     Ok(())
+}
+
+/// The directory under the scratch directory where `osm_pbf_ingest` keeps a
+/// disk node store (`DiskSortedNodeStore::new`). Extracts over 32 MiB get one.
+const NODE_STORE_DIR: &str = "node_store";
+
+/// Deletes the disk node store when dropped, on success, error or cancel.
+struct NodeStoreDir(std::path::PathBuf);
+
+impl Drop for NodeStoreDir {
+    fn drop(&mut self) {
+        // Best effort: a store still mapped elsewhere (only on an error path,
+        // and only on Windows) stays until the scratch directory is removed.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Pass 2 callbacks run on the calling thread. They only forward batches to the
@@ -939,6 +962,29 @@ fn nest_rings(rings: Vec<Polygon<f64>>) -> Geometry<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn node_store_dir_deletes_the_disk_store_osm_pbf_ingest_writes() {
+        use osm_pbf_ingest::node_store::{
+            NodeLocationStoreBuilder, NodeStoreStrategy, NodeWorkerChunk,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let guard = super::NodeStoreDir(temp.path().join(super::NODE_STORE_DIR));
+        let builder = NodeLocationStoreBuilder::new(NodeStoreStrategy::Disk, temp.path()).unwrap();
+        let mut chunk = NodeWorkerChunk::default();
+        chunk.push(1, 50.06, 19.94);
+        builder.push_chunk(chunk).unwrap();
+        let store = builder.finish().unwrap();
+        assert_eq!(
+            store.get(1).map(|(lat, _)| (lat * 100.0).round()),
+            Some(5006.0)
+        );
+        assert!(guard.0.is_dir(), "the store is where NODE_STORE_DIR says");
+        drop(store);
+        drop(guard);
+        assert!(!temp.path().join(super::NODE_STORE_DIR).exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn relation_19960721_nests_boundary_touching_inner_rings_like_planetiler() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
