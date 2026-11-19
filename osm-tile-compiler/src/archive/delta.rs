@@ -35,6 +35,7 @@
 //! patch is smaller. Edits rarely change more than a little of a tile, so
 //! this is what keeps a delta small.
 use super::reader::{ArchiveReader, Entry};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -364,11 +365,81 @@ fn encode_tile(raw: &[u8], level: u8) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+/// Reads `length` bytes at `offset` without a shared position, so many
+/// threads can read one file at once.
+fn read_at(file: &File, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = vec![0; length as usize];
+    #[cfg(unix)]
+    std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes, offset)?;
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < bytes.len() {
+            let read = std::os::windows::fs::FileExt::seek_read(
+                file,
+                &mut bytes[done..],
+                offset + done as u64,
+            )?;
+            if read == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            done += read;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut bytes)?;
+    }
+    Ok(bytes)
+}
+
+/// The first gzip level, tried in the order `first`, 6, then 0 to 9, that
+/// `reproduces`; `tried` remembers each level's answer so no level is
+/// encoded twice for a tile.
+fn find_level(
+    first: Option<u8>,
+    tried: &mut [Option<bool>; 10],
+    mut reproduces: impl FnMut(u8) -> bool,
+) -> Option<u8> {
+    first
+        .into_iter()
+        .chain([6])
+        .chain(0..=9)
+        .find(|&level| *tried[usize::from(level)].get_or_insert_with(|| reproduces(level)))
+}
+
+/// What patching one changed tile would give, worked out without the
+/// patcher's running state so that tiles can be tried in parallel.
+/// `Patcher::settle` then takes the trials in tile order and decides each
+/// exactly as trying the tiles one after another would.
+enum Trial {
+    /// Not tried: the patcher had given up, or the part is no tile.
+    Skipped,
+    /// No base tile at the position, or a tile that can't be decoded.
+    Unpatchable,
+    /// Reading the base tile failed.
+    Failed(String),
+    /// No gzip level stores the decoded tile as the target stores it.
+    Unreproducible,
+    Reproducible {
+        base: Segment,
+        /// Each gzip level's answer, for the levels tried so far.
+        tried: [Option<bool>; 10],
+        /// The patch, when it is smaller than the tile and rebuilds it.
+        patch: Option<Vec<u8>>,
+    },
+}
+
 /// Finds patches for the target's changed tiles. A patch needs the target's
 /// stored bytes to be reproducible from the decoded tile, which holds for
 /// archives this compiler wrote; for others it soon stops trying.
 struct Patcher<'a> {
     base_tiles: &'a [Entry],
+    base_file: &'a File,
     base_compression: u8,
     target_compression: u8,
     /// The gzip level that last reproduced a tile.
@@ -387,60 +458,83 @@ impl Patcher<'_> {
         })
     }
 
-    /// The level that stores `raw` as `stored`, if any.
-    fn level(&mut self, raw: &[u8], stored: &[u8]) -> Option<u8> {
-        if self.target_compression == 1 {
-            return Some(STORED);
-        }
-        let mut tried = [false; 10];
-        for level in self.level.into_iter().chain([6]).chain(0..=9) {
-            if std::mem::replace(&mut tried[usize::from(level)], true) {
-                continue;
-            }
-            if encode_tile(raw, level) == stored {
-                self.level = Some(level);
-                return Some(level);
-            }
-        }
-        None
+    /// Whether it has stopped trying: 16 tiles in, none reproducible.
+    fn given_up(&self) -> bool {
+        self.hits == 0 && self.misses >= 16
     }
 
-    /// A patch for the target tile `tile_id`, stored as `stored`, when one
-    /// is smaller than the tile.
-    fn patch(
-        &mut self,
-        base: &mut Cursor,
-        tile_id: u64,
-        stored: &[u8],
-    ) -> Result<Option<TilePatch>, String> {
-        if self.hits == 0 && self.misses >= 16 {
-            return Ok(None);
-        }
-        let Some(segment) = self.base_tile(tile_id) else {
-            return Ok(None);
+    /// Tries a patch for the target tile `tile_id`, stored as `stored`,
+    /// trying the gzip level `guess` first. Changes nothing, so it can run on
+    /// many tiles at once.
+    fn trial(&self, guess: Option<u8>, tile_id: u64, stored: &[u8]) -> Trial {
+        let Some(base) = self.base_tile(tile_id) else {
+            return Trial::Unpatchable;
         };
-        let old = base
-            .read(segment.offset, segment.length)
-            .map_err(|e| format!("Failed to read the old archive: {e}"))?;
+        let old = match read_at(self.base_file, base.offset, base.length) {
+            Ok(old) => old,
+            Err(e) => return Trial::Failed(format!("Failed to read the old archive: {e}")),
+        };
         let (Some(old), Some(new)) = (
             decode_tile(&old, self.base_compression),
             decode_tile(stored, self.target_compression),
         ) else {
-            return Ok(None);
+            return Trial::Unpatchable;
         };
-        let Some(level) = self.level(&new, stored) else {
-            self.misses += 1;
-            return Ok(None);
-        };
-        let patch = super::tile_patch::encode(&old, &new);
-        if patch.len() + 32 >= stored.len()
-            || super::tile_patch::decode(&old, &patch, new.len()).as_deref() != Ok(&new[..])
+        let mut tried = [None; 10];
+        if self.target_compression != 1
+            && find_level(guess, &mut tried, |level| {
+                encode_tile(&new, level) == stored
+            })
+            .is_none()
         {
+            return Trial::Unreproducible;
+        }
+        let patch = super::tile_patch::encode(&old, &new);
+        let patch = (patch.len() + 32 < stored.len()
+            && super::tile_patch::decode(&old, &patch, new.len()).as_deref() == Ok(&new[..]))
+        .then_some(patch);
+        Trial::Reproducible { base, tried, patch }
+    }
+
+    /// Decides the patch for a tile stored as `stored` from its trial, in
+    /// tile order: the patch, if any, that trying the tiles one after
+    /// another would have found.
+    fn settle(&mut self, trial: Trial, stored: &[u8]) -> Result<Option<TilePatch>, String> {
+        if self.given_up() {
             return Ok(None);
         }
+        let (base, mut tried, patch) = match trial {
+            Trial::Skipped | Trial::Unpatchable => return Ok(None),
+            Trial::Failed(error) => return Err(error),
+            Trial::Unreproducible => {
+                self.misses += 1;
+                return Ok(None);
+            }
+            Trial::Reproducible { base, tried, patch } => (base, tried, patch),
+        };
+        let level = if self.target_compression == 1 {
+            STORED
+        } else {
+            // The trial guessed which level the tiles before would leave
+            // here; when it guessed wrong, try the levels in this order,
+            // encoding those the trial didn't.
+            let mut new = None;
+            let level = find_level(self.level, &mut tried, |level| {
+                let new = new.get_or_insert_with(|| {
+                    decode_tile(stored, self.target_compression).unwrap_or_default()
+                });
+                encode_tile(new, level) == stored
+            })
+            .ok_or("a tile's gzip level was lost between trying and settling")?;
+            self.level = Some(level);
+            level
+        };
+        let Some(patch) = patch else {
+            return Ok(None);
+        };
         self.hits += 1;
         Ok(Some(TilePatch {
-            base: segment,
+            base,
             base_compression: self.base_compression,
             level,
             target_length: stored.len() as u64,
@@ -611,35 +705,61 @@ impl Drop for PendingFile {
     }
 }
 
+/// Target bytes `diff` reads before trying a batch's tiles, and `apply`
+/// before rebuilding a batch's patched tiles: enough to keep every thread
+/// busy, little enough to hold.
+const BATCH_BYTES: u64 = 32 << 20;
+
+/// A part of the target in a batch `diff` is working on.
+enum Part {
+    /// Its operation is already known: a gap or an overlap.
+    Ready(Operation),
+    /// A part read, waiting to be hashed and perhaps patched.
+    Read { segment: Segment, bytes: Vec<u8> },
+}
+
 /// Writes the delta that turns the archive `base` into `target` to `output`,
 /// which must not exist yet. Before keeping it, rebuilds `target` from it
 /// and checks the result.
 pub fn diff(base: &Path, target: &Path, output: &Path) -> Result<DiffReport, String> {
-    let base_digest = digest(base)?;
-    let target_digest = digest(target)?;
-    let base_layout = layout(base)?;
-    let target_layout = layout(target)?;
+    let ((base_digest, target_digest), (base_layout, target_layout)) = rayon::join(
+        || rayon::join(|| digest(base), || digest(target)),
+        || rayon::join(|| layout(base), || layout(target)),
+    );
+    let (base_digest, target_digest) = (base_digest?, target_digest?);
+    let (base_layout, target_layout) = (base_layout?, target_layout?);
 
-    // Every distinct part of the base, by content.
+    // Every distinct part of the base, by content. The parts are read in
+    // order, hashed in parallel and indexed in order, so the first of equal
+    // parts is the one kept.
     let mut base_index: HashMap<Key, Segment> = HashMap::with_capacity(base_layout.segments.len());
     let mut base_keys: HashMap<Segment, Key> = HashMap::with_capacity(base_layout.segments.len());
     let mut cursor = Cursor::open(base)?;
-    for &segment in &base_layout.segments {
-        let bytes = cursor
-            .read(segment.offset, segment.length)
+    for batch in base_layout.segments.chunks(4096) {
+        let parts = batch
+            .iter()
+            .map(|segment| cursor.read(segment.offset, segment.length))
+            .collect::<std::io::Result<Vec<_>>>()
             .map_err(|e| format!("Failed to read {}: {e}", base.display()))?;
-        let k = key(&bytes);
-        base_index.entry(k).or_insert(segment);
-        base_keys.insert(segment, k);
+        let keys: Vec<Key> = parts.par_iter().map(|bytes| key(bytes)).collect();
+        for (&segment, k) in batch.iter().zip(keys) {
+            base_index.entry(k).or_insert(segment);
+            base_keys.insert(segment, k);
+        }
     }
 
-    // Cover the target from its first byte to its last.
+    // Cover the target from its first byte to its last. Its parts are read
+    // in order a batch at a time; each batch's parts are hashed and its
+    // changed tiles tried as patches in parallel, then the batch is settled
+    // in order, so the operations are those one thread would choose.
     let mut operations = Vec::new();
     let mut target_keys: HashMap<Segment, Key> =
         HashMap::with_capacity(target_layout.segments.len());
     let mut cursor = Cursor::open(target)?;
     let mut base_cursor = Cursor::open(base)?;
     base_cursor.length = base_layout.file_length;
+    let base_file =
+        File::open(base).map_err(|e| format!("Failed to open {}: {e}", base.display()))?;
     let target_tile_of: HashMap<Segment, u64> = target_layout
         .tiles
         .iter()
@@ -654,65 +774,93 @@ pub fn diff(base: &Path, target: &Path, output: &Path) -> Result<DiffReport, Str
         .collect();
     let mut patcher = Patcher {
         base_tiles: &base_layout.tiles,
+        base_file: &base_file,
         base_compression: base_layout.tile_compression,
         target_compression: target_layout.tile_compression,
         level: None,
         hits: 0,
         misses: 0,
     };
+    // A batch starts small, so an archive whose tiles can't be patched is
+    // given up on after a few tiles' work, as one thread would, and grows to
+    // keep every thread busy.
+    let mut batch_parts = 64;
+    let mut parts: Vec<Part> = Vec::new();
+    let mut batch_bytes = 0u64;
     let mut covered = 0u64;
-    for &segment in &target_layout.segments {
+    let mut segments = target_layout.segments.iter().peekable();
+    while let Some(&segment) = segments.next() {
         let end = segment.offset + segment.length;
-        if end <= covered {
-            continue;
-        }
-        if segment.offset < covered {
-            // Overlaps the previous part: carry the rest as it is.
-            push(
-                &mut operations,
-                Operation::Literal {
+        if end > covered {
+            if segment.offset < covered {
+                // Overlaps the previous part: carry the rest as it is.
+                parts.push(Part::Ready(Operation::Literal {
                     offset: covered,
                     length: end - covered,
-                },
-            );
+                }));
+            } else {
+                if segment.offset > covered {
+                    let gap = gap(
+                        &mut base_cursor,
+                        &mut cursor,
+                        covered,
+                        segment.offset - covered,
+                    )?;
+                    parts.push(Part::Ready(gap));
+                }
+                let bytes = cursor
+                    .read(segment.offset, segment.length)
+                    .map_err(|e| format!("Failed to read {}: {e}", target.display()))?;
+                batch_bytes += segment.length;
+                parts.push(Part::Read { segment, bytes });
+            }
             covered = end;
+        }
+        if segments.peek().is_some() && parts.len() < batch_parts && batch_bytes < BATCH_BYTES {
             continue;
         }
-        if segment.offset > covered {
-            let gap = gap(
-                &mut base_cursor,
-                &mut cursor,
-                covered,
-                segment.offset - covered,
-            )?;
-            push(&mut operations, gap);
-        }
-        let bytes = cursor
-            .read(segment.offset, segment.length)
-            .map_err(|e| format!("Failed to read {}: {e}", target.display()))?;
-        let k = key(&bytes);
-        target_keys.insert(segment, k);
-        let operation = match base_index.get(&k) {
-            Some(found) if found.length == segment.length => Operation::Copy {
-                offset: found.offset,
-                length: found.length,
-            },
-            _ => {
-                let patch = match target_tile_of.get(&segment) {
-                    Some(&tile_id) => patcher.patch(&mut base_cursor, tile_id, &bytes)?,
-                    None => None,
+        let guess = patcher.level;
+        let given_up = patcher.given_up();
+        let tried: Vec<Option<(Key, Trial)>> = parts
+            .par_iter()
+            .map(|part| {
+                let Part::Read { segment, bytes } = part else {
+                    return None;
                 };
-                patch.map_or(
-                    Operation::Literal {
-                        offset: segment.offset,
-                        length: segment.length,
-                    },
-                    Operation::Patch,
-                )
-            }
-        };
-        push(&mut operations, operation);
-        covered = end;
+                let k = key(bytes);
+                let trial = match (base_index.get(&k), target_tile_of.get(segment)) {
+                    (Some(found), _) if found.length == segment.length => Trial::Skipped,
+                    (_, Some(&tile_id)) if !given_up => patcher.trial(guess, tile_id, bytes),
+                    _ => Trial::Skipped,
+                };
+                Some((k, trial))
+            })
+            .collect();
+        for (part, tried) in parts.drain(..).zip(tried) {
+            let operation = match (part, tried) {
+                (Part::Ready(operation), _) => operation,
+                (Part::Read { segment, bytes }, Some((k, trial))) => {
+                    target_keys.insert(segment, k);
+                    match base_index.get(&k) {
+                        Some(found) if found.length == segment.length => Operation::Copy {
+                            offset: found.offset,
+                            length: found.length,
+                        },
+                        _ => patcher.settle(trial, &bytes)?.map_or(
+                            Operation::Literal {
+                                offset: segment.offset,
+                                length: segment.length,
+                            },
+                            Operation::Patch,
+                        ),
+                    }
+                }
+                (Part::Read { .. }, None) => unreachable!("every part read is hashed"),
+            };
+            push(&mut operations, operation);
+        }
+        batch_bytes = 0;
+        batch_parts = (batch_parts * 2).min(1 << 16);
     }
     if covered < target_layout.file_length {
         let gap = gap(
@@ -854,7 +1002,143 @@ pub fn read_manifest(path: &Path) -> Result<DeltaManifest, String> {
     read_manifest_from(&mut BufReader::new(file)).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// One operation of a delta, read and checked, waiting to be run.
+enum Step {
+    Copy {
+        offset: u64,
+        length: u64,
+    },
+    Literal(Vec<u8>),
+    /// A literal too large to hold: copied straight from the delta, so it
+    /// is always the last step of its batch.
+    LongLiteral(u64),
+    Patch {
+        offset: u64,
+        base_length: u64,
+        base_compression: u8,
+        level: u8,
+        length: u64,
+        patch: Vec<u8>,
+    },
+}
+
+fn corrupt(what: &str) -> String {
+    format!("the delta is corrupt: {what}")
+}
+
+/// Reads and checks the delta's next operation, counting what it writes in
+/// `written`; `None` at the end operation.
+fn read_step(
+    manifest: &DeltaManifest,
+    delta: &mut impl Read,
+    written: &mut u64,
+) -> Result<Option<Step>, String> {
+    let mut tag = [0u8];
+    delta
+        .read_exact(&mut tag)
+        .map_err(|_| corrupt("it ends before its last operation"))?;
+    let (step, length) = match tag[0] {
+        TAG_END => return Ok(None),
+        TAG_COPY => {
+            let offset = read_varint(delta)?;
+            let length = read_varint(delta)?;
+            if offset
+                .checked_add(length)
+                .is_none_or(|end| end > manifest.base.bytes)
+            {
+                return Err(corrupt("it copies bytes beyond the old archive"));
+            }
+            if *written + length > manifest.target.bytes {
+                return Err(corrupt("it writes past the new archive's size"));
+            }
+            (Step::Copy { offset, length }, length)
+        }
+        TAG_LITERAL => {
+            let length = read_varint(delta)?;
+            if *written + length > manifest.target.bytes {
+                return Err(corrupt("it writes past the new archive's size"));
+            }
+            if length > BUFFER_BYTES as u64 {
+                (Step::LongLiteral(length), length)
+            } else {
+                let mut bytes = vec![0; length as usize];
+                delta
+                    .read_exact(&mut bytes)
+                    .map_err(|_| corrupt("it ends inside a literal"))?;
+                (Step::Literal(bytes), length)
+            }
+        }
+        TAG_PATCH => {
+            let offset = read_varint(delta)?;
+            let base_length = read_varint(delta)?;
+            let mut codes = [0u8; 2];
+            delta
+                .read_exact(&mut codes)
+                .map_err(|_| corrupt("it ends inside a patch"))?;
+            let [base_compression, level] = codes;
+            let length = read_varint(delta)?;
+            let patch_length = read_varint(delta)?;
+            if offset
+                .checked_add(base_length)
+                .is_none_or(|end| end > manifest.base.bytes)
+                || base_length > MAX_TILE_BYTES as u64
+            {
+                return Err(corrupt("it patches bytes beyond the old archive"));
+            }
+            if *written + length > manifest.target.bytes || patch_length > length {
+                return Err(corrupt("it writes past the new archive's size"));
+            }
+            if level != STORED && level > 9 {
+                return Err(corrupt("a patch names an unknown compression"));
+            }
+            let mut patch = vec![0; patch_length as usize];
+            delta
+                .read_exact(&mut patch)
+                .map_err(|_| corrupt("it ends inside a patch"))?;
+            let step = Step::Patch {
+                offset,
+                base_length,
+                base_compression,
+                level,
+                length,
+                patch,
+            };
+            (step, length)
+        }
+        other => return Err(corrupt(&format!("unknown operation {other}"))),
+    };
+    *written += length;
+    Ok(Some(step))
+}
+
+/// Rebuilds a patched tile's stored bytes from the base archive.
+fn rebuild_tile(base: &Path, base_file: &File, step: &Step) -> Result<Vec<u8>, String> {
+    let Step::Patch {
+        offset,
+        base_length,
+        base_compression,
+        level,
+        length,
+        ref patch,
+    } = *step
+    else {
+        unreachable!("only patches are rebuilt");
+    };
+    let old = read_at(base_file, offset, base_length)
+        .map_err(|e| format!("Failed to read {}: {e}", base.display()))?;
+    let old = decode_tile(&old, base_compression)
+        .ok_or_else(|| corrupt("a patch's old tile can't be decoded"))?;
+    let new = super::tile_patch::decode(&old, patch, MAX_TILE_BYTES).map_err(|e| corrupt(&e))?;
+    let stored = encode_tile(&new, level);
+    if stored.len() as u64 != length {
+        return Err(corrupt("a patched tile has the wrong size"));
+    }
+    Ok(stored)
+}
+
 /// Runs a delta's operations, after its manifest, writing the target to `out`.
+/// Operations are read a batch at a time; a batch's patched tiles are
+/// rebuilt in parallel and everything is written in order.
 fn run(
     base: &Path,
     manifest: &DeltaManifest,
@@ -862,88 +1146,66 @@ fn run(
     out: &mut impl Write,
 ) -> Result<(), String> {
     let mut cursor = Cursor::open(base)?;
-    let corrupt = |what: &str| format!("the delta is corrupt: {what}");
+    let base_file =
+        File::open(base).map_err(|e| format!("Failed to open {}: {e}", base.display()))?;
     let failed = |e: std::io::Error| format!("Failed to write the archive: {e}");
     let mut written = 0u64;
+    let mut steps = Vec::new();
     loop {
-        let mut tag = [0u8];
-        delta
-            .read_exact(&mut tag)
-            .map_err(|_| corrupt("it ends before its last operation"))?;
-        let length = match tag[0] {
-            TAG_END => break,
-            TAG_COPY => {
-                let offset = read_varint(delta)?;
-                let length = read_varint(delta)?;
-                if offset
-                    .checked_add(length)
-                    .is_none_or(|end| end > manifest.base.bytes)
-                {
-                    return Err(corrupt("it copies bytes beyond the old archive"));
+        // Read a batch, stopping early at the end, at a literal to copy
+        // straight from the delta, or at a corrupt operation, whose error
+        // comes after any error of the operations before it.
+        let (mut ended, mut stopped) = (false, None);
+        let batch_start = written;
+        while written - batch_start < BATCH_BYTES && steps.len() < 1 << 16 {
+            match read_step(manifest, delta, &mut written) {
+                Ok(None) => {
+                    ended = true;
+                    break;
                 }
-                if written + length > manifest.target.bytes {
-                    return Err(corrupt("it writes past the new archive's size"));
+                Ok(Some(step)) => {
+                    let long = matches!(step, Step::LongLiteral(_));
+                    steps.push(step);
+                    if long {
+                        break;
+                    }
                 }
-                cursor
+                Err(error) => {
+                    stopped = Some(error);
+                    break;
+                }
+            }
+        }
+        let mut tiles: Vec<Option<Result<Vec<u8>, String>>> = steps
+            .par_iter()
+            .map(|step| {
+                matches!(step, Step::Patch { .. }).then(|| rebuild_tile(base, &base_file, step))
+            })
+            .collect();
+        for (step, tile) in steps.drain(..).zip(tiles.drain(..)) {
+            match step {
+                Step::Copy { offset, length } => cursor
                     .copy_to(offset, length, out)
-                    .map_err(|e| format!("Failed to read {}: {e}", base.display()))?;
-                length
+                    .map_err(|e| format!("Failed to read {}: {e}", base.display()))?,
+                Step::Literal(bytes) => out.write_all(&bytes).map_err(failed)?,
+                Step::LongLiteral(length) => {
+                    let copied = std::io::copy(&mut delta.take(length), out).map_err(failed)?;
+                    if copied != length {
+                        return Err(corrupt("it ends inside a literal"));
+                    }
+                }
+                Step::Patch { .. } => {
+                    let stored = tile.expect("every patch is rebuilt")?;
+                    out.write_all(&stored).map_err(failed)?;
+                }
             }
-            TAG_LITERAL => {
-                let length = read_varint(delta)?;
-                if written + length > manifest.target.bytes {
-                    return Err(corrupt("it writes past the new archive's size"));
-                }
-                let copied = std::io::copy(&mut delta.take(length), out).map_err(failed)?;
-                if copied != length {
-                    return Err(corrupt("it ends inside a literal"));
-                }
-                length
-            }
-            TAG_PATCH => {
-                let offset = read_varint(delta)?;
-                let base_length = read_varint(delta)?;
-                let mut codes = [0u8; 2];
-                delta
-                    .read_exact(&mut codes)
-                    .map_err(|_| corrupt("it ends inside a patch"))?;
-                let [base_compression, level] = codes;
-                let length = read_varint(delta)?;
-                let patch_length = read_varint(delta)?;
-                if offset
-                    .checked_add(base_length)
-                    .is_none_or(|end| end > manifest.base.bytes)
-                    || base_length > MAX_TILE_BYTES as u64
-                {
-                    return Err(corrupt("it patches bytes beyond the old archive"));
-                }
-                if written + length > manifest.target.bytes || patch_length > length {
-                    return Err(corrupt("it writes past the new archive's size"));
-                }
-                if level != STORED && level > 9 {
-                    return Err(corrupt("a patch names an unknown compression"));
-                }
-                let mut patch = vec![0; patch_length as usize];
-                delta
-                    .read_exact(&mut patch)
-                    .map_err(|_| corrupt("it ends inside a patch"))?;
-                let old = cursor
-                    .read(offset, base_length)
-                    .map_err(|e| format!("Failed to read {}: {e}", base.display()))?;
-                let old = decode_tile(&old, base_compression)
-                    .ok_or_else(|| corrupt("a patch's old tile can't be decoded"))?;
-                let new = super::tile_patch::decode(&old, &patch, MAX_TILE_BYTES)
-                    .map_err(|e| corrupt(&e))?;
-                let stored = encode_tile(&new, level);
-                if stored.len() as u64 != length {
-                    return Err(corrupt("a patched tile has the wrong size"));
-                }
-                out.write_all(&stored).map_err(failed)?;
-                length
-            }
-            other => return Err(corrupt(&format!("unknown operation {other}"))),
-        };
-        written += length;
+        }
+        if let Some(error) = stopped {
+            return Err(error);
+        }
+        if ended {
+            break;
+        }
     }
     out.flush().map_err(failed)?;
     Ok(())
@@ -1142,5 +1404,97 @@ mod tests {
         std::fs::write(&delta, b"keep").unwrap();
         assert!(diff(&a, &a, &delta).unwrap_err().contains("already exists"));
         assert_eq!(std::fs::read(&delta).unwrap(), b"keep");
+    }
+
+    /// Tiles at several gzip levels, some too small to patch, over more
+    /// than one batch: the delta must not depend on how many threads made it.
+    #[test]
+    fn same_delta_on_any_number_of_threads() {
+        let raw = |id: u64, edit: bool| {
+            let words = if id.is_multiple_of(5) {
+                4
+            } else {
+                1_000 + id % 300
+            };
+            let mut raw: Vec<u8> = (0..words)
+                .flat_map(|i| ((i * 7919 + id * 31) % 65_521).to_le_bytes())
+                .collect();
+            if edit {
+                raw.extend_from_slice(format!("edit {id}").as_bytes());
+            }
+            raw
+        };
+        let base: Vec<(u64, Vec<u8>)> = (0..400)
+            .map(|id| (id, encode_tile(&raw(id, false), 6)))
+            .collect();
+        let target: Vec<(u64, Vec<u8>)> = (0..400)
+            .map(|id| {
+                let level = [1, 9, 6, 0, 3][(id / 7 % 5) as usize];
+                (id, encode_tile(&raw(id, id % 4 != 0), level))
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));
+        fn as_refs(tiles: &[(u64, Vec<u8>)]) -> Vec<(u64, &[u8])> {
+            tiles.iter().map(|(id, t)| (*id, &t[..])).collect()
+        }
+        archive(&a, &as_refs(&base), "{}");
+        archive(&b, &as_refs(&target), "{}");
+        let deltas: Vec<Vec<u8>> = [1, 4]
+            .into_iter()
+            .map(|threads| {
+                let delta = dir.path().join(format!("{threads}.delta"));
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| diff(&a, &b, &delta))
+                    .unwrap();
+                std::fs::read(&delta).unwrap()
+            })
+            .collect();
+        assert_eq!(deltas[0], deltas[1]);
+        let report = read_manifest(&dir.path().join("4.delta")).unwrap();
+        assert!(report.patched_tiles > 200, "{report:?}");
+        let rebuilt = dir.path().join("rebuilt.pmtiles");
+        apply(&a, &dir.path().join("4.delta"), &rebuilt).unwrap();
+        assert_eq!(std::fs::read(&rebuilt).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    /// A trial that guessed the wrong gzip level still settles on the level
+    /// trying the tiles one after another would pick.
+    #[test]
+    fn settles_the_level_a_wrong_guess_missed() {
+        let raw: Vec<u8> = (0..3_000u32)
+            .flat_map(|i| (i * 7919 % 65_521).to_le_bytes())
+            .collect();
+        let mut edited = raw.clone();
+        edited.extend_from_slice(b"an edit");
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pmtiles");
+        archive(&a, &[(0, &encode_tile(&raw, 6))], "{}");
+        let base_file = File::open(&a).unwrap();
+        let base_layout = layout(&a).unwrap();
+        for stored_level in [1, 6, 9] {
+            let stored = encode_tile(&edited, stored_level);
+            for (guess, before) in [(None, Some(9)), (Some(1), Some(8)), (Some(9), None)] {
+                let mut patcher = Patcher {
+                    base_tiles: &base_layout.tiles,
+                    base_file: &base_file,
+                    base_compression: 2,
+                    target_compression: 2,
+                    level: before,
+                    hits: 0,
+                    misses: 0,
+                };
+                let trial = patcher.trial(guess, 0, &stored);
+                let patch = patcher.settle(trial, &stored).unwrap().unwrap();
+                let expected = find_level(before, &mut [None; 10], |level| {
+                    encode_tile(&edited, level) == stored
+                });
+                assert_eq!(Some(patch.level), expected);
+                assert_eq!(patcher.level, expected);
+            }
+        }
     }
 }
