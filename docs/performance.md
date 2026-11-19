@@ -42,8 +42,9 @@ page cache. These are Linux numbers; Apple silicon follows below.
   anonymous is `RssAnon` sampled every 0.5 s, nearer what counts against an
   iPhone's memory limit (– where the run was too short to sample).
 - Scratch disk is the whole staging directory, sampled every 0.5 s: the
-  scratch and the archive as it is written. It peaks in `write_tiles`, at
-  5.4 times the extract.
+  scratch and the archive as it is written. In 0.1.2 it peaks in
+  `write_tiles`, at 5.4 times the extract; see Scratch disk below for what
+  changed since.
 - Stages with 2 threads: `index_osm` 2.0 s, `read_osm` 29.4 s, `write_tiles`
   24.1 s, `building_levels` 2.4 s, and 2.6 s before them (starting, the
   supplemental datasets). With 16: 1.9, 8.8, 9.3 and 1.5 s.
@@ -53,6 +54,38 @@ page cache. These are Linux numbers; Apple silicon follows below.
 - The supplemental datasets, once unpacked and cached, cost an inland
   region almost nothing in time or memory; they cost disk: 1.45 GB of
   downloads unpacked into another 2.23 GB.
+
+## Scratch disk
+
+Measured on 2026-11-19 on a cloud VM: 4 vCPUs (Intel Xeon, 2.1 GHz), 15 GiB
+of RAM, Linux, ext4. Command line (mimalloc), `--omit-sources all`,
+Małopolskie (Geofabrik, 2026-11-18, 194 MiB). Each figure is the median of
+three runs, interleaved so that every build saw the same machine. Peak RSS is
+`ru_maxrss`, peak anonymous is `RssAnon`, and scratch disk is the output's
+directory (scratch and partial archive), both sampled every 0.25 s.
+
+| Build | Threads | Time | Peak RSS | Peak anonymous | Peak scratch disk |
+|---|---|---|---|---|---|
+| 0.1.2 | 2 | 51.4 s | 750 MiB | 371 MiB | 1049 MiB (5.4×) |
+| Node store deleted after `read_osm` | 2 | 51.4 s | 759 MiB | 379 MiB | 898 MiB (4.6×) |
+| And zstd sort runs | 2 | 52.1 s | 751 MiB | 371 MiB | 590 MiB (3.0×) |
+| 0.1.2 | 4 | 28.4 s | 872 MiB | 491 MiB | 1047 MiB (5.4×) |
+| Node store deleted after `read_osm` | 4 | 28.4 s | 867 MiB | 487 MiB | 890 MiB (4.6×) |
+| And zstd sort runs | 4 | 28.6 s | 876 MiB | 496 MiB | 581 MiB (3.0×) |
+
+- Every run wrote the same archive, byte for byte (146 MiB).
+- What fills the scratch directory, at 4 threads: the node store, 370 MiB,
+  from `index_osm` to the end of `read_osm`; the sort runs, 534 MiB raw or
+  about 220 MiB compressed, from `read_osm` to the end of `write_tiles`; and
+  the archive, written in `write_tiles`. 0.1.2 kept the node store to the
+  end, so all three met in `write_tiles`.
+- The peak is now at the end of `read_osm`: the node store and the
+  compressed runs. Smaller still needs a smaller node store, which lives in
+  `osm-pbf-ingest`.
+- The runs compress 2.4 times at zstd level 1; level 3 gets 2.5 and 1 MiB
+  blocks no more than 64 KiB ones, so the fastest level and small blocks
+  (64 KiB of memory for each run a merge has open) stay.
+- 16 threads were not measured here.
 
 ## On Apple silicon
 
