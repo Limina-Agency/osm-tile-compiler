@@ -3,7 +3,7 @@
 Where the native OpenMapTiles profile stands against Planetiler 0.10.2 (the
 pinned reference, profile revision `91516fdf`), measured on whole archives.
 The bar below was met on 0.1.3 (2026-11-19, "Verified on 0.1.3"), and
-`OpenMapTilesResult::parity_verified` is `true` for the compiles that
+`CompileResult::parity_verified` is `true` for the compiles that
 measurement covers: Planetiler's default languages, every supplemental dataset,
 a full read of the extract and zoom 14 at the top.
 

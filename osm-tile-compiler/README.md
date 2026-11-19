@@ -48,8 +48,10 @@ The sources directory holds the supplemental datasets:
 `SourcesPolicy` decides whether the compile downloads them, and
 `request.omit_sources` compiles without some or all of them
 (`SupplementalDataset::without_warning` says what the map then lacks).
-`omt::compile_openmaptiles` is the compile alone, from local inputs, on the
-calling thread, without stages or cancelling.
+`compile_basemap` is the crate's one compile entry point. `request.area`
+limits it to bounds or a polygon, and with `ReadScope::NearArea` reads only
+the OSM data near them; `request.zoom` (a `ZoomRange`) and `request.layers`
+(a `LayerSelection` of `LayerName`s) pick the zooms and layers.
 
 ## Building levels
 
@@ -58,8 +60,7 @@ PMTiles archive from a compiled basemap, with its buildings as instanced boxes
 at z14, z12 and z11, for renderers that draw distant buildings as boxes. They
 are opt-in: `compile_basemap` with `request.building_levels = true`, and the
 binary's `compile --building-levels`, write `<NAME>-buildings.pmtiles` beside
-`<NAME>.pmtiles` as the compile's last stage; `compile_openmaptiles` never
-does. Tiles are a count and then columns, 18 bytes a box, and the output is
+`<NAME>.pmtiles` as the compile's last stage. Tiles are a count and then columns, 18 bytes a box, and the output is
 the same for any number of threads.
 
 ```text

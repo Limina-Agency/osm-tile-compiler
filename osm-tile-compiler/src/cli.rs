@@ -5,16 +5,12 @@
 //! a command stopped by Ctrl-C with 130 (see `interrupt`).
 use crate::interrupt;
 use osm_tile_compiler::{
-    ArchiveCenter, BasemapRequest, BuildingLevelsReport, CompileBounds, CompileError, CompileStage,
-    ExtractEvent, FetchEvent, FetchMode, SourcesPolicy, SupplementalDataset,
-    archive::{
-        ArchiveOptions, ArchiveReport,
-        delta::{self, DeltaManifest},
-    },
+    ArchiveCenter, Area, BasemapRequest, BuildingLevelsReport, CompileBounds, CompileError,
+    CompileStage, ExtractEvent, FetchEvent, FetchMode, LayerSelection, OMT_LANGUAGES as LANGUAGES,
+    OMT_LAYERS as LAYERS, ReadScope, SourcesPolicy, SupplementalDataset, ZoomRange,
+    archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
-    omt::{LANGUAGES, LAYERS, resolve_languages, select_layers},
-    tile_stats::kib,
-    write_building_levels_cancellable,
+    kib, resolve_languages, write_building_levels_cancellable,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -30,7 +26,7 @@ const SCRATCH_MARKER: &str = ".osm-tile-compiler-scratch";
 const STYLE: &str = include_str!("../style/osm-bright.json");
 const STYLE_ARCHIVE: &str = "pmtiles://basemap.pmtiles";
 /// Names the Geofabrik index `--area` reads instead of
-/// [`osm_tile_compiler::extracts::GEOFABRIK_INDEX_URL`]: a mirror, or the
+/// [`osm_tile_compiler::GEOFABRIK_INDEX_URL`]: a mirror, or the
 /// local server the tests run.
 const GEOFABRIK_INDEX_VAR: &str = "OSM_TILE_COMPILER_GEOFABRIK_INDEX";
 const STYLE_GLYPHS: &str = "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf";
@@ -177,14 +173,13 @@ struct CompileArgs {
     area_only: bool,
     center: Option<ArchiveCenter>,
     archive: ArchiveOptions,
-    min_zoom: u8,
-    max_zoom: u8,
+    zoom: ZoomRange,
     threads: Option<usize>,
     temp_dir: Option<PathBuf>,
     fetch: bool,
     building_levels: bool,
     json: bool,
-    layers: Option<Vec<String>>,
+    layers: LayerSelection,
     languages: Option<Vec<String>>,
 }
 
@@ -447,11 +442,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                         "--center zoom must be a whole number 0-14, got {zoom}"
                     ));
                 }
-                center = Some(ArchiveCenter {
-                    longitude,
-                    latitude,
-                    zoom: zoom as u8,
-                });
+                center = Some(ArchiveCenter::new(longitude, latitude, zoom as u8));
             }
             "--min-zoom" => min_zoom = number(value(&mut args, &flag)?, &flag)?,
             "--max-zoom" => max_zoom = number(value(&mut args, &flag)?, &flag)?,
@@ -489,29 +480,32 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
             "--exclude-layers" => excluded_layers = Some(list(value(&mut args, &flag)?)),
             "--languages" => {
                 let list = list(value(&mut args, &flag)?);
-                resolve_languages(&list).map_err(|e| format!("--languages: {e}"))?;
+                resolve_languages(&list).map_err(|e| format!("--languages: {}", e.message()))?;
                 languages = Some(list);
             }
             _ => return Err(format!("unknown compile option '{flag}'")),
         }
     }
-    if max_zoom > 14 || min_zoom > max_zoom {
-        return Err(format!(
-            "zooms must satisfy 0 <= --min-zoom <= --max-zoom <= 14, got {min_zoom} and {max_zoom}"
-        ));
+    let zoom = ZoomRange::new(min_zoom, max_zoom).map_err(|_| {
+        format!(
+            "zooms must satisfy 0 <= --min-zoom <= --max-zoom <= {}, got {min_zoom} and {max_zoom}",
+            ZoomRange::MAX_ZOOM
+        )
+    })?;
+    let (layers, flag) = match (only_layers, excluded_layers) {
+        (Some(_), Some(_)) => {
+            return Err("--layers and --exclude-layers cannot be combined".into());
+        }
+        (Some(only), None) => (LayerSelection::only(only), "--layers"),
+        (None, Some(except)) => (LayerSelection::except(except), "--exclude-layers"),
+        (None, None) => (LayerSelection::All, ""),
+    };
+    layers
+        .resolve()
+        .map_err(|e| format!("{flag}: {}", e.message()))?;
+    if area_only && bounds.is_none() && polygon.is_none() {
+        return Err("--area-only needs --bounds or --polygon".into());
     }
-    if only_layers.is_some() && excluded_layers.is_some() {
-        return Err("--layers and --exclude-layers cannot be combined".into());
-    }
-    let layers =
-        select_layers(only_layers.as_deref(), excluded_layers.as_deref()).map_err(|e| {
-            let flag = if only_layers.is_some() {
-                "--layers"
-            } else {
-                "--exclude-layers"
-            };
-            format!("{flag}: {e}")
-        })?;
     if input.is_some() && area.is_some() {
         return Err("compile takes an input PBF or --area, not both".into());
     }
@@ -553,8 +547,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         area_only,
         center,
         archive,
-        min_zoom,
-        max_zoom,
+        zoom,
         threads,
         temp_dir,
         fetch,
@@ -802,6 +795,7 @@ fn fetch(directory: &Path, status: &mut Status) -> Result<(), String> {
                 },
                 megabytes(bytes)
             )),
+            _ => {}
         },
         interrupt::requested,
     )
@@ -991,7 +985,7 @@ fn area_extract(name: &str, directory: &Path, status: &mut Status) -> Result<Pat
     fetch_extract_from(
         index_url
             .as_deref()
-            .unwrap_or(osm_tile_compiler::extracts::GEOFABRIK_INDEX_URL),
+            .unwrap_or(osm_tile_compiler::GEOFABRIK_INDEX_URL),
         directory,
         name,
         |event| match event {
@@ -1035,6 +1029,7 @@ fn area_extract(name: &str, directory: &Path, status: &mut Status) -> Result<Pat
                 },
                 megabytes(bytes)
             )),
+            _ => {}
         },
         interrupt::requested,
     )
@@ -1121,8 +1116,8 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         bounds.south,
         bounds.east,
         bounds.north,
-        args.min_zoom,
-        args.max_zoom,
+        args.zoom.min(),
+        args.zoom.max(),
     ));
     let mut request =
         BasemapRequest::new(input, args.output.clone(), args.sources, temp_dir.clone());
@@ -1132,13 +1127,14 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         SourcesPolicy::UsePresent
     };
     request.omit_sources = args.omit_sources;
-    request.bounds = Some(bounds);
-    request.polygon = args.polygon;
-    request.area_only = args.area_only;
+    request.area = Area::bounds(bounds);
+    request.area.polygon = args.polygon.map(Into::into);
+    if args.area_only {
+        request.area.read = ReadScope::NearArea;
+    }
     request.center = args.center;
     request.archive = args.archive;
-    request.min_zoom = args.min_zoom;
-    request.max_zoom = args.max_zoom;
+    request.zoom = args.zoom;
     request.threads = threads;
     request.layers = args.layers;
     request.languages = args.languages;
@@ -1277,8 +1273,8 @@ fn delta_summary(manifest: &DeltaManifest, delta_bytes: u64) -> String {
 }
 
 fn diff(args: DeltaArgs) -> Result<(), String> {
-    let _partial = interrupt::remove_on_exit(delta::partial_path(&args.output));
-    let report = delta::diff(&args.base, &args.other, &args.output)?;
+    let _partial = interrupt::remove_on_exit(archive::partial_path(&args.output));
+    let report = archive::diff(&args.base, &args.other, &args.output)?;
     if args.json {
         println!(
             "{}",
@@ -1295,8 +1291,8 @@ fn diff(args: DeltaArgs) -> Result<(), String> {
 }
 
 fn apply(args: DeltaArgs) -> Result<(), String> {
-    let _partial = interrupt::remove_on_exit(delta::partial_path(&args.output));
-    let report = delta::apply(&args.base, &args.other, &args.output)?;
+    let _partial = interrupt::remove_on_exit(archive::partial_path(&args.output));
+    let report = archive::apply(&args.base, &args.other, &args.output)?;
     if args.json {
         println!(
             "{}",

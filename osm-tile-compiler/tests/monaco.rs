@@ -4,8 +4,8 @@
 //! `fixtures/monaco-features.json`.
 
 use osm_tile_compiler::{
-    CompileArea, CompileBounds,
-    omt::{LANGUAGES, LAYERS, OpenMapTilesRequest, OpenMapTilesResult, compile_openmaptiles},
+    Area, BasemapRequest, CompileArea, CompileBounds, CompileResult, LayerSelection,
+    OMT_LANGUAGES as LANGUAGES, OMT_LAYERS as LAYERS, compile_basemap,
 };
 mod common;
 #[path = "common/mvt.rs"]
@@ -35,8 +35,8 @@ fn compile(
     out: &Path,
     threads: usize,
     area: Option<CompileArea>,
-) -> (OpenMapTilesResult, PathBuf) {
-    compile_selected(sources, out, threads, area, None, None)
+) -> (CompileResult, PathBuf) {
+    compile_selected(sources, out, threads, area, LayerSelection::All, None)
 }
 
 fn compile_selected(
@@ -44,28 +44,17 @@ fn compile_selected(
     out: &Path,
     threads: usize,
     area: Option<CompileArea>,
-    layers: Option<Vec<String>>,
+    layers: LayerSelection,
     languages: Option<Vec<String>>,
-) -> (OpenMapTilesResult, PathBuf) {
+) -> (CompileResult, PathBuf) {
     let output = out.join("basemap.pmtiles");
-    let result = compile_openmaptiles(&OpenMapTilesRequest {
-        input_pbf: monaco_pbf(),
-        sources: sources.to_path_buf(),
-        output: output.clone(),
-        temp_dir: out.join("temp"),
-        bounds: pbf_bounds(&monaco_pbf()),
-        area,
-        center: None,
-        archive: Default::default(),
-        min_zoom: 0,
-        max_zoom: 14,
-        threads,
-        layers,
-        languages,
-        omit_sources: Vec::new(),
-        area_only: false,
-    })
-    .unwrap();
+    let mut request = BasemapRequest::new(monaco_pbf(), &output, sources, out.join("temp"));
+    request.area = Area::bounds(pbf_bounds(&monaco_pbf()));
+    request.area.polygon = area.map(Into::into);
+    request.threads = threads;
+    request.layers = layers;
+    request.languages = languages;
+    let result = compile_basemap(&request, |_| {}, || false).unwrap().result;
     (result, output)
 }
 
@@ -179,7 +168,7 @@ fn assert_matches_record(actual: &Value) {
 
 /// The compile result's tile statistics agree with the tiles in the archive.
 fn assert_tile_stats_match(
-    result: &OpenMapTilesResult,
+    result: &CompileResult,
     tiles_per_zoom: &[u64],
     sizes: &[(u64, String, u64, u64)],
 ) {
@@ -527,13 +516,12 @@ async fn selected_layers_match_the_full_build() {
             None,
             Some(excluded.to_vec()),
         )]);
-    let strings = |names: Vec<&str>| names.into_iter().map(String::from).collect::<Vec<_>>();
     for (index, (selected, only, without)) in cases.enumerate() {
-        let layers = osm_tile_compiler::omt::select_layers(
-            only.map(strings).as_deref(),
-            without.map(strings).as_deref(),
-        )
-        .unwrap();
+        let layers = match (only, without) {
+            (Some(only), None) => LayerSelection::only(only),
+            (None, Some(without)) => LayerSelection::except(without),
+            _ => LayerSelection::All,
+        };
         let (result, archive) = compile_selected(
             &sources,
             &temp.path().join(format!("subset-{index}")),
@@ -602,7 +590,7 @@ async fn languages_limit_the_translated_names() {
         &temp.path().join("languages"),
         3,
         None,
-        None,
+        LayerSelection::All,
         Some(kept.iter().map(|code| format!("name:{code}")).collect()),
     );
     // Other languages than Planetiler's default are outside the measurement.

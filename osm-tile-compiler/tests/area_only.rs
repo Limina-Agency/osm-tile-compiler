@@ -4,8 +4,8 @@
 //! without a node in it and polygons that surround it.
 
 use osm_tile_compiler::{
-    CompileArea, CompileBounds, SupplementalDataset, archive,
-    omt::{OpenMapTilesRequest, OpenMapTilesResult, compile_openmaptiles},
+    Area, BasemapRequest, CompileArea, CompileBounds, CompileResult, ReadScope,
+    SupplementalDataset, archive, compile_basemap,
 };
 #[allow(dead_code)]
 #[path = "common/mvt.rs"]
@@ -82,31 +82,21 @@ fn write_extract(path: &Path) {
     );
 }
 
-fn compile(dir: &Path, pbf: &Path, area_only: bool) -> (OpenMapTilesResult, PathBuf) {
+fn compile(dir: &Path, pbf: &Path, area_only: bool) -> (CompileResult, PathBuf) {
     let [west, south, east, north] = AREA;
     let area = CompileArea::from_geojson(&format!(
         r#"{{"type":"Polygon","coordinates":[[[{west},{south}],[{east},{south}],[{east},{north}],[{west},{north}],[{west},{south}]]]}}"#
     ))
     .unwrap();
     let output = dir.join("area.pmtiles");
-    let result = compile_openmaptiles(&OpenMapTilesRequest {
-        input_pbf: pbf.to_path_buf(),
-        sources: PathBuf::new(),
-        output: output.clone(),
-        temp_dir: dir.join("temp"),
-        bounds: CompileBounds::new(50.1, 49.9, 20.6, 19.8),
-        area: Some(area),
-        center: None,
-        archive: Default::default(),
-        min_zoom: 0,
-        max_zoom: 14,
-        threads: 2,
-        layers: None,
-        languages: None,
-        omit_sources: SupplementalDataset::ALL.to_vec(),
-        area_only,
-    })
-    .unwrap();
+    let mut request = BasemapRequest::new(pbf, &output, PathBuf::new(), dir.join("temp"));
+    request.area = Area::polygon(area).within(CompileBounds::new(50.1, 49.9, 20.6, 19.8));
+    if area_only {
+        request.area.read = ReadScope::NearArea;
+    }
+    request.threads = 2;
+    request.omit_sources = SupplementalDataset::ALL.to_vec();
+    let result = compile_basemap(&request, |_| {}, || false).unwrap().result;
     (result, output)
 }
 

@@ -75,6 +75,20 @@ impl CompileError {
         }
     }
 
+    /// A failure outside a compile's stages, such as reading or writing an
+    /// archive: [`OutOfSpace`](Self::OutOfSpace) for a full disk, else
+    /// [`Failed`](Self::Failed) with no stage.
+    pub(crate) fn other(message: String) -> Self {
+        if is_out_of_space(&message) {
+            Self::OutOfSpace(message)
+        } else {
+            Self::Failed {
+                stage: None,
+                message,
+            }
+        }
+    }
+
     /// Sorts a failure by where it happened: before any stage, it is the
     /// request's; in `FetchSources`, the download's. A full disk is
     /// recognised by its OS error code wherever it happens.
@@ -108,13 +122,7 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
-/// A failure found before the compile started is the request's.
-impl From<String> for CompileError {
-    fn from(message: String) -> Self {
-        Self::classify(message, None)
-    }
-}
-
+/// The message, for callers that report errors as text.
 impl From<CompileError> for String {
     fn from(error: CompileError) -> Self {
         error.to_string()
@@ -124,6 +132,7 @@ impl From<CompileError> for String {
 /// The stages of [`crate::compile_basemap`], in the order they run. Their
 /// [`id`](Self::id)s are stable, for apps that store or match them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum CompileStage {
     /// Checking the supplemental datasets against their recorded hashes and
     /// downloading any that are missing or changed. Its fraction is bytes
@@ -197,6 +206,7 @@ impl CompileStage {
 
 /// One progress report.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CompileProgress {
     pub stage: CompileStage,
     /// What is happening, in words fit to show: "Reading OSM and preparing

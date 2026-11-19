@@ -3,15 +3,17 @@
 
 use crate::building_levels::{BuildingLevelsReport, building_levels_path, has_building_layer};
 use crate::control::{self, CompileError, CompileProgress, CompileStage, Control, RemoveOnDrop};
-use crate::omt::{self, OpenMapTilesRequest, OpenMapTilesResult};
+use crate::omt::{self, CompileResult, OpenMapTilesRequest};
+use crate::request::{Area, LayerSelection, ReadScope, ZoomRange};
 use crate::sources::{self, CachedInput, FetchEvent, FetchMode, SupplementalDataset};
-use crate::{ArchiveCenter, CompileArea, CompileBounds, archive::ArchiveOptions};
+use crate::{ArchiveCenter, CompileBounds, archive::ArchiveOptions};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What to do about the supplemental datasets the compile reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SourcesPolicy {
     /// Use what `sources` holds, unchecked; fail if a dataset not omitted is
     /// missing.
@@ -25,7 +27,12 @@ pub enum SourcesPolicy {
 }
 
 /// A compile of one PBF extract into a basemap.
+///
+/// Make one with [`BasemapRequest::new`] and set the fields that differ from
+/// its defaults; more fields may be added in later versions, each with a
+/// default that keeps today's behaviour.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BasemapRequest {
     /// The `.osm.pbf` extract, read in place.
     pub input_pbf: PathBuf,
@@ -43,32 +50,28 @@ pub struct BasemapRequest {
     /// Scratch space. The compile works in a directory of its own inside it
     /// and removes that directory when it ends, however it ends.
     pub temp_dir: PathBuf,
-    /// The box to compile [default: the PBF header's]; one whose west is
-    /// greater than its east crosses the antimeridian.
-    pub bounds: Option<CompileBounds>,
-    /// A GeoJSON or Osmosis `.poly` file limiting the compile to the tiles
-    /// its polygon covers.
-    pub polygon: Option<PathBuf>,
-    /// Read only the OSM data in and near the area (`bounds` and `polygon`)
-    /// [default: no]: a small area then compiles from a country extract in
-    /// seconds. See [`crate::omt::OpenMapTilesRequest::area_only`].
-    pub area_only: bool,
+    /// The part of the extract to compile, and how much of the extract to
+    /// read for it [default: the whole extract, read in full].
+    pub area: Area,
     /// Where viewers start [default: the middle of the area].
     pub center: Option<ArchiveCenter>,
     pub archive: ArchiveOptions,
-    pub min_zoom: u8,
-    pub max_zoom: u8,
+    /// The zooms to write [default: 0 to 14].
+    pub zoom: ZoomRange,
     /// The compile's threads. Its work runs on a rayon pool of this many
     /// threads; the PBF reader and the tile renderers start this many of
     /// their own as well, so up to about twice as many are busy at a time
     /// while the PBF is read.
     pub threads: usize,
-    /// The layers to write [default: all]; not together with
-    /// `exclude_layers`. See [`crate::omt::select_layers`].
-    pub layers: Option<Vec<String>>,
-    pub exclude_layers: Option<Vec<String>>,
-    /// The `name:<lang>` languages to write, as
-    /// [`crate::omt::resolve_languages`] takes them [default: all].
+    /// The layers to write [default: all].
+    pub layers: LayerSelection,
+    /// The `name:<lang>` languages to write, as [`resolve_languages`] takes
+    /// them [default: all of [`OMT_LANGUAGES`]]. `name`, `name_en`,
+    /// `name_de`, `name_int`, `name:latin` and `name:nonlatin` are written
+    /// regardless.
+    ///
+    /// [`resolve_languages`]: crate::resolve_languages
+    /// [`OMT_LANGUAGES`]: crate::OMT_LANGUAGES
     pub languages: Option<Vec<String>>,
     /// Whether to write the building levels beside the archive (when it
     /// has buildings at zoom 14) [default: no]. They serve renderers that
@@ -94,16 +97,12 @@ impl BasemapRequest {
             sources_policy: SourcesPolicy::UsePresent,
             omit_sources: Vec::new(),
             temp_dir: temp_dir.into(),
-            bounds: None,
-            polygon: None,
-            area_only: false,
+            area: Area::default(),
             center: None,
             archive: ArchiveOptions::default(),
-            min_zoom: 0,
-            max_zoom: 14,
+            zoom: ZoomRange::default(),
             threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
-            layers: None,
-            exclude_layers: None,
+            layers: LayerSelection::All,
             languages: None,
             building_levels: false,
         }
@@ -116,12 +115,63 @@ impl BasemapRequest {
             .filter(|dataset| !self.omit_sources.contains(dataset))
             .collect()
     }
+
+    /// Checks everything about the request that needs no reading or
+    /// network: the layers, languages, threads, gzip level, bounds, center
+    /// and area, and that no output would be replaced.
+    /// [`compile_basemap`] starts with the same checks, so this is for
+    /// callers that want to refuse a request before starting it.
+    pub fn validate(&self) -> Result<(), CompileError> {
+        self.check().map(|_| ())
+    }
+
+    /// [`validate`](Self::validate), returning the layers as the profile
+    /// takes them.
+    fn check(&self) -> Result<Option<Vec<String>>, CompileError> {
+        let invalid = CompileError::InvalidRequest;
+        let layers = self.layers.names().map_err(invalid)?;
+        if let Some(languages) = &self.languages {
+            omt::resolve_languages(languages).map_err(invalid)?;
+        }
+        if self.threads == 0 {
+            return Err(invalid("threads must be positive".into()));
+        }
+        if self.archive.gzip_level > 9 {
+            return Err(invalid(format!(
+                "the gzip level must be 0 to 9, got {}",
+                self.archive.gzip_level
+            )));
+        }
+        if let Some(bounds) = self.area.bounds {
+            omt::check_bounds(bounds).map_err(invalid)?;
+        }
+        if let Some(center) = self.center {
+            omt::check_center(center, self.zoom).map_err(invalid)?;
+        }
+        if self.area.read == ReadScope::NearArea && !self.area.is_limited() {
+            return Err(invalid(
+                "reading only near the area needs bounds or a polygon".into(),
+            ));
+        }
+        let levels = building_levels_path(&self.output);
+        let archives = [Some(&self.output), self.building_levels.then_some(&levels)];
+        for archive in archives.into_iter().flatten() {
+            if archive.exists() {
+                return Err(invalid(format!(
+                    "refusing to replace existing archive {}",
+                    archive.display()
+                )));
+            }
+        }
+        Ok(layers)
+    }
 }
 
 /// What a compile wrote.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct BasemapOutput {
-    pub result: OpenMapTilesResult,
+    pub result: CompileResult,
     /// The archive: the request's `output`.
     pub archive: PathBuf,
     /// The building levels and what they hold, if written.
@@ -162,7 +212,11 @@ impl BasemapOutput {
 
 /// Reads the PBF header's bounding box, normalized (a box crossing the
 /// antimeridian has west above east).
-pub fn pbf_bounds(input: &Path) -> Result<CompileBounds, String> {
+pub fn pbf_bounds(input: &Path) -> Result<CompileBounds, CompileError> {
+    read_pbf_bounds(input).map_err(CompileError::InvalidRequest)
+}
+
+fn read_pbf_bounds(input: &Path) -> Result<CompileBounds, String> {
     let index = osm_pbf_ingest::blob_index::PbfBlobIndex::scan(input)
         .map_err(|e| format!("Failed to inspect {}: {e}", input.display()))?;
     let b = index.header().bounds.ok_or_else(|| {
@@ -206,23 +260,7 @@ pub fn compile_basemap(
     should_cancel: impl Fn() -> bool,
 ) -> Result<BasemapOutput, CompileError> {
     // Everything that needs no reading or network is checked first.
-    let layers = omt::select_layers(request.layers.as_deref(), request.exclude_layers.as_deref())?;
-    if let Some(languages) = &request.languages {
-        omt::resolve_languages(languages)?;
-    }
-    let levels = building_levels_path(&request.output);
-    let archives = [
-        Some(&request.output),
-        request.building_levels.then_some(&levels),
-    ];
-    for archive in archives.into_iter().flatten() {
-        if archive.exists() {
-            return Err(CompileError::InvalidRequest(format!(
-                "refusing to replace existing archive {}",
-                archive.display()
-            )));
-        }
-    }
+    let layers = request.check()?;
     control::run(
         request.threads,
         request.building_levels,
@@ -237,14 +275,15 @@ fn compile(
     layers: Option<Vec<String>>,
     control: &Control,
 ) -> Result<BasemapOutput, String> {
-    let bounds = match request.bounds {
+    let bounds = match request.area.bounds {
         Some(bounds) => bounds,
-        None => pbf_bounds(&request.input_pbf)?,
+        None => read_pbf_bounds(&request.input_pbf)?,
     };
     let area = request
+        .area
         .polygon
-        .as_deref()
-        .map(CompileArea::read)
+        .as_ref()
+        .map(|polygon| polygon.load().map_err(|e| e.to_string()))
         .transpose()?;
     let mut compile_request = OpenMapTilesRequest {
         input_pbf: request.input_pbf.clone(),
@@ -255,13 +294,13 @@ fn compile(
         area,
         center: request.center,
         archive: request.archive.clone(),
-        min_zoom: request.min_zoom,
-        max_zoom: request.max_zoom,
+        min_zoom: request.zoom.min(),
+        max_zoom: request.zoom.max(),
         threads: request.threads,
         layers,
         languages: request.languages.clone(),
         omit_sources: request.omit_sources.clone(),
-        area_only: request.area_only,
+        area_only: request.area.read == ReadScope::NearArea,
     };
     omt::validate(&compile_request)?;
     let used = request.used_sources();

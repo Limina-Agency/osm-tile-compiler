@@ -271,7 +271,7 @@ of OpenStreetMap edits gave a 63 kB delta: 245 of its 11,305 tiles changed and
 
 The delta format is experimental: a delta applies only with a build that reads
 its version (`docs/formats.md`). From Rust, the same is
-`archive::delta::{diff, apply, read_manifest}`.
+`archive::{diff, apply, read_delta_manifest}`.
 
 ## Using it as a library
 
@@ -284,9 +284,24 @@ both produce the same bytes.
 let mut request = BasemapRequest::new(pbf, output, sources_dir, temp_dir);
 request.threads = 2;
 request.sources_policy = SourcesPolicy::FetchMissing; // or UsePresent, FetchAndVerify
+request.zoom = ZoomRange::new(0, 12)?;
+request.layers = LayerSelection::except(["housenumber"]);
+// A city from a country extract, reading only the data near it.
+request.area = Area::bounds(CompileBounds::new(50.13, 49.97, 20.22, 19.79))
+    .reading(ReadScope::NearArea);
 let output: Result<BasemapOutput, CompileError> =
     compile_basemap(&request, |progress: &CompileProgress| { /* ... */ }, || cancelled());
 ```
+
+- **One entry point.** `compile_basemap` is the only way to compile.
+  `BasemapRequest` and the other public structs and enums are
+  `#[non_exhaustive]`: build a request with `BasemapRequest::new` and set
+  fields, and match enums with a wildcard arm, so later fields and kinds are
+  not breaking. `BasemapRequest::validate` runs the checks that need no
+  reading or network, as `compile_basemap` does first.
+- **Errors.** Every fallible function returns `CompileError`, whose `kind()`
+  is stable: `cancelled`, `invalid_request`, `download`, `out_of_space` or
+  `failed`.
 
 - **Progress.** The callbacks run on the calling thread, while the work runs
   on a rayon pool of `request.threads` threads built for the compile. Each

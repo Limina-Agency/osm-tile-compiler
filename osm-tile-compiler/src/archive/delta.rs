@@ -58,6 +58,7 @@ const BUFFER_BYTES: usize = 1 << 20;
 
 /// An archive a delta names: its size and SHA-256, in lowercase hex.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ArchiveDigest {
     pub bytes: u64,
     pub sha256: String,
@@ -66,6 +67,7 @@ pub struct ArchiveDigest {
 /// How the tiles changed between the two archives, counted by tile ID: a
 /// tile is changed when both archives address it with different bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TileChanges {
     pub unchanged: u64,
     pub changed: u64,
@@ -75,6 +77,7 @@ pub struct TileChanges {
 
 /// What a delta describes, stored at its start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DeltaManifest {
     /// Always `DELTA_FORMAT`.
     pub format: String,
@@ -99,6 +102,7 @@ pub struct DeltaManifest {
 
 /// What `diff` wrote.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct DiffReport {
     pub delta_bytes: u64,
     #[serde(flatten)]
@@ -107,6 +111,7 @@ pub struct DiffReport {
 
 /// What `apply` wrote.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ApplyReport {
     pub delta_bytes: u64,
     #[serde(flatten)]
@@ -721,7 +726,7 @@ enum Part {
 /// Writes the delta that turns the archive `base` into `target` to `output`,
 /// which must not exist yet. Before keeping it, rebuilds `target` from it
 /// and checks the result.
-pub fn diff(base: &Path, target: &Path, output: &Path) -> Result<DiffReport, String> {
+pub(super) fn diff(base: &Path, target: &Path, output: &Path) -> Result<DiffReport, String> {
     let ((base_digest, target_digest), (base_layout, target_layout)) = rayon::join(
         || rayon::join(|| digest(base), || digest(target)),
         || rayon::join(|| layout(base), || layout(target)),
@@ -997,7 +1002,7 @@ fn read_manifest_from(input: &mut impl Read) -> Result<DeltaManifest, String> {
 }
 
 /// Reads the manifest at the start of the delta at `path`.
-pub fn read_manifest(path: &Path) -> Result<DeltaManifest, String> {
+pub(super) fn read_manifest(path: &Path) -> Result<DeltaManifest, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
     read_manifest_from(&mut BufReader::new(file)).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -1214,7 +1219,7 @@ fn run(
 /// Applies the delta at `delta` to the archive `base`, writing the new
 /// archive to `output`, which must not exist yet. Checks `base` before and
 /// the result after; on any failure nothing is left at `output`.
-pub fn apply(base: &Path, delta: &Path, output: &Path) -> Result<ApplyReport, String> {
+pub(super) fn apply(base: &Path, delta: &Path, output: &Path) -> Result<ApplyReport, String> {
     let delta_file =
         File::open(delta).map_err(|e| format!("Failed to open {}: {e}", delta.display()))?;
     let delta_bytes = delta_file.metadata().map_err(|e| e.to_string())?.len();

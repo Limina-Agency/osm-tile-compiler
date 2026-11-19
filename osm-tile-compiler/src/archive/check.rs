@@ -16,6 +16,7 @@ const ROOT_LIMIT: u64 = 16_384;
 
 /// What `inspect` found.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ArchiveReport {
     pub file_bytes: u64,
     pub tile_type: String,
@@ -61,7 +62,7 @@ fn tile_name(tile_id: u64) -> String {
 /// Reads every part of the archive at `path`. Fails only when the file is
 /// not a readable PMTiles v3 archive; anything else wrong is listed in the
 /// report's problems.
-pub fn inspect(path: &Path) -> Result<ArchiveReport, String> {
+pub(super) fn inspect(path: &Path) -> Result<ArchiveReport, String> {
     let mut reader = ArchiveReader::open(path)?;
     let header = reader.header.clone();
     let mut report = ArchiveReport {

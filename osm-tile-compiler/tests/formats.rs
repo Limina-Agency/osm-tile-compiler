@@ -1,8 +1,8 @@
 //! Pins the versions of the formats the compiler writes. Changing one is a
 //! deliberate act: follow `docs/formats.md`, then update this test.
 
-use osm_tile_compiler::archive::delta::{DELTA_FORMAT, DELTA_VERSION};
-use osm_tile_compiler::omt::OMT_SCHEMA_VERSION;
+use osm_tile_compiler::OMT_SCHEMA_VERSION;
+use osm_tile_compiler::archive::{DELTA_FORMAT, DELTA_VERSION};
 use osm_tile_compiler::{
     BUILDING_LEVELS_FORMAT, BUILDING_LEVELS_VERSION, MANIFEST_FORMAT, MANIFEST_VERSION,
 };

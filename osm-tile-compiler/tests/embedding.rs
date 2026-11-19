@@ -350,7 +350,7 @@ fn a_failed_compile_reports_the_failure_and_cleans_up() {
         Err(CompileError::InvalidRequest(_))
     ));
     request.threads = 1;
-    request.exclude_layers = Some(vec!["roads".into()]);
+    request.layers = osm_tile_compiler::LayerSelection::except(["roads"]);
     match compile_basemap(&request, |_| {}, || false) {
         Err(CompileError::InvalidRequest(message)) => {
             assert!(message.contains("roads"), "{message}")

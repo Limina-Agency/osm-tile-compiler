@@ -18,6 +18,7 @@ pub const GEOFABRIK_INDEX_URL: &str = "https://download.geofabrik.de/index-v1-no
 
 /// One extract Geofabrik offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Extract {
     /// Geofabrik's identifier: `malopolskie`, `poland`, `us/georgia`.
     pub id: String,
@@ -73,7 +74,11 @@ struct Urls {
 
 /// The extracts in Geofabrik's index JSON (`index-v1.json` or
 /// `index-v1-nogeom.json`); entries without a PBF download are left out.
-pub fn parse_index(json: &[u8]) -> Result<Vec<Extract>, String> {
+pub fn parse_index(json: &[u8]) -> Result<Vec<Extract>, CompileError> {
+    read_index(json).map_err(CompileError::Download)
+}
+
+fn read_index(json: &[u8]) -> Result<Vec<Extract>, String> {
     let index: Index = serde_json::from_slice(json)
         .map_err(|e| format!("Geofabrik's index could not be read: {e}"))?;
     Ok(index
@@ -160,7 +165,11 @@ fn keys(extract: &Extract) -> Vec<String> {
 /// `Małopolskie`, `MALOPOLSKIE` and `Lesser Poland Voivodeship` all name
 /// `malopolskie`. A `geofabrik:` prefix, as Planetiler takes, is ignored.
 /// No match, or several, is an error that lists candidates.
-pub fn find_extract<'a>(index: &'a [Extract], query: &str) -> Result<&'a Extract, String> {
+pub fn find_extract<'a>(index: &'a [Extract], query: &str) -> Result<&'a Extract, CompileError> {
+    find(index, query).map_err(CompileError::InvalidRequest)
+}
+
+fn find<'a>(index: &'a [Extract], query: &str) -> Result<&'a Extract, String> {
     let query = query.trim();
     let query = query.strip_prefix("geofabrik:").unwrap_or(query);
     if let Some(extract) = index.iter().find(|extract| extract.id == query) {
@@ -215,6 +224,7 @@ pub fn find_extract<'a>(index: &'a [Extract], query: &str) -> Result<&'a Extract
 
 /// What [`fetch_extract`] is doing, for progress reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExtractEvent<'a> {
     /// Downloading Geofabrik's index from `url`.
     Resolving { url: &'a str },
@@ -279,8 +289,8 @@ pub fn fetch_extract_from(
                 "Could not download Geofabrik's index from {index_url}: {e}"
             ))
         })?;
-    let index = parse_index(&index).map_err(CompileError::Download)?;
-    let extract = find_extract(&index, query).map_err(CompileError::InvalidRequest)?;
+    let index = parse_index(&index)?;
+    let extract = find_extract(&index, query)?;
     on_event(ExtractEvent::Found { extract });
     download(directory, extract, &agent, on_event, &should_cancel).map_err(|error| {
         if should_cancel() || error == CANCELLED {
@@ -443,13 +453,13 @@ mod tests {
     #[test]
     fn ambiguous_and_unknown_names_list_candidates() {
         let index = index();
-        let error = find_extract(&index, "Georgia ").unwrap_err();
+        let error = find_extract(&index, "Georgia ").unwrap_err().to_string();
         // Trimmed, "Georgia" differs from the identifier only in case.
         assert!(
             error.contains("georgia (Georgia), us/georgia (Georgia)"),
             "{error}"
         );
-        let error = find_extract(&index, "york").unwrap_err();
+        let error = find_extract(&index, "york").unwrap_err().to_string();
         assert!(error.contains("no extract named 'york'"), "{error}");
         assert!(error.contains("similar: us/new-york"), "{error}");
         assert!(find_extract(&index, " / ").is_err());

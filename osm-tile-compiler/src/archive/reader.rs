@@ -12,6 +12,7 @@ const MAX_DIRECTORY_DEPTH: usize = 4;
 
 /// The header, field by field.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Header {
     pub root_offset: u64,
     pub root_length: u64,
@@ -43,6 +44,7 @@ pub struct Header {
 /// A directory entry that addresses tiles: `run_length` consecutive tile
 /// IDs from `tile_id` share the `length` bytes at `offset` in the data section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Entry {
     pub tile_id: u64,
     pub offset: u64,
@@ -50,6 +52,8 @@ pub struct Entry {
     pub run_length: u32,
 }
 
+/// Reads a PMTiles v3 archive. Test support: not part of the stable API.
+#[doc(hidden)]
 pub struct ArchiveReader {
     file: File,
     pub file_length: u64,

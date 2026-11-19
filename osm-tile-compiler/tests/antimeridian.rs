@@ -4,8 +4,7 @@
 //! 180 in the tiles on both sides.
 
 use osm_tile_compiler::{
-    CompileArea, CompileBounds, archive,
-    omt::{OpenMapTilesRequest, compile_openmaptiles},
+    Area, BasemapRequest, CompileArea, CompileBounds, archive, compile_basemap,
 };
 #[allow(dead_code)]
 mod common;
@@ -152,24 +151,11 @@ fn compile(
     let bounds = CompileBounds::new(b.north, b.south, b.east, b.west).normalized();
     assert!(bounds.wraps(), "{bounds:?}");
     let output = dir.join("fiji.pmtiles");
-    compile_openmaptiles(&OpenMapTilesRequest {
-        input_pbf: pbf.to_path_buf(),
-        sources: sources.to_path_buf(),
-        output: output.clone(),
-        temp_dir: dir.join("temp"),
-        bounds,
-        area,
-        center: None,
-        archive: Default::default(),
-        min_zoom: 0,
-        max_zoom: 14,
-        threads: 2,
-        layers: None,
-        languages: None,
-        omit_sources: Vec::new(),
-        area_only: false,
-    })
-    .unwrap();
+    let mut request = BasemapRequest::new(pbf, &output, sources, dir.join("temp"));
+    request.area = Area::bounds(bounds);
+    request.area.polygon = area.map(Into::into);
+    request.threads = 2;
+    compile_basemap(&request, |_| {}, || false).unwrap();
     output
 }
 

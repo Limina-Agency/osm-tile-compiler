@@ -41,7 +41,7 @@ These belong to other projects and follow them:
 
 | What | Version | Where |
 |---|---|---|
-| OpenMapTiles schema | 3.16.0 | `omt::OMT_SCHEMA_VERSION`; written as the archive metadata's `version` and the manifest's `version`, as OpenMapTiles does |
+| OpenMapTiles schema | 3.16.0 | `OMT_SCHEMA_VERSION`; written as the archive metadata's `version` and the manifest's `version`, as OpenMapTiles does |
 | Planetiler OpenMapTiles profile | commit `91516fdf` | `omt::PROFILE_REVISION`; written as `planetiler_openmaptiles_profile_commit` |
 | Planetiler (comparison) | 0.10.2 | `benchmarks/compiler-parity/` |
 | PMTiles | specification v3 | the archive header |
