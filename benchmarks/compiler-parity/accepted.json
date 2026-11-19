@@ -1,0 +1,10 @@
+[
+  {"tile": [13, 4571, 2774], "layer": "building", "kind": "polygon_geometry",
+   "reason": "Małopolskie building cluster: JTS reduces it to a near-empty triangle, native keeps the buildings"},
+  {"layer": "poi", "id": 124958633681, "kind": "attributes",
+   "reason": "Berlin POI: ICU4X and ICU4J space Han syllables differently in name:latin and name_int"},
+  {"tile": [13, 4402, 2684], "layer": "building", "id": 287215350, "kind": "polygon_geometry",
+   "reason": "Berlin building group: 0.17% of the area, 1.41 px Hausdorff distance (2,824 vertices against 2,839); accepted 2026-11-19"},
+  {"tile": [5, 17, 10], "layer": "transportation", "id": 45367920, "kind": "line_geometry",
+   "reason": "Berlin motorway: one of 147 vertices 2 tile units (0.125 px) away, a last-bit difference in the projection maths; accepted 2026-11-19"}
+]

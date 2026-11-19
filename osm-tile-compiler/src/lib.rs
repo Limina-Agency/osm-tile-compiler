@@ -1,8 +1,9 @@
 //! Compiles an OpenStreetMap `.osm.pbf` into an OpenMapTiles-schema basemap,
 //! written as a single PMTiles archive. [`omt`] is a native Rust port of the
 //! OpenMapTiles 3.16 profile as pinned by Planetiler 0.10.2, checked against
-//! Planetiler's output. It is experimental: `OpenMapTilesResult::parity_verified`
-//! is `false`. An `osm-tile-compiler` binary is included.
+//! Planetiler's output: `OpenMapTilesResult::parity_verified` is `true` for the
+//! compiles the parity measurement covers (see `docs/parity.md`). An
+//! `osm-tile-compiler` binary is included.
 //!
 //! Output derived from OpenStreetMap data is under the ODbL: credit
 //! "© OpenStreetMap contributors". The OpenMapTiles schema and each

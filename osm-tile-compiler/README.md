@@ -68,10 +68,12 @@ osm-tile-compiler building-levels basemap.pmtiles basemap-buildings.pmtiles
 
 ## Status
 
-Pre-1.0, and the OpenMapTiles profile is experimental. The result reports
-`parity_verified: false`: output is compared with Planetiler's, but identity
-with it is not claimed. Check the repository's parity benchmarks before
-treating tiles as interchangeable with Planetiler's.
+Pre-1.0. The OpenMapTiles profile meets the repository's parity bar against
+Planetiler on three regions, and the result reports `parity_verified: true`
+for the compiles that measurement covers: Planetiler's default languages,
+every supplemental dataset, a full read of the extract and zoom 14 at the top.
+Merged polygons can still differ slightly in shape; the repository's
+`docs/parity.md` lists what differs and what is accepted.
 
 ## Data and licensing
 

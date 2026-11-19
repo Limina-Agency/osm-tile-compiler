@@ -330,6 +330,8 @@ async fn compiles_monaco_into_a_complete_deterministic_archive() {
 
     let (result, archive) = compile(&sources, &temp.path().join("four-threads"), 4, None);
     assert!(result.profile_features > 0, "{result:?}");
+    // The full profile is what docs/parity.md measures against Planetiler.
+    assert!(result.parity_verified);
     // The extract leaves these relations incomplete; a change in the counts
     // shows up here.
     assert_eq!(
@@ -595,7 +597,7 @@ async fn languages_limit_the_translated_names() {
     synthetic_sources(&sources);
     let full_layers = vector_layers(&read_record()["metadata"]);
     let kept = ["en", "it"];
-    let (_, archive) = compile_selected(
+    let (languages_result, archive) = compile_selected(
         &sources,
         &temp.path().join("languages"),
         3,
@@ -603,6 +605,8 @@ async fn languages_limit_the_translated_names() {
         None,
         Some(kept.iter().map(|code| format!("name:{code}")).collect()),
     );
+    // Other languages than Planetiler's default are outside the measurement.
+    assert!(!languages_result.parity_verified);
     let limited = read_archive(&archive).await;
     let dropped = |key: &str| {
         key.strip_prefix("name:")

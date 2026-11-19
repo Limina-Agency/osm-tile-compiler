@@ -2,8 +2,10 @@
 
 Where the native OpenMapTiles profile stands against Planetiler 0.10.2 (the
 pinned reference, profile revision `91516fdf`), measured on whole archives.
-`OpenMapTilesResult::parity_verified` stays `false` until the bar below is met.
-The latest measurement is the release check of 2026-11-17, before the bar.
+The bar below was met on 0.1.3 (2026-11-19, "Verified on 0.1.3"), and
+`OpenMapTilesResult::parity_verified` is `true` for the compiles that
+measurement covers: Planetiler's default languages, every supplemental dataset,
+a full read of the extract and zoom 14 at the top.
 
 ## Baseline: 2026-11-03
 
@@ -342,6 +344,51 @@ The extract is two weeks newer than the one above, so the counts are not
 like for like, but against the 19 differing polygons of the last
 measurement nothing has got worse.
 
+## Verified on 0.1.3: 2026-11-19
+
+Native at `45dee3c` (main, 0.1.3) against Planetiler 0.10.2, all three
+regions, every tile, zooms 0–14, four threads, Linux x86_64 (4 cores, 15 GiB),
+bounds from each extract's header. Prepared with `setup-linux.sh`, run with
+`run_omt.py`, compared with `compare.py --all-tiles` and measured with
+`pairdiff.py --accepted accepted.json`, which exits 0 on all three. Extracts of
+2026-11-18; water polygons SHA-256 `3e5b7e91…e38c9c2`, the other two datasets
+at their pinned hashes.
+
+| | Małopolskie | Berlin | Pomorskie |
+|---|---|---|---|
+| extract SHA-256 | `777306c5…dd2fbc20` | `c00600eb…eafa563f` | `eaa1a9ea…a8130496` |
+| tiles (same on both sides) | 11,293 | 942 | 21,286 |
+| differing tiles | 18 | 47 | 15 |
+| polygon geometry differs | 14 building, 4 landuse | 38 building, 6 landuse | 11 building, 4 landuse |
+| of which outside the bar | 1 (accepted) | 1 (accepted) | 0 |
+| line geometry differs | 0 | 1 (accepted) | 0 |
+| unpaired features | 0 | 0 | 0 |
+| attributes differ | 0 | 2 (one POI, accepted) | 0 |
+| invalid only in native | 0 | 0 | 0 |
+| invalid native / Planetiler | 9,768 / 9,773 | 3,546 / 3,556 | 10,575 / 10,579 |
+| native wall time / peak RSS | 43.5 s / 0.63 GiB | 78.6 s / 0.51 GiB | 16.4 s / 0.49 GiB |
+| Planetiler wall time / peak RSS | 119.5 s / 3.14 GiB | 79.2 s / 2.78 GiB | 77.7 s / 2.86 GiB |
+
+Times are from one run on a shared machine and are noisy.
+
+Every difference outside the bar is one already known on 2026-11-03,
+unchanged, and is accepted in `benchmarks/compiler-parity/accepted.json`:
+
+- **Małopolskie 13/4571/2774**, building cluster 2252911880: JTS's merge
+  leaves less of the cluster than native (6.9% of the area, 10.5 px).
+- **Berlin 13/4402/2684**, building group 287215350: 0.17% of the area,
+  1.41 px (2,824 vertices against 2,839). Accepted on 2026-11-19.
+- **Berlin 5/17/10**, motorway 45367920: one of 147 vertices is 2 tile units
+  (0.125 px) away, a last-bit difference in the projection maths. Accepted on
+  2026-11-19. The ocean polygon without ID that differed on this tile on
+  2026-11-03 no longer does.
+- **Berlin POI 124958633681** on 14/8804/5373–5374: Han romanisation,
+  "yī bēi norāmen" against "yī bēinorāmen" in `name:latin` and `name_int`.
+
+All other differing polygons are inside the bar. Polygons invalid in native
+but valid in Planetiler are checked over every tile, not only the differing
+ones.
+
 ## The bar
 
 `parity_verified` becomes `true` when, on Malopolskie and two more regions of
@@ -368,5 +415,6 @@ Timing and size are reported but not part of the bar.
 5. ~~Full-tile squares and tile-edge slivers~~.
 6. ~~Measure the rest against the bar~~ (see "Measured against the bar"); route order, JTS depth order and ring winding fixed. Left: Berlin
    13/4402/2684 and 5/17/10.
-7. ~~A full Pomorskie rerun~~ (every tile, above). Then decide
-   `parity_verified`: either close or accept the two Berlin cases.
+7. ~~A full Pomorskie rerun~~ (every tile, above). ~~Then decide
+   `parity_verified`~~: the two Berlin cases are accepted and the bar is met
+   on 0.1.3 (see "Verified on 0.1.3").
