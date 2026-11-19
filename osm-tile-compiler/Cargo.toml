@@ -21,7 +21,7 @@ workspace = true
 # The binary's allocator. Apps that link the library leave it out with
 # `default-features = false`: the library itself never installs one.
 default = ["mimalloc", "ctrlc"]
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # The binary's Ctrl-C, SIGTERM and SIGHUP handler, which cancels a running
 # command so that it removes its scratch space and partial outputs. The
 # library never installs one.
@@ -33,6 +33,8 @@ fuzzing = []
 [dependencies]
 mimalloc = { version = "0.1", default-features = false, optional = true }
 ctrlc = { version = "3.5", features = ["termination"], optional = true }
+# mimalloc's options (`mi_option_set`), which the binary sets before main.
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"], optional = true }
 ureq.workspace = true
 sha2.workspace = true
 hex = "0.4"

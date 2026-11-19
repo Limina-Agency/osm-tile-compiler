@@ -268,6 +268,8 @@ struct MemberWays {
 
 /// Tagged nodes per job when an area-only read hands on pass 1's nodes.
 const AREA_NODES_PER_BATCH: usize = 8_000;
+/// osm-pbf-ingest's desktop default for pass 2's decoded-block queue.
+const PASS2_QUEUE_BLOCKS: usize = 16;
 
 /// Share of the read-OSM stage given to the ways of pass 2; the relations
 /// assembled after it have the rest.
@@ -370,7 +372,14 @@ pub fn read_osm(
         junctions: HashMap::new(),
         junction_ids: Arc::new(HashSet::new()),
     };
-    let mut options = Pass2Options::new().worker_threads(workers);
+    // The relations come from pass 1; pass 2 would decode them all again
+    // for nothing. The render workers are slower than the decode workers, so
+    // pass 2's queue of decoded blocks stays full: two blocks per worker,
+    // rather than 16 whatever the count, hold fewer of them.
+    let mut options = Pass2Options::new()
+        .worker_threads(workers)
+        .skip_relations()
+        .queue_capacity((2 * workers).min(PASS2_QUEUE_BLOCKS));
     if index.area.is_some() {
         // The nodes came from pass 1, in file order as pass 2 would hand them.
         for nodes in area_nodes.chunks(AREA_NODES_PER_BATCH) {
@@ -739,7 +748,7 @@ impl Index {
         let mut classes = Vec::new();
         let mut members = Vec::new();
         let (mut missing, mut skipped, mut skipped_nodes) = (0, 0, 0);
-        for (position, way) in batch.ways.into_iter().enumerate() {
+        for (position, mut way) in batch.ways.into_iter().enumerate() {
             let ordinal = base + 2 * position as u64;
             let polygon_member = self
                 .prepared
@@ -762,13 +771,6 @@ impl Index {
             if coords.len() < 2 {
                 continue;
             }
-            if member {
-                let extent = match self.area {
-                    Some(_) => Extent::of(&coords),
-                    None => Extent::EMPTY,
-                };
-                members.push((way.way_id, ordinal, way.node_ids.clone(), extent));
-            }
             let highway = way.tags.get("highway").unwrap_or("");
             let rank = junction_highway_rank(highway);
             if rank > 0 {
@@ -778,12 +780,26 @@ impl Index {
                     }
                 }
             }
+            let extent = (member || self.area.is_some()).then(|| Extent::of(&coords));
+            if member {
+                // The relations below need the node IDs, the way nothing more.
+                let extent = match self.area {
+                    Some(_) => extent.unwrap_or(Extent::EMPTY),
+                    None => Extent::EMPTY,
+                };
+                members.push((
+                    way.way_id,
+                    ordinal,
+                    std::mem::take(&mut way.node_ids),
+                    extent,
+                ));
+            }
             if way.tags.is_empty() && parents.is_empty() {
                 continue;
             }
             // Outside the area the way still serves its relations above.
             if let Some(area) = &self.area
-                && !area.intersects(&Extent::of(&coords))
+                && !area.intersects(&extent.unwrap_or(Extent::EMPTY))
             {
                 continue;
             }

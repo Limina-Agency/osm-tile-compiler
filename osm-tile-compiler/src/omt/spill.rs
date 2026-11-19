@@ -18,6 +18,7 @@ use super::record_codec::{
 };
 use super::store::{
     EncodedRecord, LAYER_VERBATIM, Layer, MAX_LAYER_BYTES, MAX_RECORD_BYTES, Seq, SortKey,
+    frame_bytes,
 };
 use std::cell::RefCell;
 use std::fs::File;
@@ -134,18 +135,24 @@ impl<W: Write> RunWriter<W> {
 
     /// Appends `record`, which sorts after the previous one.
     pub(super) fn write(&mut self, record: &EncodedRecord) -> Result<(), String> {
-        if record.payload.is_empty() || record.payload.len() > MAX_RECORD_BYTES {
+        self.write_parts(&record.key, &record.payload)
+    }
+
+    /// Appends the record of `key` and `payload`, which sorts after the
+    /// previous one.
+    pub(super) fn write_parts(&mut self, key: &SortKey, payload: &[u8]) -> Result<(), String> {
+        if payload.is_empty() || payload.len() > MAX_RECORD_BYTES {
             return Err("OMT record exceeds bounded frame limit".into());
         }
-        let key = &record.key;
         if let Layer::Other(name) = &key.layer
             && name.len() > MAX_LAYER_BYTES
         {
             return Err("OMT record exceeds bounded frame limit".into());
         }
+        let record_payload = payload;
         let lengths = self.streams.each_ref().map(Vec::len);
         let [keys, sequences, payload @ ..] = &mut self.streams;
-        if let Err(error) = split_payload(&record.payload, payload) {
+        if let Err(error) = split_payload(record_payload, payload) {
             for (stream, len) in self.streams.iter_mut().zip(lengths) {
                 stream.truncate(len);
             }
@@ -176,7 +183,7 @@ impl<W: Write> RunWriter<W> {
         put_varint(sequences, u64::from(key.seq.record));
         self.previous.set(key);
         self.records += 1;
-        self.raw_bytes += record.frame_bytes() as u64;
+        self.raw_bytes += frame_bytes(key, record_payload.len()) as u64;
         if self.streams.iter().map(Vec::len).sum::<usize>() >= BLOCK_BYTES {
             self.write_block().map_err(|e| e.to_string())?;
         }
