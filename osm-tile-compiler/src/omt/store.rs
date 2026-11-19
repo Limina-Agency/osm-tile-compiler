@@ -3,6 +3,7 @@ use super::record_codec::{
     LAYER_NAMES, Reader, decode_payload, encode_payload, encode_varint, layer_id, zigzag,
 };
 use super::render::Record;
+use super::spill::{RunReader, RunWriter};
 use crate::control::Control;
 use crate::{
     ArchiveCenter, CompileBounds,
@@ -21,10 +22,11 @@ use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 
 const CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
@@ -92,6 +94,8 @@ pub(super) struct Store {
     /// Locked while this compile uses the scratch directory (see `new`).
     _lock: File,
     runs: Vec<PathBuf>,
+    /// Uncompressed bytes the sorters spilled, for the merge's progress.
+    spilled: Arc<AtomicU64>,
     sequence: usize,
     fields: BTreeMap<String, BTreeMap<String, String>>,
     zooms: BTreeMap<String, (u8, u8)>,
@@ -453,6 +457,7 @@ pub(super) struct Sorter {
     buffer: Vec<EncodedRecord>,
     bytes: usize,
     runs: Vec<PathBuf>,
+    spilled: Arc<AtomicU64>,
 }
 impl Sorter {
     pub(super) fn add(&mut self, record: EncodedRecord) -> Result<(), String> {
@@ -476,13 +481,13 @@ impl Sorter {
             self.worker,
             self.runs.len()
         ));
-        let file = File::create(&path).map_err(|e| e.to_string())?;
+        let mut writer = RunWriter::create(&path)?;
         self.runs.push(path);
-        let mut writer = BufWriter::new(file);
         for record in &self.buffer {
             write_record(&mut writer, record)?;
         }
-        writer.flush().map_err(|e| e.to_string())?;
+        let spilled = writer.finish()?;
+        self.spilled.fetch_add(spilled, AtomicOrdering::Relaxed);
         self.buffer.clear();
         self.bytes = 0;
         Ok(())
@@ -546,6 +551,7 @@ impl Store {
             directory,
             _lock: lock,
             runs: vec![],
+            spilled: Arc::new(AtomicU64::new(0)),
             sequence: 0,
             fields: BTreeMap::new(),
             zooms: BTreeMap::new(),
@@ -559,6 +565,7 @@ impl Store {
             buffer: vec![],
             bytes: 0,
             runs: vec![],
+            spilled: self.spilled.clone(),
         }
     }
     pub(super) fn add_runs(&mut self, runs: impl IntoIterator<Item = PathBuf>) {
@@ -590,16 +597,13 @@ impl Store {
             "{}",
             serde_json::json!({"benchmark_counts":"omt_spill_bytes",
             "runs":self.runs.len(),
+            "raw_bytes":self.spilled.load(AtomicOrdering::Relaxed),
             "bytes":self.runs.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum::<u64>()})
         );
         // Every pass reads all the records once: the fraction is the bytes
-        // merged over the run bytes times the passes.
-        let run_bytes = self
-            .runs
-            .iter()
-            .filter_map(|path| fs::metadata(path).ok())
-            .map(|metadata| metadata.len())
-            .sum::<u64>();
+        // merged over the run bytes times the passes. Both count records as
+        // frames, before compression.
+        let run_bytes = self.spilled.load(AtomicOrdering::Relaxed);
         let mut passes = 1;
         let mut runs = self.runs.len();
         while runs > MERGE_FAN_IN {
@@ -723,9 +727,9 @@ fn merge_groups(
     let next = AtomicUsize::new(0);
     let merge_group = |group: usize| -> Result<(), String> {
         let batch = &runs[group * MERGE_FAN_IN..((group + 1) * MERGE_FAN_IN).min(runs.len())];
-        let mut writer = BufWriter::new(File::create(&outputs[group]).map_err(|e| e.to_string())?);
+        let mut writer = RunWriter::create(&outputs[group])?;
         merge_controlled(batch, control, |record| write_record(&mut writer, &record))?;
-        writer.flush().map_err(|e| e.to_string())
+        writer.finish().map(drop)
     };
     let results = std::thread::scope(|scope| {
         let workers = (0..threads.min(outputs.len()))
@@ -966,9 +970,8 @@ fn merge_controlled(
     const REPORT_BYTES: u64 = 1 << 20;
     let mut readers = paths
         .iter()
-        .map(|p| File::open(p).map(BufReader::new))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+        .map(|p| RunReader::open(p))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut heap = BinaryHeap::new();
     for (index, reader) in readers.iter_mut().enumerate() {
         if let Some(record) = read_record(reader)? {
@@ -3368,9 +3371,9 @@ mod tests {
         let mut intermediate = vec![];
         for (index, runs) in store.runs.chunks(3).enumerate() {
             let path = temp.path().join(format!("merge-{index}"));
-            let mut writer = BufWriter::new(File::create(&path).unwrap());
+            let mut writer = RunWriter::create(&path).unwrap();
             merge(runs, |r| write_record(&mut writer, &r)).unwrap();
-            writer.flush().unwrap();
+            writer.finish().unwrap();
             intermediate.push(path);
         }
         let mut values = vec![];

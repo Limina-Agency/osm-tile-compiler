@@ -8,6 +8,12 @@
   from 1049 to 890 MiB (5.4 to 4.6 times the extract), and the peak moves
   from `write_tiles` to the end of `read_osm`. Time, memory and tiles are
   unchanged.
+- The sort runs spilled to the scratch directory are compressed with zstd
+  (level 1, in 64 KiB blocks), which makes them 2.4 times smaller. With the
+  node store change, peak scratch disk for Małopolskie is 585 MiB, 3.0 times
+  the extract. Compiles take under 1.5% longer on 2 threads and the same on
+  4; the tiles are unchanged. The library now builds zstd's C sources
+  (BSD-3-Clause).
 
 ## 0.1.2 (2026-11-17)
 
