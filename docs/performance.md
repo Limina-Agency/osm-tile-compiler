@@ -15,7 +15,8 @@ supplemental datasets of the tests rather than the real 1.5 GB:
 | Monaco, `compile_basemap` (`examples/compile_basemap.rs`) | 91 MiB | 101–105 MiB |
 
 Most of that is fixed: per-thread sort buffers (8 MiB each), queues and
-decoder state. Building levels read the whole basemap into memory.
+decoder state. Building levels read the basemap a tile at a time (see
+"Building levels" below).
 
 ## Cost in an app's process
 
@@ -86,6 +87,37 @@ directory (scratch and partial archive), both sampled every 0.25 s.
   blocks no more than 64 KiB ones, so the fastest level and small blocks
   (64 KiB of memory for each run a merge has open) stay.
 - 16 threads were not measured here.
+
+## Building levels
+
+Measured on 2026-11-19 on the cloud VM of "Scratch disk" (4 vCPUs, 15 GiB),
+command line (mimalloc), `building-levels` on the Małopolskie basemap above
+(146 MiB). Each figure is the median of three runs, interleaved. Both builds
+wrote the same archive, byte for byte, and the same report.
+
+| Build | Threads | Time | Peak RSS |
+|---|---|---|---|
+| 0.1.3 | 1 | 5.87 s | 310 MiB |
+| Tile at a time, grids by quadrant | 1 | 4.93 s | 88 MiB |
+| 0.1.3 | 2 | 3.24 s | 400 MiB |
+| Tile at a time, grids by quadrant | 2 | 2.81 s | 132 MiB |
+| 0.1.3 | 4 | 1.57 s | 541 MiB |
+| Tile at a time, grids by quadrant | 4 | 1.29 s | 195 MiB |
+| 0.1.3 | 16 | 1.70 s | 1179 MiB |
+| Tile at a time, grids by quadrant | 16 | 1.44 s | 544 MiB |
+
+- 0.1.3 read the whole basemap into memory, and each thread held every grid
+  of its z11 tile at once: sixteen z13, four z12 and one z11, 2.5 MiB each.
+  Now tiles are read one at a time, a z11 tile's z14 tiles go quadrant by
+  quadrant, so one grid a zoom is open, and finished grids are filled again
+  rather than freed. The gzipped tiles, held until the archive is written,
+  no longer keep the encoder's spare room.
+- What is left grows with threads mostly through mimalloc keeping freed
+  memory for a while: with the system allocator the same pass peaks at
+  74 MiB on 4 threads and 206 MiB on 16.
+- In `compile --building-levels` on 4 threads, peak anonymous memory went
+  from 537 to 469 MiB (two runs each), and building levels are no longer
+  the compile's peak.
 
 ## On Apple silicon
 
