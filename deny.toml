@@ -42,5 +42,3 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Until osm-pbf-ingest releases the changes module (Cargo.toml's patch).
-allow-git = ["https://github.com/Limina-Agency/osm-pbf-ingest"]
