@@ -896,7 +896,10 @@ fn release_scratch(directory: &Path, marker: File) -> Result<(), String> {
     remove_all_but(directory, &marker_path)
         .map_err(|e| format!("Failed to remove {}: {e}", directory.display()))?;
     // Windows cannot remove an open file. A compile that claims the empty
-    // directory in between keeps it.
+    // directory in between keeps it. Unlock before closing: a process spawned
+    // by another thread can hold a duplicate of the descriptor until it
+    // execs, and on Unix that duplicate keeps the lock held after the close.
+    let _ = marker.unlock();
     drop(marker);
     let _ = std::fs::remove_file(&marker_path);
     let _ = std::fs::remove_dir(directory);
