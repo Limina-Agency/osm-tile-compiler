@@ -146,7 +146,9 @@ identifier (`malopolskie`, `us/georgia`), a name with or without accents
 name that several regions share, such as `Georgia`, is refused with their
 identifiers. The extract is saved in `--download-dir` (by default the
 `--sources` directory) as `<ID>.osm.pbf` and reused by later compiles;
-delete it to download a newer one.
+delete it to download a newer one. To read the index from a mirror, set
+`OSM_TILE_COMPILER_GEOFABRIK_INDEX` to its URL; extracts are downloaded from
+the URLs that index lists.
 
 By default the area is the PBF header's bounding box. `--bounds W S E N`
 sets another box, and `--polygon FILE` (GeoJSON, or the Osmosis `.poly`

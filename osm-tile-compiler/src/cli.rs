@@ -9,7 +9,7 @@ use osm_tile_compiler::{
         ArchiveOptions, ArchiveReport,
         delta::{self, DeltaManifest},
     },
-    building_levels_path, compile_basemap, fetch_extract, fetch_sources as fetch_datasets,
+    building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
     omt::{LANGUAGES, LAYERS, resolve_languages, select_layers},
     tile_stats::kib,
     write_building_levels,
@@ -27,6 +27,10 @@ const SCRATCH_MARKER: &str = ".osm-tile-compiler-scratch";
 /// `style` replaces its three URLs, each one JSON string in the template.
 const STYLE: &str = include_str!("../style/osm-bright.json");
 const STYLE_ARCHIVE: &str = "pmtiles://basemap.pmtiles";
+/// Names the Geofabrik index `--area` reads instead of
+/// [`osm_tile_compiler::extracts::GEOFABRIK_INDEX_URL`]: a mirror, or the
+/// local server the tests run.
+const GEOFABRIK_INDEX_VAR: &str = "OSM_TILE_COMPILER_GEOFABRIK_INDEX";
 const STYLE_GLYPHS: &str = "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf";
 const STYLE_SPRITE: &str = "https://openmaptiles.github.io/osm-bright-gl-style/sprite";
 
@@ -88,7 +92,9 @@ Compile options:
                         name (Małopolskie) or its ISO code (PL-12). It is
                         downloaded into --download-dir as <ID>.osm.pbf, or
                         the one already there is used; remove it to download
-                        a newer one
+                        a newer one. OSM_TILE_COMPILER_GEOFABRIK_INDEX names
+                        another index (a mirror) [default:
+                        https://download.geofabrik.de/index-v1-nogeom.json]
   --download-dir <DIR>  Where --area keeps extracts [default: --sources, or
                         the current directory with --omit-sources all]
   --output <FILE>       Archive to write; must not exist yet
@@ -960,7 +966,13 @@ fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
 /// it there, and returns its path.
 fn area_extract(name: &str, directory: &Path, status: &mut Status) -> Result<PathBuf, String> {
     let mut file = String::new();
-    fetch_extract(
+    let index_url = std::env::var(GEOFABRIK_INDEX_VAR)
+        .ok()
+        .filter(|url| !url.is_empty());
+    fetch_extract_from(
+        index_url
+            .as_deref()
+            .unwrap_or(osm_tile_compiler::extracts::GEOFABRIK_INDEX_URL),
         directory,
         name,
         |event| match event {

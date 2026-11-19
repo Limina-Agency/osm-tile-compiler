@@ -240,15 +240,32 @@ pub enum ExtractEvent<'a> {
 pub fn fetch_extract(
     directory: &Path,
     query: &str,
+    on_event: impl FnMut(ExtractEvent),
+    should_cancel: impl Fn() -> bool,
+) -> Result<PathBuf, CompileError> {
+    fetch_extract_from(
+        GEOFABRIK_INDEX_URL,
+        directory,
+        query,
+        on_event,
+        should_cancel,
+    )
+}
+
+/// [`fetch_extract`] with the index read from `index_url` instead of
+/// [`GEOFABRIK_INDEX_URL`]: a mirror, or a local server in tests. The
+/// extract is downloaded from the URL the index gives for it.
+pub fn fetch_extract_from(
+    index_url: &str,
+    directory: &Path,
+    query: &str,
     mut on_event: impl FnMut(ExtractEvent),
     should_cancel: impl Fn() -> bool,
 ) -> Result<PathBuf, CompileError> {
     let agent = agent();
-    on_event(ExtractEvent::Resolving {
-        url: GEOFABRIK_INDEX_URL,
-    });
+    on_event(ExtractEvent::Resolving { url: index_url });
     let index = agent
-        .get(GEOFABRIK_INDEX_URL)
+        .get(index_url)
         .call()
         .and_then(|mut response| {
             response
@@ -259,7 +276,7 @@ pub fn fetch_extract(
         })
         .map_err(|e| {
             CompileError::Download(format!(
-                "Could not download Geofabrik's index from {GEOFABRIK_INDEX_URL}: {e}"
+                "Could not download Geofabrik's index from {index_url}: {e}"
             ))
         })?;
     let index = parse_index(&index).map_err(CompileError::Download)?;
@@ -336,7 +353,13 @@ fn download(
         Ok((bytes, _sha256)) => bytes,
         Err(error) => {
             let _ = fs::remove_file(&partial);
-            return Err(error);
+            // Name the URL: a dropped connection alone reads as "Peer
+            // disconnected".
+            return Err(if error == CANCELLED {
+                error
+            } else {
+                format!("Could not download {}: {error}", extract.url)
+            });
         }
     };
     fs::rename(&partial, &destination).map_err(|e| {
