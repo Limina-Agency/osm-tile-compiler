@@ -1,9 +1,12 @@
 //! The PMTiles archive a compile writes: options for its metadata and tile
-//! compression, and a reader that inspects and verifies finished archives.
+//! compression, a reader that inspects and verifies finished archives, and
+//! delta archives that update one archive to a newer one.
 use serde::{Deserialize, Serialize};
 
 mod check;
+pub mod delta;
 mod reader;
+mod tile_patch;
 
 pub use check::{ArchiveReport, inspect};
 pub use reader::{ArchiveReader, Entry};

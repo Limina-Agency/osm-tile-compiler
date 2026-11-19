@@ -269,6 +269,17 @@ impl ArchiveReader {
         &mut self,
         mut visit: impl FnMut(&mut Self, Entry) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.walk(|reader, entry, leaf| if leaf { Ok(()) } else { visit(reader, entry) })
+    }
+
+    /// Calls `visit` with every directory entry in directory order, tile
+    /// entries with `false` and leaf directory pointers with `true`, each
+    /// pointer before its leaf's entries. A pointer's offset is relative to
+    /// the leaf section.
+    pub fn walk(
+        &mut self,
+        mut visit: impl FnMut(&mut Self, Entry, bool) -> Result<(), String>,
+    ) -> Result<(), String> {
         let root = self.directory(self.header.root_offset, self.header.root_length)?;
         let mut stack = vec![(root.into_iter(), 0usize)];
         while let Some((entries, depth)) = stack.last_mut() {
@@ -277,8 +288,8 @@ impl ArchiveReader {
                 stack.pop();
                 continue;
             };
+            visit(self, entry, leaf)?;
             if !leaf {
-                visit(self, entry)?;
                 continue;
             }
             if depth + 1 >= MAX_DIRECTORY_DEPTH {
