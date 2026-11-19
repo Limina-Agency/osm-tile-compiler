@@ -55,6 +55,19 @@ fn usage_errors_exit_with_2() {
         (&["frobnicate"], "unknown command 'frobnicate'"),
         (&["--bogus"], "unknown command '--bogus'"),
         (&["compile"], "compile needs an input PBF"),
+        (
+            &["compile", "in.pbf", "--area", "monaco"],
+            "an input PBF or --area, not both",
+        ),
+        (&["compile", "--area"], "--area needs a value"),
+        (
+            &["compile", "in.pbf", "--download-dir", "d"],
+            "--download-dir is only used with --area",
+        ),
+        (
+            &["compile", "--area", "monaco", "--output", "o.pmtiles"],
+            "--sources",
+        ),
         (&["compile", "in.pbf", "--sources", "s"], "--output"),
         (&["compile", "in.pbf", "--output", "o.pmtiles"], "--sources"),
         (&["compile", "in.pbf", "--output"], "--output needs a value"),

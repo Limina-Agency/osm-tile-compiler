@@ -169,7 +169,7 @@ pub struct CachedInput {
 
 /// Copies `reader` to `output`, hashing it; `progress` gets the bytes so far
 /// after every read, and an error stops the copy.
-fn transfer(
+pub(crate) fn transfer(
     mut reader: impl Read,
     mut output: impl Write,
     expected: Option<u64>,
@@ -191,7 +191,7 @@ fn transfer(
         progress(bytes)?;
     }
     if bytes == 0 || expected.is_some_and(|length| length != bytes) {
-        return Err("Supplemental download is empty or incomplete; retry compilation".into());
+        return Err("The download is empty or incomplete; retry".into());
     }
     Ok((bytes, hex::encode(hash.finalize())))
 }
@@ -256,6 +256,17 @@ pub fn fetch_sources(
     })
 }
 
+/// The HTTP client downloads use: a connection must open within 30 s and
+/// answer within 60 s, and a download may take two hours.
+pub(crate) fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
+        .timeout_global(Some(Duration::from_secs(7200)))
+        .build()
+        .into()
+}
+
 pub(crate) fn fetch(
     directory: &Path,
     datasets: &[SupplementalDataset],
@@ -271,12 +282,7 @@ pub(crate) fn fetch(
         }
     };
     fs::create_dir_all(directory).map_err(|e| e.to_string())?;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(30)))
-        .timeout_recv_response(Some(Duration::from_secs(60)))
-        .timeout_global(Some(Duration::from_secs(7200)))
-        .build()
-        .into();
+    let agent = agent();
     let mut inputs = Vec::new();
     for dataset in SupplementalDataset::ALL {
         if !datasets.contains(&dataset) {
