@@ -214,6 +214,24 @@ after decoding, not total decoding or validity-check costs. For before/after
 experiments, reuse the recorded coordinates through the `audit` function;
 changing the sample cannot establish that the same cases improved.
 
+To decide the parity bar of `docs/parity.md` on a whole archive, measure every
+differing feature of a `compare.py --all-tiles` report:
+
+```powershell
+python benchmarks/compiler-parity/pairdiff.py NATIVE.pmtiles REFERENCE.pmtiles --comparison-report full-comparison.json --accepted benchmarks/compiler-parity/accepted.json --workers 4 --output pairdiff.json --markdown pairdiff.md
+```
+
+It decodes every differing tile, pairs features by layer, ID and geometry type
+(identical features first where an ID repeats) and reports unpaired features,
+attribute differences, line and point geometry differences, and each differing
+polygon's symmetric difference as a share of the reference's area with its
+vertex-based Hausdorff distance in pixels of a 256-pixel tile. Nothing is
+sampled or capped: large polygons use an indexed form of GEOS's discrete
+Hausdorff distance that gives the same value. Polygons invalid in native but
+valid in the reference are taken from the comparison's validity list, over
+every tile. `accepted.json` lists the accepted differences, each matched on its
+fields. Exit 0 means the archive meets the bar.
+
 Use `validate-pmtiles.py` with `--probes source-probes.json` (written by
 `source-probes.py INPUT.pbf --output source-probes.json`) for PBF-derived
 named-point controls.

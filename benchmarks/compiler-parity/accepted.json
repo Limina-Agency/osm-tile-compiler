@@ -1,0 +1,4 @@
+[
+  {"tile": [13, 4571, 2774], "layer": "building", "kind": "polygon_geometry",
+   "reason": "Małopolskie building cluster: JTS reduces it to a near-empty triangle, native keeps the buildings (docs/parity.md)"}
+]
