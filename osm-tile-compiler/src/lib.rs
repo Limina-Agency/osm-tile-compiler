@@ -66,6 +66,9 @@ mod compile_bounds;
 mod control;
 mod coordinate_groups;
 pub mod extracts;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod generalization;
 pub mod omt;
 mod profiling;

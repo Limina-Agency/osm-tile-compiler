@@ -26,6 +26,8 @@ mimalloc = ["dep:mimalloc"]
 # library never installs one.
 ctrlc = ["dep:ctrlc"]
 benchmark-profiling = []
+# Exposes internals to the cargo-fuzz targets in ../fuzz. Not an API.
+fuzzing = []
 
 [dependencies]
 mimalloc = { version = "0.1", default-features = false, optional = true }

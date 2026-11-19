@@ -31,3 +31,23 @@ Once the change is released, raise the version in `Cargo.toml` and remove
 the override. A change to what the
 ingest reads must leave `fixtures/monaco-features.json` untouched, or explain
 the difference as any other output change does.
+
+## Fuzzing the input readers
+
+`fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets
+for what the compiler reads from users' files: `--polygon` files
+(`polygon_geojson`, `polygon_poly`) and PMTiles archives (`pmtiles_inspect`,
+the reader behind `inspect` and `verify`; `pmtiles_building_levels`). It is a
+workspace of its own and needs a nightly toolchain:
+
+```sh
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz run polygon_poly corpus/polygon_poly seeds/polygon_poly -- -max_total_time=300
+cargo +nightly fuzz run pmtiles_inspect corpus/pmtiles_inspect seeds/pmtiles -- -max_len=65536
+```
+
+`seeds/` holds small valid inputs to start from; `corpus/` and `artifacts/`
+are left untracked. `pmtiles_building_levels` starts a thread pool per
+input, which LeakSanitizer reports at exit; pass `-detect_leaks=0` to it. A crash found this way becomes a unit test beside the
+code it fixes.

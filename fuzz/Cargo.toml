@@ -1,0 +1,47 @@
+[package]
+name = "osm-tile-compiler-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+osm-tile-compiler = { path = "../osm-tile-compiler", default-features = false, features = ["fuzzing"] }
+
+# Its own workspace, so that the main one's builds and lockfile never need
+# the nightly toolchain cargo-fuzz runs with.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "polygon_geojson"
+path = "fuzz_targets/polygon_geojson.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "polygon_poly"
+path = "fuzz_targets/polygon_poly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pmtiles_inspect"
+path = "fuzz_targets/pmtiles_inspect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pmtiles_building_levels"
+path = "fuzz_targets/pmtiles_building_levels.rs"
+test = false
+doc = false
+bench = false
