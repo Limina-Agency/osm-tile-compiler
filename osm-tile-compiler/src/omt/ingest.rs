@@ -5,6 +5,7 @@
 //! reference's sub-metre damaged-ring repair remain explicit limitations.
 use super::{
     Profile,
+    input_area::{Extent, InputArea},
     pipeline::{Pipeline, lock},
     types::{Source, SourceKind, Tags},
 };
@@ -221,12 +222,15 @@ pub(super) struct Index {
     profile_memberships: ProfileMembershipIndex,
     /// Highest-ranked highway touching each motorway junction node.
     junction_classes: Mutex<HashMap<i64, (u8, String)>>,
-    /// Node IDs of ways that relations may join, with the ordinal of the way.
-    member_ways: Mutex<HashMap<i64, (u64, Vec<i64>)>>,
+    /// Node IDs of ways that relations may join, with the ordinal of the way
+    /// and, in an area-only compile, the way's extent.
+    member_ways: Mutex<HashMap<i64, MemberWay>>,
     missing_ways: AtomicUsize,
     missing_relations: AtomicUsize,
     skipped_ways: AtomicUsize,
     skipped_node_references: AtomicUsize,
+    /// In an area-only compile, the box whose objects become sources.
+    area: Option<InputArea>,
 }
 
 /// A unit of source assembly that runs on a render worker.
@@ -243,7 +247,17 @@ enum Task {
     Ways(WayBatch, Arc<HashSet<i64>>),
     Sources(Vec<Source>),
     /// Relations `first..end`.
-    Relations(usize, usize, Arc<HashMap<i64, Vec<i64>>>),
+    Relations(usize, usize, Arc<MemberWays>),
+}
+
+/// A way relations may join: its ordinal, nodes and extent.
+type MemberWay = (u64, Vec<i64>, Extent);
+
+/// The ways relations join, collected while pass 2 reads the ways.
+struct MemberWays {
+    nodes: HashMap<i64, Vec<i64>>,
+    /// Each way's extent, in an area-only compile.
+    extents: HashMap<i64, Extent>,
 }
 
 /// Share of the read-OSM stage given to the ways of pass 2; the relations
@@ -262,6 +276,7 @@ pub fn read_osm(
     pipeline: &mut Pipeline,
     profile: &Arc<Profile>,
     control: &Control,
+    area: Option<InputArea>,
     progress: &mut dyn FnMut(&str),
     warnings: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -322,6 +337,7 @@ pub fn read_osm(
         missing_relations: AtomicUsize::new(0),
         skipped_ways: AtomicUsize::new(0),
         skipped_node_references: AtomicUsize::new(0),
+        area,
     });
     let mut sink = SourceSink {
         pipeline: &mut *pipeline,
@@ -446,13 +462,18 @@ impl SourceSink<'_> {
         if !junctions.is_empty() {
             self.submit_next(Task::Sources(junctions))?;
         }
-        let member_ways = std::mem::take(&mut *lock(&self.index.member_ways));
-        let member_ways = Arc::new(
-            member_ways
-                .into_iter()
-                .map(|(id, (_, nodes))| (id, nodes))
-                .collect::<HashMap<_, _>>(),
-        );
+        let collected = std::mem::take(&mut *lock(&self.index.member_ways));
+        let mut member_ways = MemberWays {
+            nodes: HashMap::with_capacity(collected.len()),
+            extents: HashMap::new(),
+        };
+        for (id, (_, nodes, extent)) in collected {
+            member_ways.nodes.insert(id, nodes);
+            if self.index.area.is_some() {
+                member_ways.extents.insert(id, extent);
+            }
+        }
+        let member_ways = Arc::new(member_ways);
         // Jobs are numbered in relation order but queued heaviest first, so a
         // huge relation does not start last and leave the other workers idle.
         let mut runs = Vec::new();
@@ -485,7 +506,7 @@ impl Pass2Sink for SourceSink<'_> {
     }
     fn on_node_batch(&mut self, batch: NodeBatch) -> Result<(), String> {
         for n in &batch.nodes {
-            if is_junction(&n.tags) {
+            if is_junction(&n.tags) && self.index.node_in_area(n) {
                 let source = node_source(n)?;
                 Arc::make_mut(&mut self.junction_ids).insert(n.node_id);
                 self.junctions.insert(n.node_id, source);
@@ -527,7 +548,7 @@ impl Job {
             Task::Nodes(batch) => {
                 for (position, n) in batch.nodes.iter().enumerate() {
                     // Junction nodes are emitted by `SourceSink::finish`.
-                    if n.tags.is_empty() || is_junction(&n.tags) {
+                    if n.tags.is_empty() || is_junction(&n.tags) || !self.index.node_in_area(n) {
                         continue;
                     }
                     emit(base + position as u64, node_source(n)?)?;
@@ -555,6 +576,25 @@ impl Job {
 }
 
 impl Index {
+    fn node_in_area(&self, node: &NormalizedNode) -> bool {
+        self.area
+            .as_ref()
+            .is_none_or(|area| area.contains(node.lat, node.lng))
+    }
+
+    /// Whether the bounding box of the member ways found touches the area.
+    /// Without an area, every relation does.
+    fn relation_in_area(&self, way_ids: &[i64], member_ways: &MemberWays) -> bool {
+        let Some(area) = &self.area else {
+            return true;
+        };
+        let mut extent = Extent::EMPTY;
+        for member in way_ids.iter().filter_map(|id| member_ways.extents.get(id)) {
+            extent.extend(member);
+        }
+        area.intersects(&extent)
+    }
+
     fn memberships(&self, id: i64) -> Vec<Tags> {
         self.profile_memberships
             .get(id)
@@ -629,7 +669,11 @@ impl Index {
                     })
                 })
             {
-                members.push((way.way_id, ordinal, way.node_ids.clone()));
+                let extent = match self.area {
+                    Some(_) => Extent::of(&coords),
+                    None => Extent::EMPTY,
+                };
+                members.push((way.way_id, ordinal, way.node_ids.clone(), extent));
             }
             let highway = way.tags.get("highway").unwrap_or("");
             let rank = junction_highway_rank(highway);
@@ -641,6 +685,12 @@ impl Index {
                 }
             }
             if way.tags.is_empty() && parents.is_empty() {
+                continue;
+            }
+            // Outside the area the way still serves its relations above.
+            if let Some(area) = &self.area
+                && !area.intersects(&Extent::of(&coords))
+            {
                 continue;
             }
             let source = Source {
@@ -675,10 +725,10 @@ impl Index {
         }
         if !members.is_empty() {
             let mut all = lock(&self.member_ways);
-            for (way_id, ordinal, nodes) in members {
+            for (way_id, ordinal, nodes, extent) in members {
                 // A repeated way ID keeps the later way, as serial order did.
-                if all.get(&way_id).is_none_or(|(old, _)| *old <= ordinal) {
-                    all.insert(way_id, (ordinal, nodes));
+                if all.get(&way_id).is_none_or(|(old, ..)| *old <= ordinal) {
+                    all.insert(way_id, (ordinal, nodes, extent));
                 }
             }
         }
@@ -689,7 +739,7 @@ impl Index {
     fn relation(
         &self,
         relation: &NormalizedRelation,
-        member_ways: &HashMap<i64, Vec<i64>>,
+        member_ways: &MemberWays,
     ) -> Result<Option<Source>, String> {
         let kind = relation.tags.get("type").unwrap_or("");
         if !matches!(kind, "multipolygon" | "boundary" | "land_area") {
@@ -701,10 +751,10 @@ impl Index {
             .filter(|m| m.member_type == RelationMemberType::Way)
             .map(|m| m.member_id)
             .collect::<Vec<_>>();
-        if way_ids.is_empty() {
+        if way_ids.is_empty() || !self.relation_in_area(&way_ids, member_ways) {
             return Ok(None);
         }
-        let segments = relation_segments_in_order(way_ids, member_ways);
+        let segments = relation_segments_in_order(way_ids, &member_ways.nodes);
         let mut complete = true;
         let Some(rings) = connect_ring_candidates(segments, true) else {
             self.missing_relations.fetch_add(1, Ordering::Relaxed);

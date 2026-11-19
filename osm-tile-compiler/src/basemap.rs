@@ -49,6 +49,10 @@ pub struct BasemapRequest {
     /// A GeoJSON or Osmosis `.poly` file limiting the compile to the tiles
     /// its polygon covers.
     pub polygon: Option<PathBuf>,
+    /// Read only the OSM data in and near the area (`bounds` and `polygon`)
+    /// [default: no]: a small area then compiles from a country extract in
+    /// seconds. See [`crate::omt::OpenMapTilesRequest::area_only`].
+    pub area_only: bool,
     /// Where viewers start [default: the middle of the area].
     pub center: Option<ArchiveCenter>,
     pub archive: ArchiveOptions,
@@ -92,6 +96,7 @@ impl BasemapRequest {
             temp_dir: temp_dir.into(),
             bounds: None,
             polygon: None,
+            area_only: false,
             center: None,
             archive: ArchiveOptions::default(),
             min_zoom: 0,
@@ -256,6 +261,7 @@ fn compile(
         layers,
         languages: request.languages.clone(),
         omit_sources: request.omit_sources.clone(),
+        area_only: request.area_only,
     };
     omt::validate(&compile_request)?;
     let used = request.used_sources();

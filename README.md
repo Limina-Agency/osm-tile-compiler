@@ -144,6 +144,16 @@ past ±180 or be split there (RFC 7946). Features near 180 are written into
 the tiles on both sides. The archive then declares longitudes -180 to 180,
 because MapLibre requests no tiles for a box whose west exceeds its east.
 
+By default the whole extract is read, so the low-zoom tiles over the area
+show everything in the extract that they reach. `--area-only` reads only
+the OSM objects in and near the area: those whose bounding box touches the
+tiles written at the highest zoom, or the tile around them, each read whole.
+A small area then compiles from a large extract in seconds: a 9 by 8 km box
+in the Tatras takes 4.5 s from the Małopolskie extract instead of 11.9 s
+(four threads, Linux, no supplemental datasets). The tiles at the highest
+zoom are the same as from a full read, byte for byte; lower zooms show only
+what lies near the area, besides the supplemental datasets.
+
 Viewers open the archive at the middle of the area, zoomed to show all of
 it, unless you pass `--center LON LAT ZOOM`. `--min-zoom` and `--max-zoom`
 narrow the zooms from 0 to 14.

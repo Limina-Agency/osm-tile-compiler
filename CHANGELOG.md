@@ -14,6 +14,13 @@
   the extract. Compiles take under 1.5% longer on 2 threads and the same on
   4; the tiles are unchanged. The library now builds zstd's C sources
   (BSD-3-Clause).
+- `compile --area-only` (`BasemapRequest::area_only`,
+  `OpenMapTilesRequest::area_only`, `areaOnly` in the worker request) reads
+  only the OSM objects in and near the area, so a small area compiles from a
+  large extract in seconds. The tiles at the highest zoom are those of a full
+  read; lower zooms show only what lies near the area. Off by default, which
+  leaves every archive as it was. Code that builds `OpenMapTilesRequest`
+  field by field needs `area_only: false`.
 
 ## 0.1.2 (2026-11-17)
 

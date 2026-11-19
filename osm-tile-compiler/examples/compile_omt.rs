@@ -58,6 +58,7 @@ fn main() -> Result<(), String> {
         layers: None,
         languages: None,
         omit_sources: Vec::new(),
+        area_only: false,
     };
     let result = compile_openmaptiles(&request)?;
     let json = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
