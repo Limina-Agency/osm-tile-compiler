@@ -66,6 +66,10 @@ jobs:
   # simulator, with the library built without the binary's allocator.
   ios:
     runs-on: macos-15
+    env:
+      # Rust links for iOS 10 by default, but the C build scripts compile for
+      # the SDK's newest iOS and call ___chkstk_darwin (iOS 13 and later).
+      IPHONEOS_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |

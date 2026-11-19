@@ -13,4 +13,8 @@ back into the host.
 The crate builds a `staticlib` (for an iOS XCFramework), a `cdylib` (for
 Android and dynamic links) and an `rlib`. It installs no allocator.
 
+For iOS, build with `IPHONEOS_DEPLOYMENT_TARGET` set to 13.0 or later (CI
+uses 13.0): the C code of SQLite, ring and zstd calls `___chkstk_darwin`,
+which older targets lack, and Rust's own default is 10.0.
+
 Experimental: not published until the 0.2 API is released.
