@@ -117,7 +117,7 @@ fn repair_contours(contours: &[Vec<WorldPoint>], fill: FillRule) -> Option<Vec<W
         return None;
     }
     // FloatOverlay constructs the same adapter from the same input bounds.
-    let adapter = FloatPointAdapter::<[f64; 2], f64>::with_iter(raw.iter().flatten());
+    let adapter = FloatPointAdapter::<[f64; 2], i32>::with_iter(raw.iter().flatten());
     let mut source_vertices = BTreeMap::<(i32, i32), Option<WorldPoint>>::new();
     for (&source, raw) in contours.iter().flatten().zip(raw.iter().flatten()) {
         let key = adapter.float_to_int(raw);

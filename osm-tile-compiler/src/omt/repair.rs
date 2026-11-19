@@ -14,10 +14,11 @@ use i_overlay::{
 };
 
 pub(super) fn repair_groups(groups: Vec<TileRingGroup>) -> Vec<TileRingGroup> {
-    // i_overlay 4.5.2's fragmented splitter can miss an endpoint lying on a
-    // nonadjacent edge. AUTO selects that path for large merged tile groups.
-    // Keep the entire set and NonZero fill semantics; LIST repairs the actual
-    // residential fixture without changing its coverage (see regression below).
+    // i_overlay 4.5.2's fragmented splitter could miss an endpoint lying on a
+    // nonadjacent edge, and AUTO selects that path for large merged tile
+    // groups. 9.x fixes it (see regression below), but LIST stays so tile
+    // output only changes where the overlay itself changed. Keep the entire
+    // set and NonZero fill semantics.
     repair_groups_with_solver(groups, Solver::LIST)
 }
 
@@ -347,10 +348,11 @@ mod tests {
         };
         assert!(!polygon(&original).is_valid());
         // Force the path that AUTO uses for the original 37,015-coordinate set.
-        // This characterizes the pinned 4.5.2 dependency failure on a small fixture.
+        // i_overlay 4.5.2 left this fixture invalid; 9.x fixed fragment
+        // splitting, so FRAG must now agree with the LIST repair kept below.
         let fragmented = repair_groups_with_solver(vec![original.clone()], Solver::FRAG);
-        assert!(fragmented.iter().any(|g| !polygon(g).is_valid()));
         let fixed = repair_groups(vec![original]);
+        assert_eq!(fragmented, fixed);
         assert_eq!(fixed.len(), 2);
         assert!(fixed.iter().all(|g| polygon(g).is_valid()));
         assert_eq!(
