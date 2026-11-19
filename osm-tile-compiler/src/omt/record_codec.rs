@@ -254,6 +254,7 @@ fn put_str(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
+#[derive(Clone)]
 pub(super) struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -307,11 +308,16 @@ impl<'a> Reader<'a> {
 
     /// A length or element count. Every element takes at least one byte, so a
     /// count beyond the remaining bytes is corrupt, however large.
-    fn length(&mut self) -> Result<usize, String> {
+    pub(super) fn length(&mut self) -> Result<usize, String> {
         usize::try_from(self.varint()?)
             .ok()
             .filter(|&len| len <= self.0.len())
             .ok_or_else(|| "Truncated OMT record".into())
+    }
+
+    /// The bytes not read yet.
+    pub(super) fn remaining(&self) -> usize {
+        self.0.len()
     }
 
     fn coordinate(&mut self, previous: i32) -> Result<i32, String> {
@@ -575,11 +581,249 @@ fn read_attrs(reader: &mut Reader) -> Result<BTreeMap<String, AttrValue>, String
     Ok(attrs.into_iter().collect())
 }
 
+/// The streams `split_payload` sorts a payload's bytes into. Like bytes
+/// compress better together: coordinates with coordinates, attribute keys
+/// with attribute keys, and so on.
+pub(super) const PAYLOAD_STREAMS: usize = 5;
+const META: usize = 0;
+const COUNTS: usize = 1;
+const COORDS: usize = 2;
+const ATTR_KEYS_STREAM: usize = 3;
+const ATTR_VALUES: usize = 4;
+
+/// Appends the parts of `payload`, a well-formed `encode_payload` output, to
+/// `streams`. `join_payload` rebuilds the payload byte for byte. Every ring
+/// of a polygon closes on its first point, so a ring's last point is dropped
+/// when it equals its first and its count says so.
+pub(super) fn split_payload(
+    payload: &[u8],
+    streams: &mut [Vec<u8>; PAYLOAD_STREAMS],
+) -> Result<(), String> {
+    let mut reader = Reader::new(payload);
+    let reader = &mut reader;
+    let zoom = reader.u8()?;
+    let flags = reader.u8()?;
+    streams[META].extend_from_slice(&[zoom, flags]);
+    if flags & FLAG_GRID_SIZE != 0 {
+        streams[META].extend_from_slice(reader.take(8)?);
+    }
+    if flags & FLAG_GRID_CELL != 0 {
+        put_varint(&mut streams[META], reader.varint()?);
+        put_varint(&mut streams[META], reader.varint()?);
+    }
+    put_varint(&mut streams[META], reader.varint()?);
+    let kind = reader.u8()?;
+    streams[META].push(kind);
+    match kind {
+        GEOMETRY_POINT => split_path(reader, streams, false)?,
+        GEOMETRY_LINE => {
+            streams[META].push(reader.u8()?);
+            let paths = reader.length()?;
+            put_varint(&mut streams[COUNTS], paths as u64);
+            for _ in 0..paths {
+                split_path(reader, streams, false)?;
+            }
+        }
+        GEOMETRY_POLYGON => {
+            let groups = reader.length()?;
+            put_varint(&mut streams[COUNTS], groups as u64);
+            for _ in 0..groups {
+                split_path(reader, streams, true)?;
+                let holes = reader.length()?;
+                put_varint(&mut streams[COUNTS], holes as u64);
+                for _ in 0..holes {
+                    split_path(reader, streams, true)?;
+                }
+            }
+        }
+        GEOMETRY_FILLED => put_varint(&mut streams[META], reader.varint()?),
+        _ => return Err("Unknown OMT record geometry".into()),
+    }
+    let attrs = reader.length()?;
+    put_varint(&mut streams[ATTR_KEYS_STREAM], attrs as u64);
+    for _ in 0..attrs {
+        let key = reader.u8()?;
+        streams[ATTR_KEYS_STREAM].push(key);
+        if key == KEY_VERBATIM {
+            let len = reader.length()?;
+            put_varint(&mut streams[ATTR_KEYS_STREAM], len as u64);
+            streams[ATTR_KEYS_STREAM].extend_from_slice(reader.take(len)?);
+        }
+        let tag = reader.u8()?;
+        streams[ATTR_KEYS_STREAM].push(tag);
+        let values = &mut streams[ATTR_VALUES];
+        match tag {
+            VALUE_STRING => {
+                let len = reader.length()?;
+                put_varint(values, len as u64);
+                values.extend_from_slice(reader.take(len)?);
+            }
+            VALUE_REPEAT => values.push(reader.u8()?),
+            VALUE_INT | VALUE_UINT => put_varint(values, reader.varint()?),
+            VALUE_DOUBLE => values.extend_from_slice(reader.take(8)?),
+            VALUE_FALSE | VALUE_TRUE => {}
+            _ => return Err("Unknown OMT record attribute value".into()),
+        }
+    }
+    if !reader.is_empty() {
+        return Err("Trailing bytes in OMT record".into());
+    }
+    Ok(())
+}
+
+fn split_path(
+    reader: &mut Reader,
+    streams: &mut [Vec<u8>; PAYLOAD_STREAMS],
+    ring: bool,
+) -> Result<(), String> {
+    let count = reader.length()?;
+    // The last point equals the first when the deltas after the first sum
+    // to zero.
+    let closed = ring && count >= 2 && {
+        let mut ahead = reader.clone();
+        let (mut x, mut y) = (0i64, 0i64);
+        for point in 0..count {
+            let (dx, dy) = (ahead.zigzag()?, ahead.zigzag()?);
+            if point > 0 {
+                x = x.wrapping_add(dx);
+                y = y.wrapping_add(dy);
+            }
+        }
+        x == 0 && y == 0
+    };
+    if ring {
+        put_varint(
+            &mut streams[COUNTS],
+            (count as u64) << 1 | u64::from(closed),
+        );
+    } else {
+        put_varint(&mut streams[COUNTS], count as u64);
+    }
+    for point in 0..count {
+        let (dx, dy) = (reader.varint()?, reader.varint()?);
+        if !(closed && point == count - 1) {
+            put_varint(&mut streams[COORDS], dx);
+            put_varint(&mut streams[COORDS], dy);
+        }
+    }
+    Ok(())
+}
+
+/// Appends the payload whose parts `split_payload` wrote to `streams` (now
+/// being read) to `out`.
+pub(super) fn join_payload(
+    streams: &mut [Reader; PAYLOAD_STREAMS],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let meta = &mut streams[META];
+    let zoom = meta.u8()?;
+    let flags = meta.u8()?;
+    out.extend_from_slice(&[zoom, flags]);
+    if flags & FLAG_GRID_SIZE != 0 {
+        out.extend_from_slice(meta.take(8)?);
+    }
+    if flags & FLAG_GRID_CELL != 0 {
+        put_varint(out, meta.varint()?);
+        put_varint(out, meta.varint()?);
+    }
+    put_varint(out, meta.varint()?);
+    let kind = meta.u8()?;
+    out.push(kind);
+    match kind {
+        GEOMETRY_POINT => join_path(streams, out, false)?,
+        GEOMETRY_LINE => {
+            out.push(streams[META].u8()?);
+            let paths = streams[COUNTS].varint()?;
+            put_varint(out, paths);
+            for _ in 0..paths {
+                join_path(streams, out, false)?;
+            }
+        }
+        GEOMETRY_POLYGON => {
+            let groups = streams[COUNTS].varint()?;
+            put_varint(out, groups);
+            for _ in 0..groups {
+                join_path(streams, out, true)?;
+                let holes = streams[COUNTS].varint()?;
+                put_varint(out, holes);
+                for _ in 0..holes {
+                    join_path(streams, out, true)?;
+                }
+            }
+        }
+        GEOMETRY_FILLED => put_varint(out, streams[META].varint()?),
+        _ => return Err("Unknown OMT record geometry".into()),
+    }
+    let keys = &mut streams[ATTR_KEYS_STREAM];
+    let attrs = keys.length()?;
+    put_varint(out, attrs as u64);
+    for _ in 0..attrs {
+        let keys = &mut streams[ATTR_KEYS_STREAM];
+        let key = keys.u8()?;
+        out.push(key);
+        if key == KEY_VERBATIM {
+            let len = keys.length()?;
+            put_varint(out, len as u64);
+            out.extend_from_slice(keys.take(len)?);
+        }
+        let tag = keys.u8()?;
+        out.push(tag);
+        let values = &mut streams[ATTR_VALUES];
+        match tag {
+            VALUE_STRING => {
+                let len = values.length()?;
+                put_varint(out, len as u64);
+                out.extend_from_slice(values.take(len)?);
+            }
+            VALUE_REPEAT => out.push(values.u8()?),
+            VALUE_INT | VALUE_UINT => put_varint(out, values.varint()?),
+            VALUE_DOUBLE => out.extend_from_slice(values.take(8)?),
+            VALUE_FALSE | VALUE_TRUE => {}
+            _ => return Err("Unknown OMT record attribute value".into()),
+        }
+    }
+    Ok(())
+}
+
+fn join_path(
+    streams: &mut [Reader; PAYLOAD_STREAMS],
+    out: &mut Vec<u8>,
+    ring: bool,
+) -> Result<(), String> {
+    let count = streams[COUNTS].varint()?;
+    let (count, closed) = if ring {
+        (count >> 1, count & 1 == 1)
+    } else {
+        (count, false)
+    };
+    if closed && count < 2 {
+        return Err("Invalid OMT run ring".into());
+    }
+    put_varint(out, count);
+    let coords = &mut streams[COORDS];
+    let (mut x, mut y) = (0i64, 0i64);
+    for point in 0..count - u64::from(closed) {
+        let (dx, dy) = (coords.varint()?, coords.varint()?);
+        put_varint(out, dx);
+        put_varint(out, dy);
+        if point > 0 {
+            x = x.wrapping_add(unzigzag(dx));
+            y = y.wrapping_add(unzigzag(dy));
+        }
+    }
+    if closed {
+        put_zigzag(out, x.wrapping_neg());
+        put_zigzag(out, y.wrapping_neg());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    struct Lcg(u64);
+    /// Random records that reach every corner of the encoding.
+    pub(in crate::omt) struct Lcg(pub(in crate::omt) u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
             self.0 = self
@@ -612,9 +856,16 @@ mod tests {
             }
         }
         fn path(&mut self) -> Vec<TilePoint> {
-            (0..self.below(6))
+            let mut path: Vec<_> = (0..self.below(6))
                 .map(|_| TilePoint::new(self.coordinate(), self.coordinate()))
-                .collect()
+                .collect();
+            // Rings close on their first point, which splitting drops.
+            if self.below(2) == 0
+                && let Some(&first) = path.first()
+            {
+                path.push(first);
+            }
+            path
         }
         fn geometry(&mut self) -> TileGeometry {
             match self.below(4) {
@@ -656,7 +907,7 @@ mod tests {
                 _ => AttrValue::Bool(self.below(2) == 0),
             }
         }
-        fn record(&mut self) -> Record {
+        pub(in crate::omt) fn record(&mut self) -> Record {
             let mut attrs = BTreeMap::new();
             for _ in 0..self.below(8) {
                 let key = if self.below(3) == 0 {
@@ -734,6 +985,55 @@ mod tests {
         for _ in 0..20_000 {
             roundtrip(&random.record());
         }
+    }
+
+    #[test]
+    fn split_payloads_join_byte_for_byte() {
+        let mut rng = Lcg(11);
+        let payloads: Vec<Vec<u8>> = (0..3000).map(|_| roundtrip(&rng.record())).collect();
+        let mut streams: [Vec<u8>; PAYLOAD_STREAMS] = Default::default();
+        for payload in &payloads {
+            split_payload(payload, &mut streams).unwrap();
+        }
+        let mut readers = streams.each_ref().map(|s| Reader::new(s));
+        for payload in &payloads {
+            let mut joined = vec![];
+            join_payload(&mut readers, &mut joined).unwrap();
+            assert_eq!(&joined, payload);
+        }
+        assert!(readers.iter().all(Reader::is_empty));
+        // A closed ring keeps its first point only.
+        let square = [(0, 0), (40, 0), (40, 40), (0, 40), (0, 0)];
+        let mut ring = |points: &[(i32, i32)]| {
+            let mut record = rng.record();
+            record.geometry = TileGeometry::Polygon(vec![TileRingGroup {
+                exterior: points.iter().map(|&(x, y)| TilePoint::new(x, y)).collect(),
+                holes: vec![],
+            }]);
+            let mut streams: [Vec<u8>; PAYLOAD_STREAMS] = Default::default();
+            split_payload(&roundtrip(&record), &mut streams).unwrap();
+            streams[COORDS].len()
+        };
+        assert_eq!(ring(&square), 8);
+        assert_eq!(ring(&square[..4]), 8);
+        assert_eq!(ring(&[(5, 5), (5, 5)]), 2);
+        // Damaged streams are refused, not misread.
+        for stream in 0..PAYLOAD_STREAMS {
+            let mut short = streams.clone();
+            if short[stream].pop().is_some() {
+                let mut readers = short.each_ref().map(|s| Reader::new(s));
+                let joined =
+                    (0..payloads.len()).try_for_each(|_| join_payload(&mut readers, &mut vec![]));
+                assert!(joined.is_err(), "stream {stream}");
+            }
+        }
+        assert!(
+            split_payload(
+                &payloads[0][..payloads[0].len() - 1],
+                &mut Default::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
