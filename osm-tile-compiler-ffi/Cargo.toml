@@ -1,0 +1,29 @@
+[package]
+name = "osm-tile-compiler-ffi"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+rust-version.workspace = true
+description = "A C ABI for osm-tile-compiler: JSON requests run as polled jobs, for iOS, Android and other native hosts"
+readme = "README.md"
+# Not on crates.io until the request types settle with the 0.2 API.
+publish = false
+
+[lib]
+name = "osm_tile_compiler_ffi"
+# staticlib for iOS (an XCFramework) and other static links, cdylib for
+# Android's JNI libraries and dynamic links, rlib for the Rust tests.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The library never installs an allocator; the host's is used.
+osm-tile-compiler = { path = "../osm-tile-compiler", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

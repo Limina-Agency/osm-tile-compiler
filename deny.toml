@@ -36,6 +36,8 @@ allow = [
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"
+# osm-tile-compiler-ffi (publish = false) uses the library by path alone.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

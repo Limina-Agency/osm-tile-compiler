@@ -15,6 +15,7 @@ they don't know. Note every bump in `CHANGELOG.md`.
 | Format | Where it is | Version now | Constant | Pinned by |
 |---|---|---|---|---|
 | Worker protocol | The request JSON a host passes with `--request`, and the JSON lines on stdout, each with `protocolVersion`; error events carry `errorKind`, one of `CompileError::kind`'s identifiers | 1 | `PROTOCOL_VERSION` (`src/main.rs`) | `tests/cli.rs` |
+| C ABI | `osm-tile-compiler-ffi`: the header's functions and `OTC_*` numbers, and the envelope (`abiVersion`), progress, result and error JSON; see `docs/c-abi.md` | 1 | `ABI_VERSION` (`osm-tile-compiler-ffi/src/lib.rs`), `OTC_ABI_VERSION` (the header) | `osm-tile-compiler-ffi/tests/header.rs` |
 | Basemap manifest | `BasemapOutput::manifest()`, written by the worker to the request's `manifestPath`; `format` is `basemap-manifest` | `formatVersion` 1 | `MANIFEST_FORMAT`, `MANIFEST_VERSION` | `tests/formats.rs`, `tests/embedding.rs` |
 | Building-level archives | The PMTiles metadata `{"format":"building-levels","version":1,"source_layer":"building"}` | 1 | `BUILDING_LEVELS_FORMAT`, `BUILDING_LEVELS_VERSION` | `tests/formats.rs`, `src/building_levels.rs`, `tests/building_levels.rs` |
 | Delta archives (experimental) | The files `diff` writes and `apply` reads: the magic `OTCDELTA`, a `u32` version, a JSON manifest whose `format` is `osm-tile-compiler-delta`, then copy, literal and tile patch operations (`src/archive/delta.rs`, `src/archive/tile_patch.rs`) | 1 | `DELTA_FORMAT`, `DELTA_VERSION` | `tests/formats.rs` |

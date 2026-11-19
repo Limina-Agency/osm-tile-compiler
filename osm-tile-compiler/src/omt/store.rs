@@ -1,6 +1,6 @@
 //! Bounded external tile-record sort and OpenMapTiles MVT archive publication.
 use super::record_codec::{
-    LAYER_NAMES, Reader, decode_payload, encode_payload, encode_varint, layer_id, zigzag,
+    LAYER_NAMES, decode_payload, encode_payload, encode_varint, layer_id, zigzag,
 };
 use super::render::Record;
 use super::spill::{RunReader, RunWriter};
@@ -22,14 +22,14 @@ use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 
 const CHUNK_BYTES: usize = 64 * 1024 * 1024;
-const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TILE_BYTES: usize = 256 * 1024 * 1024;
 pub(super) const MERGE_FAN_IN: usize = 128;
 
@@ -231,25 +231,24 @@ fn order(a: &Record, b: &Record) -> Ordering {
         .then_with(|| a.id.cmp(&b.id))
 }
 
-// Private, ephemeral spill format. The magic byte versions it so a stale or
-// malformed run cannot silently be read as the current format.
-const FRAME_MAGIC: u8 = 0xA5;
-// A frame is the magic byte, the header length, the header, then the payload.
-// The header holds the payload length and the sort key as varints.
-const LAYER_VERBATIM: u8 = 0xFF;
-const MAX_LAYER_BYTES: usize = 128;
+// A record's size, for the sort budget and the merge's progress, is that of a
+// frame: a magic byte, the header length, the header, then the payload. The
+// header holds the payload length and the sort key as varints. Run files
+// store records differently (see `spill`).
+pub(super) const LAYER_VERBATIM: u8 = 0xFF;
+pub(super) const MAX_LAYER_BYTES: usize = 128;
 const MAX_HEADER_BYTES: usize = 255;
 
 /// A layer name. The 16 OMT layers are table indices that sort like their
 /// names, so comparing two of them is a byte comparison; any other name is
 /// kept as text and compared as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Layer {
+pub(super) enum Layer {
     Known(u8),
     Other(Box<str>),
 }
 impl Layer {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         layer_id(name).map_or_else(|| Self::Other(name.into()), Self::Known)
     }
     fn name(&self) -> &str {
@@ -273,12 +272,12 @@ impl PartialOrd for Layer {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct SortKey {
-    tile_id: u64,
-    layer: Layer,
-    sort_key: i64,
-    id: u64,
-    seq: Seq,
+pub(super) struct SortKey {
+    pub tile_id: u64,
+    pub layer: Layer,
+    pub sort_key: i64,
+    pub id: u64,
+    pub seq: Seq,
 }
 impl SortKey {
     fn of(record: &Record, seq: Seq) -> Self {
@@ -292,8 +291,8 @@ impl SortKey {
     }
 }
 pub(super) struct EncodedRecord {
-    key: SortKey,
-    payload: Vec<u8>,
+    pub key: SortKey,
+    pub payload: Vec<u8>,
 }
 thread_local! {
     // Payloads are built here, then copied out at their exact size.
@@ -346,7 +345,7 @@ impl EncodedRecord {
         header.varint(u64::from(self.key.seq.record));
         header
     }
-    fn frame_bytes(&self) -> usize {
+    pub(super) fn frame_bytes(&self) -> usize {
         2 + self.header().len + self.payload.len()
     }
 }
@@ -377,77 +376,6 @@ impl Header {
         self.varint(zigzag(value));
     }
 }
-pub(super) fn write_record(writer: &mut impl Write, record: &EncodedRecord) -> Result<(), String> {
-    if record.payload.is_empty() || record.payload.len() > MAX_RECORD_BYTES {
-        return Err("OMT record exceeds bounded frame limit".into());
-    }
-    if let Layer::Other(name) = &record.key.layer
-        && name.len() > MAX_LAYER_BYTES
-    {
-        return Err("OMT record exceeds bounded frame limit".into());
-    }
-    let header = record.header();
-    writer
-        .write_all(&[FRAME_MAGIC, header.len as u8])
-        .and_then(|_| writer.write_all(&header.bytes[..header.len]))
-        .and_then(|_| writer.write_all(&record.payload))
-        .map_err(|e| e.to_string())
-}
-pub(super) fn read_record(reader: &mut impl Read) -> Result<Option<EncodedRecord>, String> {
-    let mut prefix = [0u8; 2];
-    match reader.read_exact(&mut prefix[..1]) {
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.to_string()),
-        Ok(()) => {}
-    }
-    if prefix[0] != FRAME_MAGIC {
-        return Err("Unsupported OMT spill frame version".into());
-    }
-    reader
-        .read_exact(&mut prefix[1..])
-        .map_err(|e| format!("Truncated OMT frame header: {e}"))?;
-    let mut bytes = [0u8; MAX_HEADER_BYTES];
-    let bytes = &mut bytes[..usize::from(prefix[1])];
-    reader
-        .read_exact(bytes)
-        .map_err(|e| format!("Truncated OMT frame header: {e}"))?;
-    let mut header = Reader::new(bytes);
-    let size = usize::try_from(header.varint()?).unwrap_or(usize::MAX);
-    if size == 0 || size > MAX_RECORD_BYTES {
-        return Err("OMT record exceeds bounded record limit".into());
-    }
-    let tile_id = header.varint()?;
-    let layer = match header.u8()? {
-        LAYER_VERBATIM => Layer::new(header.str()?),
-        id if usize::from(id) < LAYER_NAMES.len() => Layer::Known(id),
-        _ => return Err("Unknown OMT frame layer".into()),
-    };
-    let sort_key = header.zigzag()?;
-    let id = header.varint()?;
-    let seq = Seq {
-        source: header.varint()?,
-        feature: u32::try_from(header.varint()?).map_err(|e| e.to_string())?,
-        record: u32::try_from(header.varint()?).map_err(|e| e.to_string())?,
-    };
-    if !header.is_empty() {
-        return Err("Trailing bytes in OMT frame header".into());
-    }
-    let mut payload = vec![0; size];
-    reader
-        .read_exact(&mut payload)
-        .map_err(|e| format!("Truncated OMT frame payload: {e}"))?;
-    Ok(Some(EncodedRecord {
-        key: SortKey {
-            tile_id,
-            layer,
-            sort_key,
-            id,
-            seq,
-        },
-        payload,
-    }))
-}
-
 /// One worker's in-memory run buffer. Full buffers are sorted and spilled to
 /// run files by the owning thread; unfinished runs are deleted on drop.
 pub(super) struct Sorter {
@@ -484,7 +412,7 @@ impl Sorter {
         let mut writer = RunWriter::create(&path)?;
         self.runs.push(path);
         for record in &self.buffer {
-            write_record(&mut writer, record)?;
+            writer.write(record)?;
         }
         let spilled = writer.finish()?;
         self.spilled.fetch_add(spilled, AtomicOrdering::Relaxed);
@@ -728,7 +656,7 @@ fn merge_groups(
     let merge_group = |group: usize| -> Result<(), String> {
         let batch = &runs[group * MERGE_FAN_IN..((group + 1) * MERGE_FAN_IN).min(runs.len())];
         let mut writer = RunWriter::create(&outputs[group])?;
-        merge_controlled(batch, control, |record| write_record(&mut writer, &record))?;
+        merge_controlled(batch, control, |record| writer.write(&record))?;
         writer.finish().map(drop)
     };
     let results = std::thread::scope(|scope| {
@@ -974,7 +902,7 @@ fn merge_controlled(
         .collect::<Result<Vec<_>, _>>()?;
     let mut heap = BinaryHeap::new();
     for (index, reader) in readers.iter_mut().enumerate() {
-        if let Some(record) = read_record(reader)? {
+        if let Some(record) = reader.next()? {
             heap.push(Reverse(Head {
                 record,
                 reader: index,
@@ -990,7 +918,7 @@ fn merge_controlled(
             control.check()?;
         }
         emit(head.record)?;
-        if let Some(record) = read_record(&mut readers[head.reader])? {
+        if let Some(record) = readers[head.reader].next()? {
             heap.push(Reverse(Head {
                 record,
                 reader: head.reader,
@@ -2997,10 +2925,7 @@ mod tests {
                 known.is_some(),
                 super::super::LAYERS.contains(&name.as_str())
             );
-            let mut bytes = vec![];
-            write_record(&mut bytes, &encoded).unwrap();
-            assert_eq!(bytes.len(), encoded.frame_bytes());
-            // The frame spelled out byte by byte.
+            // The frame, whose size the budget counts, spelled out.
             let payload_len = encoded.payload.len();
             assert!(payload_len < 128);
             let mut header = vec![payload_len as u8, 42];
@@ -3012,11 +2937,10 @@ mod tests {
                 }
             }
             header.extend([17, 17, 4, 5, 6]);
-            let mut expected = vec![FRAME_MAGIC, header.len() as u8];
-            expected.extend(header);
-            expected.extend_from_slice(&encoded.payload);
-            assert_eq!(bytes, expected);
-            let replayed = read_record(&mut bytes.as_slice()).unwrap().unwrap();
+            assert_eq!(encoded.frame_bytes(), 2 + header.len() + payload_len);
+            let mut replayed = read_run(&run_bytes(&[&encoded])).unwrap();
+            assert_eq!(replayed.len(), 1);
+            let replayed = replayed.pop().unwrap();
             assert_eq!(replayed.key, encoded.key);
             assert_eq!(
                 matches!(replayed.key.layer, Layer::Known(_)),
@@ -3305,43 +3229,41 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn opaque_frames_reject_truncation_bounds_and_corruption() {
-        let encoded = EncodedRecord::encode(&record(1), seq(0)).unwrap();
-        let mut bytes = vec![];
-        write_record(&mut bytes, &encoded).unwrap();
-        assert_eq!(bytes.len(), encoded.frame_bytes());
-        assert!(read_record(&mut &bytes[..0]).unwrap().is_none());
-        for end in 1..bytes.len() {
-            assert!(read_record(&mut &bytes[..end]).is_err(), "prefix {end}");
+    fn run_bytes(records: &[&EncodedRecord]) -> Vec<u8> {
+        let mut writer = RunWriter::new(vec![]).unwrap();
+        for record in records {
+            writer.write(record).unwrap();
         }
-        let mut invalid = bytes.clone();
-        invalid[0] = 0;
-        assert!(read_record(&mut invalid.as_slice()).is_err());
-        // The first header byte is the payload size (one byte here).
-        let mut invalid = bytes.clone();
-        invalid[2] = 0;
-        assert!(read_record(&mut invalid.as_slice()).is_err());
-        let too_large = [FRAME_MAGIC, 5, 0x80, 0x80, 0x80, 0x80, 0x01];
-        assert!(read_record(&mut &too_large[..]).is_err());
-        // Then the tile id, then the layer.
-        let mut invalid = bytes.clone();
-        invalid[4] = LAYER_NAMES.len() as u8;
-        assert!(read_record(&mut invalid.as_slice()).is_err());
-        let header_len = usize::from(bytes[1]);
-        let mut invalid = bytes.clone();
-        invalid.insert(2 + header_len, 0);
-        invalid[1] += 1;
-        assert!(read_record(&mut invalid.as_slice()).is_err());
-        // The payload starts with the zoom, then the flags.
-        let mut invalid = bytes.clone();
-        invalid[2 + header_len + 1] = 0xf8;
-        assert!(
-            read_record(&mut invalid.as_slice())
-                .unwrap()
-                .unwrap()
-                .decode()
-                .is_err()
+        writer.into_inner()
+    }
+    fn read_run(bytes: &[u8]) -> Result<Vec<EncodedRecord>, String> {
+        let mut reader = RunReader::new(bytes);
+        let mut records = vec![];
+        while let Some(record) = reader.next()? {
+            records.push(record);
+        }
+        Ok(records)
+    }
+    #[test]
+    fn runs_reject_truncation_and_bad_payloads() {
+        let encoded = EncodedRecord::encode(&record(1), seq(0)).unwrap();
+        let bytes = run_bytes(&[&encoded]);
+        assert_eq!(read_run(&bytes).unwrap()[0].payload, encoded.payload);
+        // A run cut after its magic, between blocks, reads as empty.
+        for end in (0..bytes.len()).filter(|&end| end != 4) {
+            assert!(read_run(&bytes[..end]).is_err(), "prefix {end}");
+        }
+        let mut writer = RunWriter::new(vec![]).unwrap();
+        let mut bad = EncodedRecord::encode(&record(1), seq(0)).unwrap();
+        bad.payload[0] ^= 0xff;
+        bad.payload.truncate(3);
+        assert!(writer.write(&bad).is_err());
+        bad.payload.clear();
+        assert!(writer.write(&bad).is_err());
+        writer.write(&encoded).unwrap();
+        assert_eq!(
+            read_run(&writer.into_inner()).unwrap()[0].payload,
+            encoded.payload
         );
         let mut trailing = EncodedRecord::encode(&record(1), seq(0)).unwrap();
         trailing.payload.push(0);
@@ -3372,7 +3294,7 @@ mod tests {
         for (index, runs) in store.runs.chunks(3).enumerate() {
             let path = temp.path().join(format!("merge-{index}"));
             let mut writer = RunWriter::create(&path).unwrap();
-            merge(runs, |r| write_record(&mut writer, &r)).unwrap();
+            merge(runs, |r| writer.write(&r)).unwrap();
             writer.finish().unwrap();
             intermediate.push(path);
         }
@@ -3700,14 +3622,9 @@ mod tests {
     }
     #[test]
     fn previous_record_schema_is_rejected_before_payload_decode() {
-        let mut bytes = vec![];
-        write_record(
-            &mut bytes,
-            &EncodedRecord::encode(&record(1), seq(0)).unwrap(),
-        )
-        .unwrap();
-        bytes[0] = b'O';
-        assert!(read_record(&mut bytes.as_slice()).is_err());
+        let mut bytes = run_bytes(&[&EncodedRecord::encode(&record(1), seq(0)).unwrap()]);
+        bytes[3] = b'1';
+        assert!(read_run(&bytes).is_err());
     }
     #[test]
     fn default_group_ranks_continue_when_density_grid_is_disabled() {
@@ -3794,15 +3711,10 @@ mod tests {
         let mut r = record(1);
         r.attrs
             .insert("class".into(), AttrValue::String("cafe".into()));
-        let mut bytes = vec![];
-        write_record(&mut bytes, &EncodedRecord::encode(&r, seq(0)).unwrap()).unwrap();
-        let got = read_record(&mut bytes.as_slice())
-            .unwrap()
-            .unwrap()
-            .decode()
-            .unwrap();
+        let bytes = run_bytes(&[&EncodedRecord::encode(&r, seq(0)).unwrap()]);
+        let got = read_run(&bytes).unwrap().pop().unwrap().decode().unwrap();
         assert_eq!(got.attrs, r.attrs);
-        assert!(read_record(&mut &bytes[..bytes.len() - 1]).is_err());
+        assert!(read_run(&bytes[..bytes.len() - 1]).is_err());
     }
     #[test]
     fn density_applies_order_and_adds_rank() {

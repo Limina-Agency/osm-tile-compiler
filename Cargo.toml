@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["osm-tile-compiler"]
+members = ["osm-tile-compiler", "osm-tile-compiler-ffi"]
 
 [workspace.package]
 version = "0.1.3"
