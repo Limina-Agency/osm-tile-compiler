@@ -88,6 +88,35 @@ directory (scratch and partial archive), both sampled every 0.25 s.
   (64 KiB of memory for each run a merge has open) stay.
 - 16 threads were not measured here.
 
+### Columnar sort runs
+
+Measured on 2026-11-19 on the same kind of cloud VM (4 vCPUs, 15 GiB, ext4),
+command line (mimalloc), `--omit-sources all`, Małopolskie (2026-11-18,
+194 MiB), this time with the packed node store of `osm-pbf-ingest` 0.3. Each
+figure is the median of three runs, interleaved; scratch disk is the output's
+directory, sampled every 0.1 s.
+
+| Build | Threads | Time | Peak scratch disk | Sort runs |
+|---|---|---|---|---|
+| 0.1.3 | 2 | 52.8 s | 369 MiB (2.0×) | 225 MiB |
+| Columnar sort runs | 2 | 52.5 s | 312 MiB (1.7×) | 168 MiB |
+| 0.1.3 | 4 | 29.3 s | 369 MiB (2.0×) | 225 MiB |
+| Columnar sort runs | 4 | 29.9 s | 312 MiB (1.7×) | 168 MiB |
+
+- Every run wrote the same archive, byte for byte (146 MiB).
+- 0.1.3 already peaked at 2.0 times the extract, not 3.0: the node store is
+  146 MiB, not 370. The peak is at the end of `read_osm` (node store and
+  runs) and, about as high, at the end of `write_tiles` (runs and archive).
+- The runs hold 535 MiB of records as frames. zstd on the frame stream made
+  that 225 MiB (2.4×); the columnar blocks make it 168 MiB (3.2×). A block
+  spreads its records over seven streams, each its own zstd frame: sort keys
+  and insertion sequences as deltas from the previous record, then the
+  payload's fixed fields, counts, coordinates, attribute keys and attribute
+  values. A polygon ring's last point, always its first again, is left out.
+- What is left is mostly coordinates, which zstd barely shrinks (138 MiB of
+  varints to 118 MiB, before closing points were left out). Splitting x from y, or low from high bytes, saved under 2%;
+  256 KiB blocks save 2.5% and cost each open reader four times the memory.
+
 ## Building levels
 
 Measured on 2026-11-19 on the cloud VM of "Scratch disk" (4 vCPUs, 15 GiB),
