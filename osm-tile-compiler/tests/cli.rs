@@ -301,7 +301,10 @@ async fn compiles_monaco_into_a_valid_archive() {
     );
     assert!(scratch.join("node-store.bin").exists());
     // One left by an interrupted compile, and an archive it was writing, are
-    // cleared and reused.
+    // cleared and reused. Unlock rather than only close: a process another
+    // test spawns at the same moment can inherit a duplicate of this
+    // descriptor until it execs, and that duplicate keeps an flock held.
+    marker.unlock().unwrap();
     drop(marker);
     let abandoned = temp.path().join("out/monaco.pmtiles.1.partial");
     std::fs::write(&abandoned, b"half an archive").unwrap();
