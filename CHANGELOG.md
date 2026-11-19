@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 (2026-11-19)
 
 - The disk node store (about twice the extract, 370 MiB for Małopolskie) is
   deleted as soon as OSM is read instead of when the compile ends, and on a
@@ -21,6 +21,21 @@
   read; lower zooms show only what lies near the area. Off by default, which
   leaves every archive as it was. Code that builds `OpenMapTilesRequest`
   field by field needs `area_only: false`.
+
+- OSM is read with `osm-pbf-ingest` 0.3, whose packed node store keeps the
+  node locations of a file sorted by ID in 146 MiB instead of 370 MiB for
+  Małopolskie, with no spill or sort. An area-only compile also skips the node
+  blobs and drops the ways outside the area before decoding their tags. On
+  four threads, an area-only compile of the Tatras takes 2.5 s instead of
+  4.4 s, and the whole Małopolskie extract takes 26.4 s instead of 29.8 s,
+  with peak memory 608 MiB instead of 895 MiB and peak scratch disk 666 MiB
+  instead of 904 MiB. The tiles are unchanged.
+- Experimental delta archives: `diff OLD.pmtiles NEW.pmtiles --output
+  FILE.delta` writes what turns one archive into the next, and `apply
+  OLD.pmtiles FILE.delta --output NEW.pmtiles` rebuilds the new one byte for
+  byte. Both archives' SHA-256 are checked, and a failed apply leaves nothing
+  behind. 11 hours of OSM edits to Małopolskie make a 63 kB delta for a
+  153 MB archive.
 
 ## 0.1.2 (2026-11-17)
 
