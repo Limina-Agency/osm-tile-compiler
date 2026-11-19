@@ -2,7 +2,18 @@
 
 1. Run `scripts/check.sh` and the Planetiler comparison in
    `benchmarks/compiler-parity/` on a quiet machine against the previous release.
-2. Bump the workspace version and update `CHANGELOG.md`.
+2. Bump the workspace version and write the release's `CHANGELOG.md`
+   section. Pull requests do not edit `CHANGELOG.md`; the section is
+   drafted from the commits since the previous tag with
+   [git-cliff](https://git-cliff.org) and `cliff.toml`:
+
+   ```sh
+   git cliff --unreleased --tag v<version> --prepend CHANGELOG.md
+   ```
+
+   Then edit the draft into the changelog's usual prose: what changed for
+   users, measurements, and what code that uses the library needs to change.
+   Commit it with the version bump.
 3. Tag `v<version>` and push the tag. The release workflow refuses a tag that does
    not match the crate version, runs the CI checks, then builds the compiler
    binary for Linux (x86_64 and arm64), macOS (arm64 and x86_64) and Windows
