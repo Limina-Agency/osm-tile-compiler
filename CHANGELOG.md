@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The disk node store (about twice the extract, 370 MiB for Małopolskie) is
+  deleted as soon as OSM is read instead of when the compile ends, and on a
+  failed or cancelled compile too. Peak scratch disk for Małopolskie drops
+  from 1049 to 890 MiB (5.4 to 4.6 times the extract), and the peak moves
+  from `write_tiles` to the end of `read_osm`. Time, memory and tiles are
+  unchanged.
+
 ## 0.1.2 (2026-11-17)
 
 - OSM is read with `osm-pbf-ingest` 0.2, which no longer depends on
