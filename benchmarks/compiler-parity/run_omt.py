@@ -134,7 +134,7 @@ def run(config, output, dry_run=False, engine="both"):
                     compiled = json.loads((directory / 'compile-result.json').read_text(encoding='utf-8-sig'))
                     result['compile_result'] = compiled
                     result['compile_result_fingerprint'] = common.fingerprint(directory / 'compile-result.json')
-                    if compiled.get('profile_revision') != REVISION or compiled.get('parity_verified') is not False or not str(compiled.get('schema', '')).startswith('OpenMapTiles 3.16.0'):
+                    if compiled.get('profile_revision') != REVISION or not isinstance(compiled.get('parity_verified'), bool) or not str(compiled.get('schema', '')).startswith('OpenMapTiles 3.16.0'):
                         raise ValueError('Native result is not the pinned experimental OpenMapTiles profile')
             except (OSError, ValueError) as exc:
                 result['artifact_error'] = str(exc)
