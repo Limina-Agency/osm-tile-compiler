@@ -62,10 +62,14 @@ jobs:
         with:
           command: check
 
-  # The library as an iOS app links it: device and simulator, without the
-  # binary's allocator.
+  # The C ABI as an iOS app links it (a static library): device and
+  # simulator, with the library built without the binary's allocator.
   ios:
     runs-on: macos-15
+    env:
+      # Rust links for iOS 10 by default, but the C build scripts compile for
+      # the SDK's newest iOS and call ___chkstk_darwin (iOS 13 and later).
+      IPHONEOS_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
@@ -74,11 +78,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: |
           for target in aarch64-apple-ios aarch64-apple-ios-sim; do
-            cargo build --locked --lib -p osm-tile-compiler --no-default-features --target "$target"
+            cargo build --locked --lib -p osm-tile-compiler-ffi --target "$target"
           done
 
-  # The library as an Android app links it, for the ABIs phones and the
-  # emulator use. cargo-ndk points the C build scripts (SQLite, ring, zstd)
+  # The C ABI as an Android app links it (a shared and a static library),
+  # for the ABIs phones and the emulator use. cargo-ndk points the C build scripts (SQLite, ring, zstd)
   # at the NDK's compilers.
   android:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -97,7 +101,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
-            build --locked --lib -p osm-tile-compiler --no-default-features
+            build --locked --lib -p osm-tile-compiler-ffi
 
   # On a pull request, the library's public API changes against the base
   # branch, as semver classifies them, in the job summary. A change that

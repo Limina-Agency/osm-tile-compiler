@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The CI checks, run locally: formatting, clippy, Rust tests and the benchmark
-# harness's Python tests.
+# The CI checks, run locally: formatting, clippy, Rust tests, the C ABI from a
+# C host and the benchmark harness's Python tests.
 #
 #   scripts/check.sh
 #
@@ -21,6 +21,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 step "tests"
 cargo test --workspace --locked
+
+step "C ABI from C"
+scripts/check-c-abi.sh
 
 step "benchmark harness tests"
 venv=target/benchmark-venv
