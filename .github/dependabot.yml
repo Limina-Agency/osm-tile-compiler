@@ -1,0 +1,49 @@
+# Weekly dependency updates. `scripts/check.sh` is the check to run on each.
+#
+# Cargo patch bumps come grouped in one pull request. Minor bumps come one per
+# crate: Dependabot counts 0.7 -> 0.8 as minor, and for most of our 0.x
+# dependencies (fast-mvt, pmtiles, rusqlite, i_overlay) that is the breaking
+# change that needs code, so it should not hold back the rest of a group.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      cargo-patch:
+        update-types: [patch]
+    ignore:
+      # A dev-dependency on purpose: tests check the store's group keys are the
+      # bytes bincode 1 wrote for them.
+      - dependency-name: bincode
+        update-types: [version-update:semver-major]
+
+  # Actions are pinned by commit; Dependabot bumps the hash and the version
+  # comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # The benchmark harness's Python dependencies (pinned versions).
+  - package-ecosystem: pip
+    directory: /benchmarks/compiler-parity
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore
+    groups:
+      benchmark-python:
+        patterns: ["*"]
