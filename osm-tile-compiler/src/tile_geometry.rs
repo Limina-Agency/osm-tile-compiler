@@ -168,7 +168,7 @@ mod tests {
         let reader = MvtReaderRef::new(&tile).unwrap();
         let layer = reader.layers().next().unwrap();
         let feature = layer.features().next().unwrap();
-        Some(feature.geometry_commands().to_vec())
+        Some(feature.geometry_commands().collect())
     }
 
     fn zigzag(value: i32) -> u32 {

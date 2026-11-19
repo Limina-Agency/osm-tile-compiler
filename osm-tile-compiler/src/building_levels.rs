@@ -550,9 +550,8 @@ fn parse_feature(
     Some(())
 }
 
-fn parse_rings(commands: &[u32], scale: f32) -> Option<Vec<Ring>> {
+fn parse_rings(mut commands: impl Iterator<Item = u32>, scale: f32) -> Option<Vec<Ring>> {
     let unzigzag = |value: u32| (value >> 1) as i32 ^ -((value & 1) as i32);
-    let mut commands = commands.iter().copied();
     let (mut x, mut y) = (0_i32, 0_i32);
     let (mut rings, mut ring) = (Vec::new(), Vec::new());
     while let Some(command) = commands.next() {
