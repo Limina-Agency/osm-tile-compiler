@@ -637,9 +637,9 @@ impl Index {
     /// its nodes outside the area, so no source and no junction inside the
     /// area comes from it. Ways that `ways` skips anyway stay, for its tally.
     fn outside_area(&self, way: &WayRef<'_>) -> bool {
-        if self.area.is_none() {
+        let Some(area) = &self.area else {
             return false;
-        }
+        };
         let polygon_member = self
             .prepared
             .multipolygon_way_ids
@@ -648,15 +648,40 @@ impl Index {
         if skip_way_geometry(way.tags.is_empty(), parents.is_empty(), polygon_member)
             || polygon_member
             || self.has_boundary_parent(parents)
-            || self
-                .prepared
-                .node_store
-                .may_touch(way.node_ids, &self.area_boxes)
+            || self.may_touch_area(area, way.node_ids)
         {
             return false;
         }
         self.outside_ways.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    /// Whether the way may reach the area: false only when the boxes of the
+    /// node store's blocks place the nodes it holds outside, or when the
+    /// store holds every node and their extent misses the area, the test
+    /// `ways` applies. A way with a node the store lacks stays, so that
+    /// `ways` counts it as missing just as a full read does.
+    fn may_touch_area(&self, area: &InputArea, node_ids: &[i64]) -> bool {
+        let store = &self.prepared.node_store;
+        if !store.may_touch(node_ids, &self.area_boxes) {
+            return false;
+        }
+        // The block boxes are loose in an extract, whose consecutive node IDs
+        // are scattered over the region: for a city they let through about a
+        // third of a region's ways. Looking the nodes up costs little next to
+        // turning those ways into sources only for `ways` to drop them.
+        let mut nodes = store.cursor();
+        let mut extent = Extent::EMPTY;
+        for &id in node_ids {
+            let Some((lat, lng)) = nodes.get(id) else {
+                return true;
+            };
+            if area.contains(lat, lng) {
+                return true;
+            }
+            extent.add(lat, lng);
+        }
+        area.intersects(&extent)
     }
 
     fn node_in_area(&self, node: &NormalizedNode) -> bool {
