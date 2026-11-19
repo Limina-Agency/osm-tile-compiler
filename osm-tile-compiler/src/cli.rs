@@ -5,11 +5,11 @@
 use osm_tile_compiler::{
     ArchiveCenter, BasemapRequest, BuildingLevelsReport, CompileBounds, CompileError, CompileStage,
     ExtractEvent, FetchEvent, FetchMode, SourcesPolicy, SupplementalDataset,
-    building_levels_path, compile_basemap, fetch_extract, fetch_sources as fetch_datasets,
     archive::{
         ArchiveOptions, ArchiveReport,
         delta::{self, DeltaManifest},
     },
+    building_levels_path, compile_basemap, fetch_extract, fetch_sources as fetch_datasets,
     omt::{LANGUAGES, LAYERS, resolve_languages, select_layers},
     tile_stats::kib,
     write_building_levels,
