@@ -2,6 +2,25 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// On Linux, mimalloc commits its arenas eagerly (the OS overcommits) and
+/// then purges freed pages by resetting them, which leaves them counted as
+/// resident until the system needs the memory. Committing on demand lets a
+/// purge decommit, so freed memory leaves the RSS. The option only affects
+/// arenas reserved after it is set, so it is set before main, ahead of the
+/// first allocation.
+#[cfg(all(feature = "mimalloc", any(target_os = "linux", target_os = "android")))]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static TUNE_ALLOCATOR: extern "C" fn() = {
+    extern "C" fn tune() {
+        /// `mi_option_arena_eager_commit` in mimalloc.h.
+        const ARENA_EAGER_COMMIT: libmimalloc_sys::mi_option_t = 4;
+        // SAFETY: setting an option has no preconditions.
+        unsafe { libmimalloc_sys::mi_option_set(ARENA_EAGER_COMMIT, 0) };
+    }
+    tune
+};
+
 mod cli;
 mod interrupt;
 use osm_tile_compiler::{
