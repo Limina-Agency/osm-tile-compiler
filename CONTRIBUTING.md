@@ -7,6 +7,12 @@ Issues and pull requests are welcome.
   `fixtures/README.md`), says why in the pull request, and states its effect
   against Planetiler with `benchmarks/compiler-parity/` (see its README). A
   change that is not meant to alter the output leaves that file untouched.
+- Pull requests leave `CHANGELOG.md` alone: it is written at release time
+  from the commits (see `RELEASING.md`). Start commit subjects with a
+  conventional prefix (`feat:`, `fix:`, `perf:`, `docs:`, `chore:`, `ci:`,
+  `test:`, `refactor:`; add `!` for a breaking change, as in `feat!:`) and
+  put what users should know in the commit body, which the release notes
+  are written from.
 - Contributions are licensed under the Apache License, Version 2.0, as the
   license's section 5 describes.
 

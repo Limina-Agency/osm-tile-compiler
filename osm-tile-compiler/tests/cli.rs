@@ -1,7 +1,7 @@
 //! Runs the built `osm-tile-compiler` binary: the command line's usage
 //! handling, a real `compile` of `fixtures/monaco.osm.pbf` against synthetic
-//! supplemental inputs, the `style` it is drawn with, and the desktop worker
-//! protocol's argument errors.
+//! supplemental inputs, the `style` it is drawn with, a delta between two
+//! compiles, and the desktop worker protocol's argument errors.
 
 mod common;
 
@@ -135,6 +135,17 @@ fn usage_errors_exit_with_2() {
         (&["inspect"], "inspect needs an archive"),
         (&["verify", "a", "b"], "verify takes one archive"),
         (&["verify", "a", "--frob"], "unknown verify option '--frob'"),
+        (&["diff", "a", "--output", "d"], "diff takes two files"),
+        (&["diff", "a", "b"], "diff needs --output"),
+        (
+            &["apply", "a", "b", "c", "-o", "d"],
+            "apply takes two files",
+        ),
+        (&["apply", "a", "b", "--output"], "--output needs a value"),
+        (
+            &["apply", "a", "b", "--frob"],
+            "unknown apply option '--frob'",
+        ),
         (
             &["compile", "in.pbf", "--gzip-level", "10"],
             "--gzip-level must be 0-9",
@@ -465,6 +476,73 @@ async fn compiles_monaco_into_a_valid_archive() {
         "{}",
         text(&again.stderr)
     );
+}
+
+#[test]
+fn diff_and_apply_rebuild_a_compiled_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let pbf = monaco_pbf();
+    let compile = |output: &std::path::Path, extra: &[&str]| {
+        let mut args = vec![
+            "compile".as_ref(),
+            pbf.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+            "--omit-sources".as_ref(),
+            "all".as_ref(),
+            "--max-zoom".as_ref(),
+            "12".as_ref(),
+        ];
+        args.extend(extra.iter().map(OsStr::new));
+        let output = run(args);
+        assert!(output.status.success(), "{output:?}");
+    };
+    let (old, new) = (path("old.pmtiles"), path("new.pmtiles"));
+    compile(&old, &["--exclude-layers", "poi"]);
+    compile(&new, &[]);
+
+    let delta = path("update.delta");
+    let output = run([
+        "diff".as_ref(),
+        old.as_os_str(),
+        new.as_os_str(),
+        "--output".as_ref(),
+        delta.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["format"], "osm-tile-compiler-delta");
+    assert!(report["copied_bytes"].as_u64().unwrap() > 0, "{report}");
+    assert!(report["tiles"]["changed"].as_u64().unwrap() > 0, "{report}");
+
+    let rebuilt = path("rebuilt.pmtiles");
+    let output = run([
+        "apply".as_ref(),
+        old.as_os_str(),
+        delta.as_os_str(),
+        "-o".as_ref(),
+        rebuilt.as_os_str(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read(&rebuilt).unwrap(),
+        std::fs::read(&new).unwrap()
+    );
+
+    // Applied to the wrong archive, it fails and writes nothing.
+    let wrong = path("wrong.pmtiles");
+    let output = run([
+        "apply".as_ref(),
+        new.as_os_str(),
+        delta.as_os_str(),
+        "-o".as_ref(),
+        wrong.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(text(&output.stderr).contains("is not the archive this delta applies to"));
+    assert!(!wrong.exists());
 }
 
 #[test]

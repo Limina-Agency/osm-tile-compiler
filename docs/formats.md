@@ -17,6 +17,7 @@ they don't know. Note every bump in `CHANGELOG.md`.
 | Worker protocol | The request JSON a host passes with `--request`, and the JSON lines on stdout, each with `protocolVersion`; error events carry `errorKind`, one of `CompileError::kind`'s identifiers | 1 | `PROTOCOL_VERSION` (`src/main.rs`) | `tests/cli.rs` |
 | Basemap manifest | `BasemapOutput::manifest()`, written by the worker to the request's `manifestPath`; `format` is `basemap-manifest` | `formatVersion` 1 | `MANIFEST_FORMAT`, `MANIFEST_VERSION` | `tests/formats.rs`, `tests/embedding.rs` |
 | Building-level archives | The PMTiles metadata `{"format":"building-levels","version":1,"source_layer":"building"}` | 1 | `BUILDING_LEVELS_FORMAT`, `BUILDING_LEVELS_VERSION` | `tests/formats.rs`, `src/building_levels.rs`, `tests/building_levels.rs` |
+| Delta archives (experimental) | The files `diff` writes and `apply` reads: the magic `OTCDELTA`, a `u32` version, a JSON manifest whose `format` is `osm-tile-compiler-delta`, then copy, literal and tile patch operations (`src/archive/delta.rs`, `src/archive/tile_patch.rs`) | 1 | `DELTA_FORMAT`, `DELTA_VERSION` | `tests/formats.rs` |
 | Supplemental caches | `<sources>/.extracted/<archive>/.complete` and `<database>.geometry-counts`, each led by a stamp `v<version> <size> <mtime-ns>` | 1 | `CACHE_VERSION` (`src/omt/supplements.rs`) | its unit test |
 | Benchmark reports | `format_version` in the harness's JSON reports and manifests | 1 | in each script | none (internal tooling) |
 

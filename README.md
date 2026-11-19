@@ -237,6 +237,36 @@ directories, entry order, clustering, the header's counts) and decodes every
 tile, checking its MVT encoding and that its layers are declared in the
 metadata. Tiles over 1 MiB compressed produce a warning at compile time.
 
+## Updating archives in the field (experimental)
+
+A device that already holds an archive can update to a newer compile by
+downloading only what changed:
+
+```sh
+osm-tile-compiler diff old.pmtiles new.pmtiles --output update.delta    # on the server
+osm-tile-compiler apply old.pmtiles update.delta --output new.pmtiles   # on the device
+```
+
+`apply` rebuilds `new.pmtiles` byte for byte. Every part of the new archive
+(header, directories, metadata, each distinct tile) is copied from the old
+archive, which may hold it anywhere, rebuilt from the old tile at the same
+position and a patch, or carried in the delta. `apply` checks the old
+archive's SHA-256 before it starts and the result's after, and leaves nothing
+behind if either check fails. Both commands read any PMTiles v3 archive;
+patches need tiles stored as this compiler stores them, and other archives
+get a delta without them.
+
+Small edits stay small because compiles are deterministic and an edit
+changes only a little of each tile it touches. Małopolskie (153 MB, zoom 0
+to 14, without the supplemental datasets) compiled before and after 11 hours
+of OpenStreetMap edits gave a 63 kB delta: 245 of its 11,305 tiles changed and
+27 were added. `diff` took 1.4 s and `apply` 0.7 s on a 4-core cloud VM. Recompiling with
+`--languages en` instead, which changes half the tiles, gave a 5.8 MB delta.
+
+The delta format is experimental: a delta applies only with a build that reads
+its version (`docs/formats.md`). From Rust, the same is
+`archive::delta::{diff, apply, read_manifest}`.
+
 ## Using it as a library
 
 `compile_basemap` runs the whole compile in the caller's process: it fetches

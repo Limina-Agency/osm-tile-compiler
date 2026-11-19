@@ -1,12 +1,15 @@
 //! The human command line: `compile`, `building-levels`, `fetch-sources`,
-//! `style`, `help`, `--version`.
+//! `style`, `inspect`, `verify`, `diff`, `apply`, `help`, `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
 //! the version, `--json`). Usage errors exit with 2, failures with 1.
 use osm_tile_compiler::{
     ArchiveCenter, BasemapRequest, BuildingLevelsReport, CompileBounds, CompileError, CompileStage,
     ExtractEvent, FetchEvent, FetchMode, SourcesPolicy, SupplementalDataset,
-    archive::{ArchiveOptions, ArchiveReport},
     building_levels_path, compile_basemap, fetch_extract, fetch_sources as fetch_datasets,
+    archive::{
+        ArchiveOptions, ArchiveReport,
+        delta::{self, DeltaManifest},
+    },
     omt::{LANGUAGES, LAYERS, resolve_languages, select_layers},
     tile_stats::kib,
     write_building_levels,
@@ -36,6 +39,8 @@ Usage:
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
+  osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
+  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler help | --help
   osm-tile-compiler --version";
 
@@ -51,6 +56,8 @@ Usage:
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
+  osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
+  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler help | --help
   osm-tile-compiler --version
 
@@ -69,6 +76,11 @@ Commands:
                    zoom and the largest tiles, and any problems 'verify' finds
   verify           Check a PMTiles archive's layout and every tile's MVT
                    encoding; exits with 1 if anything is wrong
+  diff             Experimental: write a delta that turns OLD.pmtiles into
+                   NEW.pmtiles, carrying only the parts OLD doesn't hold
+  apply            Experimental: rebuild NEW.pmtiles from OLD.pmtiles and a
+                   delta, byte for byte; checks both archives' SHA-256 and
+                   leaves nothing behind on failure
 
 Compile options:
   --area <NAME>         Instead of INPUT.pbf, compile Geofabrik's extract of a
@@ -118,6 +130,12 @@ Compile options:
                         all, '-xx' leaves one out (so 'default,-ru'), and an
                         empty list writes none. name, name_en, name_de,
                         name_int, name:latin and name:nonlatin stay
+
+Diff and apply options:
+  --output <FILE>       File to write; must not exist yet
+  --json                Print the delta's manifest and size as JSON on stdout
+  The delta format is experimental and may change between releases; a delta
+  applies only with a build that reads its version.
 
 Building levels options:
   --threads <N>         Worker threads [default: available cores]; the archive
@@ -192,6 +210,18 @@ enum Command {
     Style(StyleArgs),
     Inspect { archive: PathBuf, json: bool },
     Verify { archive: PathBuf, json: bool },
+    Diff(DeltaArgs),
+    Apply(DeltaArgs),
+}
+
+/// `diff` and `apply`: the old archive, then the new archive (`diff`) or the
+/// delta (`apply`).
+#[derive(Debug)]
+struct DeltaArgs {
+    base: PathBuf,
+    other: PathBuf,
+    output: PathBuf,
+    json: bool,
 }
 
 /// Runs the command line on `args` (without the program name) and returns the
@@ -226,6 +256,8 @@ pub fn main(args: Vec<OsString>) -> i32 {
         }
         Command::Inspect { archive, json } => inspect(&archive, json),
         Command::Verify { archive, json } => verify(&archive, json),
+        Command::Diff(args) => diff(args),
+        Command::Apply(args) => apply(args),
     };
     match result {
         Ok(()) => 0,
@@ -249,6 +281,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("fetch-sources") => parse_fetch_sources(rest),
         Some("style") => parse_style(rest),
         Some(name @ ("inspect" | "verify")) => parse_archive_command(name, rest),
+        Some(name @ ("diff" | "apply")) => parse_delta_command(name, rest),
         _ => Err(format!("unknown command '{}'", first.to_string_lossy())),
     }
 }
@@ -597,6 +630,42 @@ fn parse_archive_command(name: &str, args: &[OsString]) -> Result<Command, Strin
         Command::Inspect { archive, json }
     } else {
         Command::Verify { archive, json }
+    })
+}
+
+fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String> {
+    let mut paths = Vec::new();
+    let mut output = None;
+    let mut json = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match option(arg).as_deref() {
+            Some("--help" | "-h") => return Ok(Command::Help),
+            Some("--json") => json = true,
+            Some("--output" | "-o") => output = Some(PathBuf::from(value(&mut args, "--output")?)),
+            Some(flag) => return Err(format!("unknown {name} option '{flag}'")),
+            None => paths.push(PathBuf::from(arg)),
+        }
+    }
+    let second = if name == "diff" {
+        "NEW.pmtiles"
+    } else {
+        "FILE.delta"
+    };
+    let [base, other]: [PathBuf; 2] = paths
+        .try_into()
+        .map_err(|_| format!("{name} takes two files: OLD.pmtiles and {second}"))?;
+    let output = output.ok_or_else(|| format!("{name} needs --output"))?;
+    let args = DeltaArgs {
+        base,
+        other,
+        output,
+        json,
+    };
+    Ok(if name == "diff" {
+        Command::Diff(args)
+    } else {
+        Command::Apply(args)
     })
 }
 
@@ -1144,6 +1213,63 @@ fn verify(path: &Path, json: bool) -> Result<(), String> {
             String::new()
         }
     ))
+}
+
+fn delta_summary(manifest: &DeltaManifest, delta_bytes: u64) -> String {
+    let megabytes = |bytes: u64| {
+        if bytes < 1_000_000 {
+            format!("{:.1} kB", bytes as f64 / 1e3)
+        } else {
+            megabytes(bytes)
+        }
+    };
+    let tiles = &manifest.tiles;
+    format!(
+        "{} delta for a {} archive ({} copied from the old one, {} tiles patched); tiles: {} changed, {} added, {} removed, {} unchanged",
+        megabytes(delta_bytes),
+        megabytes(manifest.target.bytes),
+        megabytes(manifest.copied_bytes),
+        manifest.patched_tiles,
+        tiles.changed,
+        tiles.added,
+        tiles.removed,
+        tiles.unchanged
+    )
+}
+
+fn diff(args: DeltaArgs) -> Result<(), String> {
+    let report = delta::diff(&args.base, &args.other, &args.output)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        eprintln!(
+            "Wrote {}: {}",
+            args.output.display(),
+            delta_summary(&report.manifest, report.delta_bytes)
+        );
+    }
+    Ok(())
+}
+
+fn apply(args: DeltaArgs) -> Result<(), String> {
+    let report = delta::apply(&args.base, &args.other, &args.output)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        eprintln!(
+            "Wrote {} (SHA-256 {}): {}",
+            args.output.display(),
+            report.manifest.target.sha256,
+            delta_summary(&report.manifest, report.delta_bytes)
+        );
+    }
+    Ok(())
 }
 
 /// `inspect`'s text: the header, metadata, size statistics and problems.
