@@ -16,7 +16,8 @@ set the design:
 
 - **In-process.** The compile is a library that runs inside the app that
   shows the map, with no separate service, database or Java runtime to
-  ship or start. CI builds it for iOS devices and the simulator, and it has
+  ship or start. CI builds it for iOS devices and the simulator and for Android
+  (arm64, armv7 and x86_64), and it has
   run in an app in the simulator; it has not yet been measured on a phone. The command line is a thin layer over the same
   call.
 - **Speed and memory first.** A region compiles in seconds to a minute, in
@@ -380,5 +381,8 @@ scripts/check.sh
 ```
 
 runs what CI runs: formatting, clippy (warnings are errors), the Rust tests
-and the benchmark harness's Python tests. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers changes to
+and the benchmark harness's Python tests. CI also runs clippy and the tests
+on Windows and macOS, builds the library for iOS and Android, and reports
+changes to the public API on pull requests (`scripts/semver-report.sh`).
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers changes to
 tile output, and [`RELEASING.md`](RELEASING.md) the release steps.

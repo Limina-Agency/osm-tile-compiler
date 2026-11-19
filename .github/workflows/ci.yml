@@ -21,6 +21,27 @@ jobs:
           python-version: "3.12"
       - run: scripts/check.sh
 
+  # Clippy and the Rust tests on the other platforms the release builds for.
+  # Formatting and the benchmark harness do not depend on the platform and
+  # stay in `test`.
+  platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The fixtures are compared byte for byte: no CRLF conversion.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
   # The oldest Rust the crate declares (`rust-version`); rust-toolchain.toml
   # pins a newer one for everything else.
   msrv:
@@ -55,3 +76,51 @@ jobs:
           for target in aarch64-apple-ios aarch64-apple-ios-sim; do
             cargo build --locked --lib -p osm-tile-compiler --no-default-features --target "$target"
           done
+
+  # The library as an Android app links it, for the ABIs phones and the
+  # emulator use. cargo-ndk points the C build scripts (SQLite, ring, zstd)
+  # at the NDK's compilers.
+  android:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
+        id: ndk
+        with:
+          ndk-version: r28c
+      - run: |
+          rustup toolchain install
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo install cargo-ndk --locked --version 4.1.2
+      - env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+            build --locked --lib -p osm-tile-compiler --no-default-features
+
+  # On a pull request, the library's public API changes against the base
+  # branch, as semver classifies them, in the job summary. A change that
+  # needs a new major version (a minor one before 1.0) is also a warning on
+  # the pull request. It does not fail the check: the release decides the
+  # version (RELEASING.md).
+  semver:
+    if: github.event_name == 'pull_request'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo install cargo-semver-checks --locked --version 0.51.0
+      - name: Report API changes
+        run: |
+          status=0
+          scripts/semver-report.sh "origin/$GITHUB_BASE_REF" > semver-report.md || status=$?
+          cat semver-report.md >> "$GITHUB_STEP_SUMMARY"
+          case $status in
+            0) ;;
+            1) echo "::warning title=Public API break::This pull request breaks the library's public API; the next release needs a new minor version. See the semver job's summary." ;;
+            *) cat semver-report.md; exit "$status" ;;
+          esac
