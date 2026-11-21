@@ -20,18 +20,22 @@ use geo::{Area, BoundingRect, Buffer, Distance, Euclidean, Relate, unary_union};
 use geo_types::{Coord, LineString, MultiPolygon, Polygon};
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
+use std::collections::binary_heap::PeekMut;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 const CHUNK_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TILE_BYTES: usize = 256 * 1024 * 1024;
 pub(super) const MERGE_FAN_IN: usize = 128;
+/// Blocks of each run the final merge's decoders keep decoded ahead of the
+/// merge, counting one being decoded.
+const BLOCKS_AHEAD: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) enum AttrValue {
@@ -726,7 +730,7 @@ impl Store {
                 let mut tile_id = None;
                 let mut tile = vec![];
                 let mut tile_bytes = 0usize;
-                merge_controlled(&self.runs, control, |encoded| {
+                merge_prefetched(&self.runs, threads, control, |encoded| {
                     if tile_id.is_some_and(|id| id != encoded.key.tile_id) {
                         let job = TileJob {
                             id: tile_id.unwrap(),
@@ -1000,6 +1004,140 @@ impl Ord for Head {
             .key
             .cmp(&other.record.key)
             .then(self.reader.cmp(&other.reader))
+    }
+}
+
+/// A run's next decoded block and its records' size as frames: empty at the
+/// end of the run.
+type Block = Result<(Vec<EncodedRecord>, u64), String>;
+
+/// Merges sorted runs as `merge_controlled` does, record for record, while
+/// `decoders` threads read and decode the runs' blocks ahead of the merge,
+/// so that this thread only orders records. Each run has `BLOCKS_AHEAD`
+/// blocks requested at a time: the merge asks for another as it starts on
+/// one, so the blocks held decoded stay bounded by the runs, not their size.
+fn merge_prefetched(
+    paths: &[PathBuf],
+    decoders: usize,
+    control: &Control,
+    mut emit: impl FnMut(EncodedRecord) -> Result<(), String>,
+) -> Result<(), String> {
+    const REPORT_BYTES: u64 = 1 << 20;
+    let readers = paths
+        .iter()
+        .map(|p| RunReader::open(p).map(Mutex::new))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (block_senders, block_receivers): (Vec<_>, Vec<_>) = (0..paths.len())
+        .map(|_| crossbeam_channel::unbounded::<Block>())
+        .unzip();
+    let (requests, requested) = crossbeam_channel::unbounded::<usize>();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        // Dropped however this closure returns, which ends the decoders
+        // before the scope waits for them.
+        let requests = requests;
+        let _stop = StopOnDrop(&stop);
+        for worker in 0..decoders.max(1).min(paths.len()) {
+            let (requested, readers, block_senders, stop) =
+                (requested.clone(), &readers, &block_senders, &stop);
+            std::thread::Builder::new()
+                .name(format!("omt-run-decode-{worker}"))
+                .spawn_scoped(scope, move || {
+                    for run in requested {
+                        if stop.load(AtomicOrdering::Relaxed) {
+                            return;
+                        }
+                        let mut reader = readers[run].lock().unwrap_or_else(|e| e.into_inner());
+                        let block = catch_unwind(AssertUnwindSafe(|| {
+                            let records = reader.next_block_records()?;
+                            let bytes = records.iter().map(|r| r.frame_bytes() as u64).sum();
+                            Ok((records, bytes))
+                        }))
+                        .unwrap_or_else(|payload| {
+                            let message = crate::panic_message(&*payload);
+                            Err(format!("OMT run decoder panicked: {message}"))
+                        });
+                        // Sent while the run is locked, so its blocks arrive in order.
+                        if block_senders[run].send(block).is_err() {
+                            return;
+                        }
+                    }
+                })
+                .map_err(|e| format!("Start OMT run decoder: {e}"))?;
+        }
+        drop(requested);
+        for run in 0..paths.len() {
+            for _ in 0..BLOCKS_AHEAD {
+                requests
+                    .send(run)
+                    .map_err(|_| "OMT run decoders stopped unexpectedly")?;
+            }
+        }
+        let mut blocks = (0..paths.len())
+            .map(|_| Vec::new().into_iter())
+            .collect::<Vec<_>>();
+        let mut ended = vec![false; paths.len()];
+        // Progress counts a block's bytes as the merge starts on it.
+        let mut merged = 0;
+        let mut next = |run: usize| -> Result<Option<EncodedRecord>, String> {
+            loop {
+                if let Some(record) = blocks[run].next() {
+                    return Ok(Some(record));
+                }
+                if ended[run] {
+                    return Ok(None);
+                }
+                let (block, bytes) = block_receivers[run]
+                    .recv()
+                    .map_err(|_| "OMT run decoders stopped unexpectedly")??;
+                if block.is_empty() {
+                    ended[run] = true;
+                    return Ok(None);
+                }
+                requests
+                    .send(run)
+                    .map_err(|_| "OMT run decoders stopped unexpectedly")?;
+                merged += bytes;
+                if merged >= REPORT_BYTES {
+                    control.add_done(merged);
+                    merged = 0;
+                    control.check()?;
+                }
+                blocks[run] = block.into_iter();
+            }
+        };
+        let mut heap = BinaryHeap::new();
+        for reader in 0..paths.len() {
+            if let Some(record) = next(reader)? {
+                heap.push(Reverse(Head { record, reader }));
+            }
+        }
+        // The head's successor from the same run replaces it in place: one
+        // sift instead of a pop and a push.
+        while let Some(mut top) = heap.peek_mut() {
+            let reader = top.0.reader;
+            let record = match next(reader) {
+                Ok(Some(record)) => std::mem::replace(&mut top.0.record, record),
+                Ok(None) => PeekMut::pop(top).0.record,
+                // The head comes first in record order, and so does its error.
+                Err(error) => {
+                    emit(PeekMut::pop(top).0.record)?;
+                    return Err(error);
+                }
+            };
+            emit(record)?;
+        }
+        drop(next);
+        control.add_done(merged);
+        Ok(())
+    })
+}
+
+/// Raises its flag when dropped, so that threads still working stop early.
+struct StopOnDrop<'a>(&'a AtomicBool);
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, AtomicOrdering::Relaxed);
     }
 }
 
@@ -3473,6 +3611,102 @@ mod tests {
         .unwrap();
         assert_eq!(values, (0..60).map(AttrValue::Int).collect::<Vec<_>>());
     }
+    /// Runs whose records interleave across tiles and runs, each run many
+    /// blocks long.
+    fn interleaved_runs(temp: &Path) -> Store {
+        let mut store = Store::new(temp).unwrap();
+        for worker in 0..6u64 {
+            let mut sorter = store.sorter(worker as usize, 400 * 300);
+            for i in 0..1500u64 {
+                let mut r = record(i);
+                r.tile_id = (i * i * 7 + worker * 13) % 9000 / 30;
+                r.attrs.insert(
+                    "padding".into(),
+                    AttrValue::String("x".repeat((i % 97) as usize * 3)),
+                );
+                sorter
+                    .add(EncodedRecord::encode(&r, seq(worker * 10_000 + i)).unwrap())
+                    .unwrap();
+            }
+            store.add_runs(sorter.finish().unwrap());
+        }
+        store
+    }
+
+    #[test]
+    fn prefetched_merge_gives_the_records_of_one_merge() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = interleaved_runs(temp.path());
+        assert!(store.runs.len() > 6, "{} runs", store.runs.len());
+        let mut expected = vec![];
+        merge(&store.runs, |r| {
+            expected.push((r.key, r.payload));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(expected.len(), 6 * 1500);
+        for decoders in [1, 2, 3, 16] {
+            let mut found = vec![];
+            merge_prefetched(&store.runs, decoders, &Control::detached(), |r| {
+                found.push((r.key, r.payload));
+                Ok(())
+            })
+            .unwrap();
+            assert!(found == expected, "{decoders} decoders");
+        }
+        merge_prefetched(&[], 4, &Control::detached(), |_| panic!("no records")).unwrap();
+    }
+
+    #[test]
+    fn prefetched_merge_stops_on_the_first_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = interleaved_runs(temp.path());
+        // The consumer failing while decoders still run.
+        let mut emitted = 0;
+        let result = merge_prefetched(&store.runs, 4, &Control::detached(), |_| {
+            emitted += 1;
+            if emitted == 100 {
+                Err("writer failed".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err("writer failed".into()));
+        assert_eq!(emitted, 100);
+        // A run damaged past its first block fails the merge where the merge
+        // reaches the damage, after every record before it.
+        let damaged = temp.path().join("damaged");
+        let mut bytes = fs::read(&store.runs[1]).unwrap();
+        let cut = bytes.len() * 2 / 3;
+        bytes.truncate(cut);
+        fs::write(&damaged, &bytes).unwrap();
+        let mut runs = store.runs.clone();
+        runs[1] = damaged;
+        let mut serial = 0;
+        let serial_error = merge(&runs, |_| {
+            serial += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        let mut prefetched = 0;
+        let prefetched_error = merge_prefetched(&runs, 3, &Control::detached(), |_| {
+            prefetched += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(prefetched_error, serial_error);
+        assert!(prefetched > 0);
+        assert_eq!(prefetched, serial);
+        // A run that cannot be opened.
+        let mut runs = store.runs.clone();
+        runs[2] = temp.path().join("missing");
+        assert!(
+            merge_prefetched(&runs, 2, &Control::detached(), |_| Ok(()))
+                .unwrap_err()
+                .contains("missing")
+        );
+    }
+
     /// A test job: sleep `millis`, then succeed or fail with `error`
     /// (`"panic"` panics). The job's index is its result.
     type TestJob = (usize, u64, Option<&'static str>);
