@@ -62,6 +62,10 @@ serde_json = { workspace = true }
 
 osm-pbf-ingest = { workspace = true }
 
+# The stage profiler's CPU clocks (getrusage, clock_gettime).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.172"
+
 [dev-dependencies]
 # Checks that the store's group keys are the bytes bincode 1 wrote for them.
 bincode = { workspace = true }

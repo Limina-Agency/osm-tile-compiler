@@ -496,6 +496,7 @@ pub(crate) fn compile(
     let message = "Reading supplemental sources";
     progress(message);
     control.stage(CompileStage::ReadSources, message)?;
+    let sources_stage = crate::stage_profile::Stage::start("read_sources");
     supplements::read_sources(
         &request.sources,
         &request.temp_dir,
@@ -511,6 +512,7 @@ pub(crate) fn compile(
         &mut process,
         &mut warnings,
     )?;
+    drop(sources_stage);
     let supplement_seconds = start.elapsed().as_secs_f64();
     control.stage(CompileStage::IndexOsm, "Indexing the OSM extract")?;
     let osm_start = Instant::now();
@@ -536,6 +538,7 @@ pub(crate) fn compile(
     }
     let osm_seconds = osm_start.elapsed().as_secs_f64();
     control.check()?;
+    let drain_stage = crate::stage_profile::Stage::start("render_drain");
     let mut deferred = Vec::new();
     profile.finish(&mut deferred);
     profile_features += deferred.len() as u64;
@@ -545,6 +548,7 @@ pub(crate) fn compile(
     sources_processed += totals.sources;
     profile_features += totals.features;
     drop(pipeline);
+    drop(drain_stage);
     let finish_start = Instant::now();
     let message = "Sorting, encoding and writing PMTiles";
     progress(message);
