@@ -198,12 +198,19 @@ fn java_round(v: f64) -> f64 {
 pub(super) fn buffer_union_unbuffer(
     cluster: &[MultiPolygon<f64>],
     distance: f64,
+    drop_below: f64,
 ) -> Option<MultiPolygon<f64>> {
     use geo::Area;
     let expanded = cluster
         .iter()
         .map(|g| buffer(g, distance))
         .collect::<Option<Vec<_>>>()?;
+    if drop_below > 0.0
+        && distance > 1.0
+        && eroded_hull_area(&expanded, distance - 0.8) <= drop_below
+    {
+        return Some(MultiPolygon(vec![]));
+    }
     let mut merged = buffer(&union(&expanded)?, -distance)?;
     let largest = cluster
         .iter()
@@ -221,6 +228,82 @@ pub(super) fn buffer_union_unbuffer(
         }
     }
     Some(merged)
+}
+
+/// An upper bound on the area of anything the unbuffered union of `expanded`
+/// can cover: the area of the convex hull of the buffered polygons, eroded by
+/// `amount`. The negative mitre buffer of a region lies within its erosion by
+/// a disc (a mitre or bevel join removes more than a round one), and the
+/// erosion of a region lies within the erosion of its convex hull. `amount`
+/// is the buffer distance less the slack for rounding to the grid (0.71) and
+/// for the input simplification (0.01 of the distance).
+fn eroded_hull_area(expanded: &[MultiPolygon<f64>], amount: f64) -> f64 {
+    let mut points = Vec::<Point>::new();
+    for g in expanded {
+        for p in &g.0 {
+            points.extend(p.exterior().0.iter().map(point));
+        }
+    }
+    if points.len() < 3
+        || points
+            .iter()
+            .any(|p| !p[0].is_finite() || !p[1].is_finite())
+    {
+        return f64::INFINITY;
+    }
+    points.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    points.dedup();
+    let cross = |o: Point, a: Point, b: Point| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
+    // Andrew's monotone chain: counter-clockwise, without collinear points.
+    let mut hull = Vec::<Point>::with_capacity(points.len() + 1);
+    for reverse in [false, true] {
+        let start = hull.len();
+        for i in 0..points.len() {
+            let p = points[if reverse { points.len() - 1 - i } else { i }];
+            while hull.len() >= start + 2
+                && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
+            {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    if hull.len() < 3 {
+        return 0.0;
+    }
+    let mut polygon = hull.clone();
+    let mut next = Vec::with_capacity(polygon.len() + 2);
+    for i in 0..hull.len() {
+        let (a, b) = (hull[i], hull[(i + 1) % hull.len()]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let length = dx.hypot(dy);
+        let side = |c: Point| ((c[0] - a[0]) * -dy + (c[1] - a[1]) * dx) / length - amount;
+        next.clear();
+        for j in 0..polygon.len() {
+            let (p, q) = (polygon[j], polygon[(j + 1) % polygon.len()]);
+            let (sp, sq) = (side(p), side(q));
+            if sp >= 0.0 {
+                next.push(p);
+            }
+            if (sp >= 0.0) != (sq >= 0.0) {
+                let t = sp / (sp - sq);
+                next.push([p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])]);
+            }
+        }
+        std::mem::swap(&mut polygon, &mut next);
+        if polygon.len() < 3 {
+            return 0.0;
+        }
+    }
+    let mut twice = 0.0;
+    for j in 0..polygon.len() {
+        let (p, q) = (polygon[j], polygon[(j + 1) % polygon.len()]);
+        twice += p[0] * q[1] - q[0] * p[1];
+    }
+    twice.abs() / 2.0
 }
 
 /// `Geometry.union()` of a collection of valid polygons: JTS's classic

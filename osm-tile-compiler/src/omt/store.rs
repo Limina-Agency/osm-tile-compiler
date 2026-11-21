@@ -1664,10 +1664,14 @@ fn merge_geometries_controlled(
                         );
                         let mut result = Vec::new();
                         let mut cluster_ids = Vec::new();
-                        for (cluster_id, (members, merged, jts)) in
-                            merge_nearby(geometries, distance * 16.)
-                                .into_iter()
-                                .enumerate()
+                        // Experiment: clusters whose output the area filter
+                        // below is certain to drop skip union and unbuffer.
+                        if std::env::var_os("OTC_NO_DROP_BOUND").is_none() {
+                            DROP_BELOW.with(|d| d.set(min_area * 256.));
+                        }
+                        let clusters = merge_nearby(geometries, distance * 16.);
+                        DROP_BELOW.with(|d| d.set(0.));
+                        for (cluster_id, (members, merged, jts)) in clusters.into_iter().enumerate()
                         {
                             let rings = if members.len() == 1 {
                                 // Pinned FeatureMerge leaves singleton clusters
@@ -1968,6 +1972,12 @@ fn fill_square(area: f64, ring: &[TilePoint]) -> Option<Vec<TilePoint>> {
     ])
 }
 
+thread_local! {
+    /// The exterior area at or below which a merged cluster's polygons are
+    /// dropped by the caller; 0 disables the early-out.
+    static DROP_BELOW: std::cell::Cell<f64> = const { std::cell::Cell::new(0.) };
+}
+
 fn merge_nearby(
     geometries: Vec<MultiPolygon<f64>>,
     distance: f64,
@@ -2073,8 +2083,12 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
             // FeatureMerge.bufferUnionUnbuffer, through the port of the
             // pinned JTS buffer and union; the integer overlay remains for
             // inputs outside the port's bounds.
-            super::jts_buffer::buffer_union_unbuffer(&cluster, distance)
-                .unwrap_or_else(|| overlay_buffer_union_unbuffer(&cluster, distance, buffer))
+            super::jts_buffer::buffer_union_unbuffer(
+                &cluster,
+                distance,
+                DROP_BELOW.with(std::cell::Cell::get),
+            )
+            .unwrap_or_else(|| overlay_buffer_union_unbuffer(&cluster, distance, buffer))
         } else {
             // Pinned mergeOverlappingPolygons uses minDist=buffer=0: a zero
             // buffer of each connected cluster's collection, through the
@@ -4962,6 +4976,369 @@ mod merge_replay {
         println!(
             "{label}: dissolve total {total:.2}s, digest {:016x}",
             digest.finish()
+        );
+    }
+
+    /// Stage times of the positive-distance dissolve, by cluster size and by
+    /// whether the area filter then drops the whole cluster, and how often
+    /// cheap bounds on the output's area would have predicted the drop.
+    #[test]
+    #[ignore]
+    fn merge_replay_stages() {
+        use super::super::jts_buffer as jts;
+        use geo::ConvexHull;
+        let Some(groups) = groups() else { return };
+        let min_area: f64 = std::env::var("OTC_BENCH_MIN_AREA")
+            .ok()
+            .map_or(4., |v| v.parse().unwrap())
+            * 256.;
+        #[derive(Default, Clone)]
+        struct Row {
+            clusters: usize,
+            buffer: f64,
+            union: f64,
+            unbuffer: f64,
+            snap: f64,
+            hull: f64,
+            hull_pred: usize,
+            hull_pred_secs: f64,
+            env_pred: usize,
+            sum_pred: usize,
+        }
+        // [bucket][dropped]
+        let mut rows = vec![[Row::default(), Row::default()]; 5];
+        let mut proximity = 0.;
+        let (mut singles, mut singles_dropped) = (0usize, 0usize);
+        let mut worst_ratio = 0_f64;
+        let mut violations = 0usize;
+        let mut worst_excess = f64::MIN;
+        let mut ratio_hist = [0usize; 12];
+        let mut sound = [[(0usize, 0f64, 0usize, 0usize); 3]; 3];
+        let mut sound_cost = 0.;
+        const THRESHOLDS: [f64; 8] = [0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25];
+        let mut sweep = [[(0usize, 0f64, 0f64); 8]; 3];
+        for (distance, geoms) in &groups {
+            if *distance <= 0. {
+                continue;
+            }
+            let started = Instant::now();
+            let clusters = merge_nearby_collect(geoms, *distance);
+            proximity += started.elapsed().as_secs_f64();
+            for (members, ..) in clusters {
+                if members.len() == 1 {
+                    singles += 1;
+                    let a = geoms[members[0]]
+                        .0
+                        .iter()
+                        .map(|p| Polygon::new(p.exterior().clone(), vec![]).unsigned_area())
+                        .fold(0., f64::max);
+                    if a <= min_area {
+                        singles_dropped += 1;
+                    }
+                    continue;
+                }
+                let cluster: Vec<MultiPolygon<f64>> =
+                    members.iter().map(|&i| geoms[i].clone()).collect();
+                let t0 = Instant::now();
+                let expanded = cluster
+                    .iter()
+                    .map(|g| jts::buffer(g, *distance))
+                    .collect::<Option<Vec<_>>>();
+                let t1 = Instant::now();
+                let Some(expanded) = expanded else { continue };
+                let Some(u) = jts::union(&expanded) else {
+                    continue;
+                };
+                let t2 = Instant::now();
+                let Some(merged) = jts::buffer(&u, -*distance) else {
+                    continue;
+                };
+                let t3 = Instant::now();
+                let envelope = merged
+                    .bounding_rect()
+                    .map_or(0., |r| r.width() * r.height());
+                let rings = if envelope < min_area {
+                    vec![]
+                } else {
+                    jts::snap_and_fix(&merged)
+                        .map(from_grid_polygons)
+                        .unwrap_or_else(|| from_polygons(merged.clone()))
+                };
+                let t4 = Instant::now();
+                // largest exterior area out
+                let out_max = to_polygons(&rings)
+                    .0
+                    .iter()
+                    .map(|p| Polygon::new(p.exterior().clone(), vec![]).unsigned_area())
+                    .fold(0., f64::max);
+                let dropped = filter_tile_polygon_areas(rings, min_area, min_area).is_empty();
+                // bounds
+                let t5 = Instant::now();
+                let all = geo::MultiPoint::from(
+                    cluster
+                        .iter()
+                        .flat_map(|g| {
+                            g.0.iter()
+                                .flat_map(|p| p.exterior().0.iter().map(|c| geo::Point::from(*c)))
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let hull = all.convex_hull();
+                let hull_area = hull.unsigned_area();
+                let t6 = Instant::now();
+                let perimeter: f64 = hull
+                    .exterior()
+                    .0
+                    .windows(2)
+                    .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
+                    .sum();
+                let hull_bound = hull_area + perimeter * 1. + 4.;
+                let env = all.bounding_rect().map_or(0., |r| r.width() * r.height());
+                let sum_buffered: f64 = expanded.iter().map(|g| g.unsigned_area()).sum();
+                // Sound bounds from the buffered members (see findings): the
+                // unbuffered union lies in the erosion of any convex superset.
+                let t7 = Instant::now();
+                let dd = *distance - 1.;
+                let bpts = geo::MultiPoint::from(
+                    expanded
+                        .iter()
+                        .flat_map(|g| {
+                            g.0.iter()
+                                .flat_map(|p| p.exterior().0.iter().map(|c| geo::Point::from(*c)))
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let brect = bpts.bounding_rect().unwrap();
+                let env_bound =
+                    (brect.width() - 2. * dd).max(0.) * (brect.height() - 2. * dd).max(0.);
+                let bhull = bpts.convex_hull();
+                let bhull_area = bhull.unsigned_area();
+                let iso_bound = (bhull_area.sqrt() - dd * std::f64::consts::PI.sqrt())
+                    .max(0.)
+                    .powi(2);
+                // The hull eroded by the distance less 0.8 (rounding and input
+                // simplification slack): its edges' half-planes moved inwards.
+                // Andrew's monotone chain, strictly convex, counter-clockwise.
+                let chain = {
+                    let mut pts: Vec<Coord<f64>> = bpts.0.iter().map(|p| p.0).collect();
+                    pts.sort_unstable_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+                    pts.dedup();
+                    let cross = |o: Coord<f64>, a: Coord<f64>, b: Coord<f64>| {
+                        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+                    };
+                    let mut h: Vec<Coord<f64>> = Vec::with_capacity(pts.len() + 1);
+                    for pass in 0..2 {
+                        let start = h.len();
+                        let it: Box<dyn Iterator<Item = &Coord<f64>>> = if pass == 0 {
+                            Box::new(pts.iter())
+                        } else {
+                            Box::new(pts.iter().rev())
+                        };
+                        for &p in it {
+                            while h.len() >= start + 2
+                                && cross(h[h.len() - 2], h[h.len() - 1], p) <= 0.
+                            {
+                                h.pop();
+                            }
+                            h.push(p);
+                        }
+                        h.pop();
+                    }
+                    let first = h[0];
+                    h.push(first);
+                    h
+                };
+                let erode = |amount: f64| {
+                    let ring = &chain;
+                    let sign = 1.;
+                    let mut poly: Vec<Coord<f64>> = ring[..ring.len() - 1].to_vec();
+                    for e in ring.windows(2) {
+                        let (dx, dy) = (e[1].x - e[0].x, e[1].y - e[0].y);
+                        let len = dx.hypot(dy);
+                        if len == 0. {
+                            continue;
+                        }
+                        let (nx, ny) = (-dy / len * sign, dx / len * sign);
+                        let side =
+                            |c: &Coord<f64>| (c.x - e[0].x) * nx + (c.y - e[0].y) * ny - amount;
+                        let mut next = Vec::with_capacity(poly.len() + 1);
+                        for i in 0..poly.len() {
+                            let (p, q) = (poly[i], poly[(i + 1) % poly.len()]);
+                            let (sp, sq) = (side(&p), side(&q));
+                            if sp >= 0. {
+                                next.push(p);
+                            }
+                            if (sp >= 0.) != (sq >= 0.) {
+                                let t = sp / (sp - sq);
+                                next.push(Coord {
+                                    x: p.x + t * (q.x - p.x),
+                                    y: p.y + t * (q.y - p.y),
+                                });
+                            }
+                        }
+                        poly = next;
+                        if poly.len() < 3 {
+                            return 0.;
+                        }
+                    }
+                    let mut twice = 0.;
+                    for i in 0..poly.len() {
+                        let (p, q) = (poly[i], poly[(i + 1) % poly.len()]);
+                        twice += p.x * q.y - q.x * p.y;
+                    }
+                    twice.abs() / 2.
+                };
+                let env_bound = erode(*distance - 0.8);
+                let iso_bound = iso_bound.min(erode(*distance - 2.));
+                let t8 = Instant::now();
+                let size = usize::from(members.len() > 2) + usize::from(members.len() > 5);
+                for (k, bound) in [env_bound, iso_bound, env_bound.min(iso_bound)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if bound <= min_area {
+                        sound[size][k].0 += 1;
+                        sound[size][k].1 += (t4 - t1).as_secs_f64();
+                        if !dropped {
+                            sound[size][k].2 += 1;
+                        }
+                    }
+                    if out_max > bound {
+                        sound[size][k].3 += 1;
+                    }
+                }
+                sound_cost += (t8 - t7).as_secs_f64();
+                if out_max > env_bound.min(iso_bound) + 1e-9 {
+                    println!(
+                        "VIOLATION members {} out_max {out_max} hull-erode(d-0.8) {env_bound} other {iso_bound} hull {bhull_area}",
+                        members.len()
+                    );
+                    println!(
+                        "INPUT {}",
+                        serde_json::to_string(
+                            &cluster
+                                .iter()
+                                .map(|g| g
+                                    .0
+                                    .iter()
+                                    .map(|p| std::iter::once(p.exterior())
+                                        .chain(p.interiors())
+                                        .map(|r| r.0.iter().map(|c| [c.x, c.y]).collect::<Vec<_>>())
+                                        .collect::<Vec<_>>())
+                                    .collect::<Vec<_>>())
+                                .collect::<Vec<_>>()
+                        )
+                        .unwrap()
+                    );
+                    for (name, g) in [("UNION", &u), ("MERGED", &merged)] {
+                        println!(
+                            "{name} {}",
+                            serde_json::to_string(
+                                &g.0.iter()
+                                    .map(|p| std::iter::once(p.exterior())
+                                        .chain(p.interiors())
+                                        .map(|r| r.0.iter().map(|c| [c.x, c.y]).collect::<Vec<_>>())
+                                        .collect::<Vec<_>>())
+                                    .collect::<Vec<_>>()
+                            )
+                            .unwrap()
+                        );
+                    }
+                }
+                let bucket = match members.len() {
+                    2 => 0,
+                    3..=5 => 1,
+                    6..=20 => 2,
+                    21..=100 => 3,
+                    _ => 4,
+                };
+                let row = &mut rows[bucket][usize::from(dropped)];
+                row.clusters += 1;
+                row.buffer += (t1 - t0).as_secs_f64();
+                row.union += (t2 - t1).as_secs_f64();
+                row.unbuffer += (t3 - t2).as_secs_f64();
+                row.snap += (t4 - t3).as_secs_f64();
+                row.hull += (t6 - t5).as_secs_f64();
+                if hull_bound <= min_area {
+                    row.hull_pred += 1;
+                    row.hull_pred_secs += (t4 - t0).as_secs_f64();
+                    if !dropped {
+                        violations += 1;
+                    }
+                }
+                if env <= min_area {
+                    row.env_pred += 1;
+                }
+                if sum_buffered <= min_area {
+                    row.sum_pred += 1;
+                }
+                {
+                    let secs = (t4 - t0).as_secs_f64();
+                    let size = usize::from(members.len() > 2) + usize::from(members.len() > 5);
+                    for (k, t) in THRESHOLDS.iter().enumerate() {
+                        if hull_bound <= *t * min_area {
+                            sweep[size][k].0 += 1;
+                            sweep[size][k].1 += secs;
+                            sweep[size][k].2 = sweep[size][k].2.max(out_max);
+                        }
+                    }
+                }
+                if hull_area > 0. {
+                    let ratio = out_max / hull_area;
+                    worst_ratio = worst_ratio.max(ratio);
+                    worst_excess = worst_excess.max(out_max - hull_bound);
+                    let slot = ((ratio * 10.) as usize).min(11);
+                    ratio_hist[slot] += 1;
+                }
+            }
+        }
+        println!(
+            "proximity {proximity:.2}s; singletons {singles}, of which dropped by area {singles_dropped}"
+        );
+        println!(
+            "bucket dropped clusters buffer union unbuffer snap | hull_time hull_pred hull_pred_secs env_pred sumbuf_pred"
+        );
+        for (b, name) in ["2", "3-5", "6-20", "21-100", ">100"].iter().enumerate() {
+            for d in 0..2 {
+                let r = &rows[b][d];
+                println!(
+                    "{name:>7} {d} {:>7} {:6.2} {:6.2} {:6.2} {:6.2} | {:5.2} {:>7} {:6.2} {:>7} {:>7}",
+                    r.clusters,
+                    r.buffer,
+                    r.union,
+                    r.unbuffer,
+                    r.snap,
+                    r.hull,
+                    r.hull_pred,
+                    r.hull_pred_secs,
+                    r.env_pred,
+                    r.sum_pred
+                );
+            }
+        }
+        for (size, name) in ["2", "3-5", ">5"].iter().enumerate() {
+            for (k, t) in THRESHOLDS.iter().enumerate() {
+                let (n, secs, max_out) = sweep[size][k];
+                println!(
+                    "members {name}: hull_bound <= {t} x min_area: {n} clusters, {secs:.2}s, largest output exterior {:.3} x min_area",
+                    max_out / min_area
+                );
+            }
+        }
+        for (size, name) in ["2", "3-5", ">5"].iter().enumerate() {
+            for (k, bound) in ["hull eroded d-0.8", "iso or hull eroded d-2", "either"]
+                .iter()
+                .enumerate()
+            {
+                let (n, secs, wrong, exceeded) = sound[size][k];
+                println!(
+                    "sound {bound}, members {name}: {n} clusters skip union+unbuffer+snap, {secs:.2}s saved, {wrong} wrongly skipped, {exceeded} outputs above the bound"
+                );
+            }
+        }
+        println!("sound bounds cost {sound_cost:.2}s");
+        println!(
+            "hull bound violations {violations}; worst out/hull area ratio {worst_ratio:.4}; worst out - hull_bound {worst_excess:.2}; ratio histogram {ratio_hist:?}"
         );
     }
 
