@@ -115,8 +115,9 @@ pub use extracts::{
     parse_index,
 };
 pub use omt::{
-    CompileResult, LANGUAGES as OMT_LANGUAGES, LAYERS as OMT_LAYERS, OMT_SCHEMA_VERSION,
-    PROFILE_REVISION as OMT_PROFILE_REVISION,
+    CompileResult, LANGUAGES as OMT_LANGUAGES, LAYERS as OMT_LAYERS, MergeCacheOptions,
+    MergeCacheStats, OMT_SCHEMA_VERSION, PROFILE_REVISION as OMT_PROFILE_REVISION,
+    merge_cache_path,
 };
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};

@@ -79,6 +79,12 @@ pub struct BasemapRequest {
     ///
     /// [`write_building_levels`]: crate::write_building_levels
     pub building_levels: bool,
+    /// Whether to write a merge cache index beside the archive, and an
+    /// earlier archive to reuse unchanged tile layers from [default:
+    /// neither]. Experimental. Reuse makes a compile after an OSM update
+    /// skip merging and encoding the tiles the update left alone; the
+    /// archive is the same as without it.
+    pub merge_cache: crate::MergeCacheOptions,
 }
 
 impl BasemapRequest {
@@ -105,6 +111,7 @@ impl BasemapRequest {
             layers: LayerSelection::All,
             languages: None,
             building_levels: false,
+            merge_cache: crate::MergeCacheOptions::default(),
         }
     }
 
@@ -161,6 +168,17 @@ impl BasemapRequest {
                     "refusing to replace existing archive {}",
                     archive.display()
                 )));
+            }
+        }
+        if let Some(old) = &self.merge_cache.reuse_from {
+            let index = crate::merge_cache_path(old);
+            for file in [old, &index] {
+                if !file.is_file() {
+                    return Err(invalid(format!(
+                        "the merge cache to reuse needs {}, which does not exist",
+                        file.display()
+                    )));
+                }
             }
         }
         Ok(layers)
@@ -301,6 +319,7 @@ fn compile(
         languages: request.languages.clone(),
         omit_sources: request.omit_sources.clone(),
         area_only: request.area.read == ReadScope::NearArea,
+        merge_cache: request.merge_cache.clone(),
     };
     omt::validate(&compile_request)?;
     let used = request.used_sources();

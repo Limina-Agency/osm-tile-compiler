@@ -15,6 +15,7 @@ mod jts_intersection;
 mod labels;
 mod land;
 mod line_merge;
+mod merge_cache;
 mod pipeline;
 mod polygon_validity;
 mod record_codec;
@@ -34,6 +35,7 @@ use crate::compile_area::{Region, TileCoverage};
 use crate::control::{CompileStage, Control};
 use crate::sources::SupplementalDataset;
 use crate::{ArchiveCenter, CompileArea, CompileBounds, archive::ArchiveOptions};
+pub use merge_cache::{MergeCacheOptions, MergeCacheStats, merge_cache_path};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -111,6 +113,8 @@ pub(crate) struct OpenMapTilesRequest {
     /// seconds. The tiles at `max_zoom` keep the content a full read gives
     /// them; lower zooms show only what lies near the area.
     pub area_only: bool,
+    /// The merge cache to write and reuse.
+    pub merge_cache: merge_cache::MergeCacheOptions,
 }
 /// Whether a compile with these options is one the parity measurement covers
 /// (docs/parity.md): Planetiler's default languages, every supplemental
@@ -160,6 +164,9 @@ pub struct CompileResult {
     /// compile was asked to leave out, as the archive's metadata lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omitted_sources: Vec<String>,
+    /// What the merge cache did, when the compile used one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_cache: Option<MergeCacheStats>,
 }
 
 /// The profile's state. Supplements fill it serially; afterwards workers only
@@ -492,6 +499,13 @@ pub(crate) fn compile(
         Ok(())
     };
     let mut warnings = Vec::new();
+    // Opened first, so that an index that cannot be used fails at once.
+    let mut cache = merge_cache::MergeCache::open(
+        &request.merge_cache,
+        &request.temp_dir,
+        request.archive.gzip_level,
+        &mut warnings,
+    )?;
     let omitted = |dataset| request.omit_sources.contains(&dataset);
     let message = "Reading supplemental sources";
     progress(message);
@@ -567,9 +581,45 @@ pub(crate) fn compile(
         layers: &selection.layers(),
         omitted_sources: &omitted_sources,
     };
-    let tile_stats = store.finish(partial.file(), &header, request.threads, control)?;
+    let tile_stats = store.finish_cached(
+        partial.file(),
+        &header,
+        request.threads,
+        control,
+        cache.as_mut(),
+    )?;
     control.check()?;
     partial.persist(&request.output)?;
+    let merge_cache = match cache {
+        Some(mut cache) => {
+            let mut index_bytes = 0;
+            if let Some(writer) = cache.writer.take() {
+                // Written beside the archive, then moved over any index an
+                // earlier archive of this name left.
+                let path = merge_cache_path(&request.output);
+                let mut partial = path.as_os_str().to_owned();
+                partial.push(format!(".{}.partial", std::process::id()));
+                let partial = PathBuf::from(partial);
+                let written = writer
+                    .finish(&partial, request.archive.gzip_level, &request.output)
+                    .and_then(|bytes| {
+                        let _ = std::fs::remove_file(&path);
+                        std::fs::rename(&partial, &path)
+                            .map(|()| bytes)
+                            .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+                    });
+                match written {
+                    Ok(bytes) => index_bytes = bytes,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&partial);
+                        warnings.push(format!("the merge cache was not written: {error}"));
+                    }
+                }
+            }
+            Some(cache.counters.stats(index_bytes))
+        }
+        None => None,
+    };
     warnings.extend(tile_stats.warning());
     Ok(CompileResult {
         schema: format!("OpenMapTiles {OMT_SCHEMA_VERSION} (native experimental port)"),
@@ -585,5 +635,6 @@ pub(crate) fn compile(
         warnings,
         tile_stats,
         omitted_sources: omitted_sources.into_iter().map(String::from).collect(),
+        merge_cache,
     })
 }

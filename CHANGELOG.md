@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Experimental merge cache for recompiles after an update: `compile
+  --merge-cache` writes `<NAME>.merge-cache` beside the archive, and
+  `--reuse-from OLD.pmtiles` takes every tile layer whose input records are
+  unchanged from that archive instead of merging and encoding it again. The
+  archive is byte-identical to an uncached compile. From Rust,
+  `BasemapRequest::merge_cache` (`MergeCacheOptions`), and
+  `CompileResult::merge_cache` reports what was reused.
+
 ## 0.2.0 (2026-11-19)
 
 ### Breaking: one entry point with a typed request
