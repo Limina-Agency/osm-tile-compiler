@@ -1139,6 +1139,8 @@ fn ring_curve(input: &[Point], side: Side, offset: f64, scale: Option<f64>) -> O
     }
     let mut generator =
         SegmentGenerator::new(offset, side, scale, simplified[n - 1], simplified[0]);
+    // A mitre join adds at most two points per vertex.
+    generator.points.reserve(2 * n + 2);
     for (i, &p) in simplified.iter().enumerate().skip(1) {
         generator.add_next_segment(p, i != 1);
     }
@@ -1402,9 +1404,42 @@ fn line_segment(line0: Point, line1: Point, seg0: Point, seg1: Point) -> Option<
     super::jts_intersection::intersection(line0, line1, seg0, seg1)
 }
 
+/// Up to two intersection points, held inline.
+#[derive(Clone, Copy)]
+struct Hits {
+    len: usize,
+    points: [Point; 2],
+}
+
+impl Hits {
+    const NONE: Hits = Hits {
+        len: 0,
+        points: [[0.0; 2]; 2],
+    };
+    fn one(p: Point) -> Self {
+        Hits {
+            len: 1,
+            points: [p, [0.0; 2]],
+        }
+    }
+    fn two(a: Point, b: Point) -> Self {
+        Hits {
+            len: 2,
+            points: [a, b],
+        }
+    }
+}
+
+impl std::ops::Deref for Hits {
+    type Target = [Point];
+    fn deref(&self) -> &[Point] {
+        &self.points[..self.len]
+    }
+}
+
 /// `RobustLineIntersector.computeIntersect`: no point, one point, or the two
 /// ends of a collinear overlap, in JTS's order.
-fn intersections(p1: Point, p2: Point, q1: Point, q2: Point) -> Vec<Point> {
+fn intersections(p1: Point, p2: Point, q1: Point, q2: Point) -> Hits {
     let within = |a: Point, b: Point, p: Point| {
         p[0] >= a[0].min(b[0])
             && p[0] <= a[0].max(b[0])
@@ -1416,29 +1451,35 @@ fn intersections(p1: Point, p2: Point, q1: Point, q2: Point) -> Vec<Point> {
         || p1[1].max(p2[1]) < q1[1].min(q2[1])
         || q1[1].max(q2[1]) < p1[1].min(p2[1])
     {
-        return vec![];
+        return Hits::NONE;
     }
     let same = |a: Orientation, b: Orientation| a != Orientation::Collinear && a == b;
     let pq1 = orientation(p1, p2, q1);
     let pq2 = orientation(p1, p2, q2);
     if same(pq1, pq2) {
-        return vec![];
+        return Hits::NONE;
     }
     let qp1 = orientation(q1, q2, p1);
     let qp2 = orientation(q1, q2, p2);
     if same(qp1, qp2) {
-        return vec![];
+        return Hits::NONE;
     }
     let collinear = Orientation::Collinear;
     if pq1 == collinear && pq2 == collinear && qp1 == collinear && qp2 == collinear {
         // computeCollinearIntersection
         let (q1p, q2p) = (within(p1, p2, q1), within(p1, p2, q2));
         let (p1q, p2q) = (within(q1, q2, p1), within(q1, q2, p2));
-        let pair = |a: Point, b: Point, single: bool| if single { vec![a] } else { vec![a, b] };
+        let pair = |a: Point, b: Point, single: bool| {
+            if single {
+                Hits::one(a)
+            } else {
+                Hits::two(a, b)
+            }
+        };
         return if q1p && q2p {
-            vec![q1, q2]
+            Hits::two(q1, q2)
         } else if p1q && p2q {
-            vec![p1, p2]
+            Hits::two(p1, p2)
         } else if q1p && p1q {
             pair(q1, p1, q1 == p1 && !q2p && !p2q)
         } else if q1p && p2q {
@@ -1448,7 +1489,7 @@ fn intersections(p1: Point, p2: Point, q1: Point, q2: Point) -> Vec<Point> {
         } else if q2p && p2q {
             pair(q2, p2, q2 == p2 && !q1p && !p1q)
         } else {
-            vec![]
+            Hits::NONE
         };
     }
     if [pq1, pq2, qp1, qp2].contains(&collinear) {
@@ -1465,7 +1506,7 @@ fn intersections(p1: Point, p2: Point, q1: Point, q2: Point) -> Vec<Point> {
         } else {
             p2
         };
-        return vec![p];
+        return Hits::one(p);
     }
     // RobustLineIntersector.intersection
     let point = match super::jts_intersection::intersection(p1, p2, q1, q2) {
@@ -1483,7 +1524,7 @@ fn intersections(p1: Point, p2: Point, q1: Point, q2: Point) -> Vec<Point> {
             nearest
         }
     };
-    vec![point]
+    Hits::one(point)
 }
 
 /// `SegmentPointComparator` order of two nodes along a segment.
@@ -1543,7 +1584,12 @@ fn node_float(curves: &[Curve]) -> Option<Vec<Noded>> {
         curve: usize,
         index: usize,
     }
-    let mut segments = Vec::new();
+    let mut segments = Vec::with_capacity(
+        curves
+            .iter()
+            .map(|c| c.points.len().saturating_sub(1))
+            .sum(),
+    );
     let mut curve_len = Vec::with_capacity(curves.len());
     let mut first_segment = Vec::with_capacity(curves.len());
     for (c, curve) in curves.iter().enumerate() {
@@ -1589,11 +1635,11 @@ fn node_float(curves: &[Curve]) -> Option<Vec<Noded>> {
                     continue;
                 }
             }
-            nodes[i].extend(&found);
-            nodes[j].extend(found);
+            nodes[i].extend_from_slice(&found);
+            nodes[j].extend_from_slice(&found);
         }
     }
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(curves.len());
     for (c, curve) in curves.iter().enumerate() {
         let n = curve_len[c];
         if n == 0 {
@@ -1614,7 +1660,9 @@ fn node_float(curves: &[Curve]) -> Option<Vec<Noded>> {
                 }
             }
         }
-        let mut sequence = vec![(points[0], true, true)];
+        let inserted: usize = (0..n).map(|i| nodes[first_segment[c] + i].len()).sum();
+        let mut sequence = Vec::with_capacity(n + 1 + inserted);
+        sequence.push((points[0], true, true));
         for i in 0..n {
             let (a, b) = (points[i], points[i + 1]);
             let mut inner = nodes[first_segment[c] + i]
@@ -1637,53 +1685,69 @@ fn node_float(curves: &[Curve]) -> Option<Vec<Noded>> {
 /// two equal vertices (`findCollapsesFromExistingVertices`), or the single
 /// vertex between two consecutive equal nodes (`findCollapsesFromInsertedNodes`).
 /// Indices are into `sequence`, in which both kinds are computed from the
-/// nodes as given.
-fn collapsed_vertices(sequence: &[(Point, bool, bool)]) -> Vec<usize> {
-    let mut collapsed = Vec::new();
-    let nodes = (0..sequence.len())
-        .filter(|&i| sequence[i].1)
-        .collect::<Vec<_>>();
-    for pair in nodes.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        if sequence[a].0 != sequence[b].0 {
+/// nodes as given; each collapsed vertex's flag in `is_node` is set.
+fn mark_collapsed_vertices(sequence: &[(Point, bool, bool)], is_node: &mut [bool]) {
+    // Consecutive nodes with equal points and exactly one vertex between.
+    let mut previous_node = None::<usize>;
+    let mut between = 0usize;
+    let mut between_vertex = 0usize;
+    for (i, &(p, node, vertex)) in sequence.iter().enumerate() {
+        if node {
+            if let Some(a) = previous_node
+                && sequence[a].0 == p
+                && between == 1
+            {
+                is_node[between_vertex] = true;
+            }
+            previous_node = Some(i);
+            between = 0;
+        } else if vertex && previous_node.is_some() {
+            between += 1;
+            between_vertex = i;
+        }
+    }
+    // Three consecutive vertices whose first and last are equal.
+    let (mut first, mut second) = (None::<usize>, None::<usize>);
+    for (i, &(p, _, vertex)) in sequence.iter().enumerate() {
+        if !vertex {
             continue;
         }
-        let mut between = (a + 1..b).filter(|&i| sequence[i].2);
-        if let (Some(vertex), None) = (between.next(), between.next()) {
-            collapsed.push(vertex);
+        if let (Some(t0), Some(t1)) = (first, second)
+            && sequence[t0].0 == p
+        {
+            is_node[t1] = true;
         }
+        first = second;
+        second = Some(i);
     }
-    let vertices = (0..sequence.len())
-        .filter(|&i| sequence[i].2)
-        .collect::<Vec<_>>();
-    for triple in vertices.windows(3) {
-        if sequence[triple[0]].0 == sequence[triple[2]].0 {
-            collapsed.push(triple[1]);
-        }
-    }
-    collapsed
 }
 
 /// `SegmentNodeList.addSplitEdges`: substrings between consecutive nodes.
 /// Each entry is a point, whether it is a node, and whether it is a vertex
 /// of the string (rather than a node inserted inside a segment).
 fn split_at_nodes(sequence: &[(Point, bool, bool)], delta: i64, output: &mut Vec<Noded>) {
-    let mut collapsed = collapsed_vertices(sequence);
-    collapsed.sort_unstable();
-    let sequence = sequence
-        .iter()
-        .enumerate()
-        .map(|(i, &(p, node, _))| (p, node || collapsed.binary_search(&i).is_ok()))
-        .collect::<Vec<_>>();
-    let Some(&(first, _)) = sequence.first() else {
+    let Some(&(first, ..)) = sequence.first() else {
         return;
     };
-    let mut current = vec![first];
-    for &(p, node) in &sequence[1..] {
+    let mut is_node = sequence
+        .iter()
+        .map(|&(_, node, _)| node)
+        .collect::<Vec<_>>();
+    mark_collapsed_vertices(sequence, &mut is_node);
+    // Room for the points from `from` up to the next node.
+    let span = |from: usize| {
+        is_node[from + 1..]
+            .iter()
+            .position(|&n| n)
+            .map_or(sequence.len() - from, |k| k + 2)
+    };
+    let mut current = Vec::with_capacity(span(0));
+    current.push(first);
+    for (i, &(p, ..)) in sequence.iter().enumerate().skip(1) {
         if current.last() != Some(&p) {
             current.push(p);
         }
-        if node {
+        if is_node[i] {
             if current.len() >= 2 {
                 output.push(Noded {
                     points: std::mem::take(&mut current),
@@ -1691,6 +1755,9 @@ fn split_at_nodes(sequence: &[(Point, bool, bool)], delta: i64, output: &mut Vec
                 });
             } else {
                 current.clear();
+            }
+            if current.capacity() == 0 && i + 1 < sequence.len() {
+                current.reserve_exact(span(i));
             }
             current.push(p);
         }
@@ -1763,9 +1830,9 @@ fn node_snap_round(curves: &[Curve], scale: f64, prescaled: bool) -> Option<Vec<
                 .iter()
                 .any(|p| (*p != p0 && *p != p1) || (*p != q0 && *p != q1));
             if !found.is_empty() && interior {
-                pixels.extend(&found);
-                nodes[i].extend(&found);
-                nodes[j].extend(found);
+                pixels.extend_from_slice(&found);
+                nodes[i].extend_from_slice(&found);
+                nodes[j].extend_from_slice(&found);
                 continue;
             }
             // processNearVertex
@@ -1961,30 +2028,60 @@ fn edge_end_order(origin: Point, a: Point, b: Point) -> std::cmp::Ordering {
 /// Rings keep JTS's start and orientation. `None` where JTS would throw.
 fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
     // insertUniqueEdge
-    let mut edges = Vec::<(Vec<Point>, i64)>::new();
+    let mut edges = Vec::<(Vec<Point>, i64)>::with_capacity(noded.len());
     // Each edge is looked up by its coordinates in whichever direction
-    // orders first, with the direction it was inserted in.
-    let mut lookup = HashMap::<Vec<(u64, u64)>, (usize, bool)>::default();
+    // orders first, with the direction it was inserted in: by a hash of
+    // that sequence of keys, then comparing the sequences of the edges
+    // that share the hash (chained through `same_hash`).
+    let mut lookup = HashMap::<u64, usize>::default();
+    lookup.reserve(noded.len());
+    let mut stored_reversed = Vec::<bool>::with_capacity(noded.len());
+    let mut same_hash = Vec::<usize>::with_capacity(noded.len());
+    fn canonical(points: &[Point], reversed: bool) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let n = points.len();
+        (0..n).map(move |i| key(points[if reversed { n - 1 - i } else { i }]))
+    }
     for Noded { points, delta } in noded {
         if points.len() < 2 || (points.len() == 2 && points[0] == points[1]) {
             continue;
         }
-        let mut canonical = points.iter().map(|&p| key(p)).collect::<Vec<_>>();
-        let reversed = canonical.iter().rev().lt(canonical.iter());
-        if reversed {
-            canonical.reverse();
+        let reversed = points
+            .iter()
+            .rev()
+            .map(|&p| key(p))
+            .lt(points.iter().map(|&p| key(p)));
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            points.len().hash(&mut hasher);
+            for k in canonical(&points, reversed) {
+                k.hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+        let mut found = None;
+        let mut e = lookup.get(&hash).copied().unwrap_or(usize::MAX);
+        while e != usize::MAX {
+            if edges[e].0.len() == points.len()
+                && canonical(&edges[e].0, stored_reversed[e]).eq(canonical(&points, reversed))
+            {
+                found = Some(e);
+                break;
+            }
+            e = same_hash[e];
         }
-        match lookup.entry(canonical) {
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                let (e, stored_reversed) = *entry.get();
-                if stored_reversed == reversed {
+        match found {
+            Some(e) => {
+                if stored_reversed[e] == reversed {
                     edges[e].1 += delta;
                 } else {
                     edges[e].1 -= delta;
                 }
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert((edges.len(), reversed));
+            None => {
+                let index = edges.len();
+                same_hash.push(lookup.insert(hash, index).unwrap_or(usize::MAX));
+                stored_reversed.push(reversed);
                 edges.push((points, delta));
             }
         }
@@ -2007,13 +2104,15 @@ fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
         }
     };
     // JTS directed edges: 2e along the edge, 2e + 1 against it. A JTS
-    // result edge has the interior on its right.
-    let edge_points = |d: usize| -> Vec<Point> {
+    // result edge has the interior on its right. Appends the points of `d`,
+    // without the first unless `first`.
+    let extend_edge_points = |out: &mut Vec<Point>, d: usize, first: bool| {
         let points = &edges[d / 2].0;
+        let skip = usize::from(!first);
         if d.is_multiple_of(2) {
-            points.clone()
+            out.extend_from_slice(&points[skip..]);
         } else {
-            points.iter().rev().copied().collect()
+            out.extend(points.iter().rev().skip(skip).copied());
         }
     };
     let start_of = |d: usize| {
@@ -2033,8 +2132,10 @@ fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
     };
     // Node stars of the JTS graph.
     let mut nodes = HashMap::<(u64, u64), usize>::default();
+    nodes.reserve(edges.len() * 2);
     let mut node_points = Vec::<Point>::new();
     let mut star = Vec::<Vec<usize>>::new();
+    let mut node_index = Vec::with_capacity(edges.len() * 2);
     for d in 0..edges.len() * 2 {
         let k = start_of(d);
         let n = *nodes.entry(k).or_insert_with(|| {
@@ -2047,6 +2148,7 @@ fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
             star.push(Vec::new());
             star.len() - 1
         });
+        node_index.push(n);
         // EdgeEndStar keeps its ends in a TreeMap: an end in the same
         // direction as an earlier one replaces it.
         let origin = node_points[n];
@@ -2056,9 +2158,6 @@ fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
             Err(i) => list.insert(i, d),
         }
     }
-    let node_index = (0..edges.len() * 2)
-        .map(|d| nodes[&start_of(d)])
-        .collect::<Vec<_>>();
     let node_of = |d: usize| node_index[d];
     // JTS edge depth delta of a directed edge: left minus right.
     let edge_delta = |d: usize| {
@@ -2130,14 +2229,13 @@ fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
     // DirectedEdgeStar.linkResultDirectedEdges
     let mut next = vec![usize::MAX; edges.len() * 2];
     for list in &star {
-        let area = list
+        let mut first_out = None;
+        let mut incoming = None;
+        for out in list
             .iter()
             .copied()
             .filter(|&d| in_result(d) || in_result(d ^ 1))
-            .collect::<Vec<_>>();
-        let mut first_out = None;
-        let mut incoming = None;
-        for &out in &area {
+        {
             let sym = out ^ 1;
             if first_out.is_none() && in_result(out) {
                 first_out = Some(out);
@@ -2189,10 +2287,13 @@ fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
         maximal.push(ring);
     }
     let points_of = |ring: &[usize]| {
-        let mut points = Vec::new();
+        let len = 1 + ring
+            .iter()
+            .map(|&d| edges[d / 2].0.len() - 1)
+            .sum::<usize>();
+        let mut points = Vec::with_capacity(len);
         for (i, &d) in ring.iter().enumerate() {
-            let p = edge_points(d);
-            points.extend(if i == 0 { &p[..] } else { &p[1..] });
+            extend_edge_points(&mut points, d, i == 0);
         }
         points
     };
@@ -2200,12 +2301,19 @@ fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
     let is_hole = |points: &[Point]| signed_area(points) > 0.0;
     let mut shells = Vec::<(Vec<Point>, Vec<Vec<Point>>)>::new();
     let mut free_holes = Vec::<Vec<Point>>::new();
+    // The maximal ring that last visited each node.
+    let mut visited_by = vec![usize::MAX; node_points.len()];
     for (index, ring) in maximal.iter().enumerate() {
-        let mut out_degree = HashMap::<usize, usize>::default();
+        let mut node_visited_twice = false;
         for &d in ring {
-            *out_degree.entry(node_of(d)).or_default() += 1;
+            let n = node_of(d);
+            if visited_by[n] == index {
+                node_visited_twice = true;
+                break;
+            }
+            visited_by[n] = index;
         }
-        if out_degree.values().all(|&n| n <= 1) {
+        if !node_visited_twice {
             let points = points_of(ring);
             if is_hole(&points) {
                 free_holes.push(points);
@@ -2223,14 +2331,14 @@ fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
             if !done.insert(n) {
                 continue;
             }
-            let area = star[n]
+            let mut first_out = None;
+            let mut incoming = None;
+            for out in star[n]
                 .iter()
                 .copied()
                 .filter(|&e| in_result(e) || in_result(e ^ 1))
-                .collect::<Vec<_>>();
-            let mut first_out = None;
-            let mut incoming = None;
-            for &out in area.iter().rev() {
+                .rev()
+            {
                 let sym = out ^ 1;
                 if first_out.is_none() && ring_of[out] == index {
                     first_out = Some(out);

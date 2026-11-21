@@ -2064,6 +2064,11 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
             result.push((members, cluster.into_iter().next().unwrap(), false));
             continue;
         }
+        #[cfg(test)]
+        if merge_replay::COLLECT_ONLY.with(std::cell::Cell::get) {
+            result.push((members, MultiPolygon(vec![]), false));
+            continue;
+        }
         let merged = if distance > 0. {
             // FeatureMerge.bufferUnionUnbuffer, through the port of the
             // pinned JTS buffer and union; the integer overlay remains for
@@ -4780,6 +4785,11 @@ mod merge_replay {
     use super::*;
     use std::time::Instant;
 
+    // The binary's allocator, so that replay timings match a compile's.
+    #[cfg(feature = "mimalloc")]
+    #[global_allocator]
+    static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
     #[derive(Deserialize)]
     struct Group {
         layer: String,
@@ -4879,7 +4889,12 @@ mod merge_replay {
     #[ignore]
     fn merge_replay_timing() {
         let Some(groups) = groups() else { return };
-        for geo in [true, false] {
+        let variants: &[bool] = if std::env::var_os("OTC_BENCH_GEO").is_some() {
+            &[true, false]
+        } else {
+            &[false]
+        };
+        for &geo in variants {
             GEO_PROXIMITY.with(|g| g.set(geo));
             replay_dissolve(
                 &groups,
@@ -4894,19 +4909,75 @@ mod merge_replay {
     }
 
     fn replay_dissolve(groups: &[(f64, Vec<MultiPolygon<f64>>)], label: &str) {
+        use std::hash::{Hash, Hasher};
+        // A digest of every merged cluster's coordinates, in order, so that two
+        // builds can be compared bit for bit.
+        let mut digest = std::collections::hash_map::DefaultHasher::new();
+        let hash = |digest: &mut std::collections::hash_map::DefaultHasher,
+                    g: &MultiPolygon<f64>| {
+            for p in &g.0 {
+                for ring in std::iter::once(p.exterior()).chain(p.interiors()) {
+                    ring.0.len().hash(digest);
+                    for c in &ring.0 {
+                        (c.x.to_bits(), c.y.to_bits()).hash(digest);
+                    }
+                }
+            }
+        };
+        let only_small = std::env::var_os("OTC_BENCH_SMALL").is_some();
         let mut total = 0.;
         for (distance, geoms) in groups.iter().cloned() {
-            let started = Instant::now();
-            let clusters = merge_nearby(geoms, distance);
-            total += started.elapsed().as_secs_f64();
-            for (members, merged, jts) in clusters {
-                if members.len() > 1 && jts {
-                    let started = Instant::now();
-                    std::hint::black_box(super::super::jts_buffer::snap_and_fix(&merged));
-                    total += started.elapsed().as_secs_f64();
+            let geoms = if only_small {
+                // Clusters of at most five members, each run on its own.
+                let mut out = Vec::new();
+                for (members, ..) in merge_nearby_collect(&geoms, distance) {
+                    if (2..=5).contains(&members.len()) {
+                        out.push(members.iter().map(|&i| geoms[i].clone()).collect());
+                    }
+                }
+                out
+            } else {
+                vec![geoms]
+            };
+            for geoms in geoms {
+                let started = Instant::now();
+                let clusters = merge_nearby(geoms, distance);
+                let mut snapped = Vec::new();
+                for (members, merged, jts) in &clusters {
+                    if members.len() > 1 && *jts {
+                        snapped.push(super::super::jts_buffer::snap_and_fix(merged));
+                    }
+                }
+                total += started.elapsed().as_secs_f64();
+                for (members, merged, jts) in &clusters {
+                    members.hash(&mut digest);
+                    jts.hash(&mut digest);
+                    hash(&mut digest, merged);
+                }
+                for s in snapped.iter().flatten() {
+                    hash(&mut digest, s);
                 }
             }
         }
-        println!("{label}: dissolve total {total:.2}s");
+        println!(
+            "{label}: dissolve total {total:.2}s, digest {:016x}",
+            digest.finish()
+        );
+    }
+
+    /// The proximity clusters' members, without merging them.
+    fn merge_nearby_collect(
+        geoms: &[MultiPolygon<f64>],
+        distance: f64,
+    ) -> Vec<(Vec<usize>, MultiPolygon<f64>, bool)> {
+        COLLECT_ONLY.with(|c| c.set(true));
+        let result = merge_nearby(geoms.to_vec(), distance);
+        COLLECT_ONLY.with(|c| c.set(false));
+        result
+    }
+
+    thread_local! {
+        /// Makes `merge_nearby` return each cluster's members unmerged.
+        pub(super) static COLLECT_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }
