@@ -396,11 +396,80 @@ impl Header {
 pub(super) struct Sorter {
     directory: PathBuf,
     worker: usize,
+    /// Frame bytes this buffer holds before it spills; see `SortBudget`.
     budget: usize,
+    limits: Arc<SortBudget>,
     frames: Vec<u8>,
     entries: Vec<SortEntry>,
     runs: Vec<PathBuf>,
+    /// Frame bytes and records this sorter has spilled.
+    spilled_frames: u64,
+    spilled_records: u64,
     spilled: Arc<AtomicU64>,
+}
+
+// The largest frame buffer a worker grows to. Frame offsets are 32-bit, and
+// one sort of more than this takes long enough to stall the worker's share
+// of the rendering noticeably.
+const MAX_FRAME_BUDGET: usize = 2 << 30;
+// The workers keep their starting buffers until they have spilled this many
+// runs between them. Below it the final merge takes every run in one pass,
+// so larger buffers would only add memory; above it the compile is headed
+// for more runs than one merge takes.
+const GROW_AFTER_RUNS: usize = MERGE_FAN_IN / 2;
+
+/// How large the workers' sort buffers may grow.
+///
+/// Every worker starts with `floor` frame bytes. Once the workers have
+/// spilled `GROW_AFTER_RUNS` runs between them, each worker's next buffer
+/// is as large as everything it has spilled so far, up to its share of the
+/// sort memory: run sizes double until memory caps them. A small extract
+/// keeps the floor, its run count and its peak memory; a large one ends with
+/// a few dozen large runs per worker, and the merge combines the small early
+/// runs first (`Store::finish`), rather than every record twice or more.
+#[derive(Debug)]
+pub(super) struct SortBudget {
+    floor: usize,
+    /// Bytes each worker may hold in frames and sort entries together.
+    worker_memory: usize,
+    runs: AtomicUsize,
+}
+
+impl SortBudget {
+    /// `floor` frame bytes per worker, growing as far as `memory` bytes split
+    /// among `workers`; `memory` below the floors keeps the floor.
+    pub(super) fn new(floor: usize, memory: Option<u64>, workers: usize) -> Self {
+        let worker_memory = memory.map_or(0, |memory| {
+            usize::try_from(memory / workers.max(1) as u64).unwrap_or(usize::MAX)
+        });
+        Self {
+            floor: floor.max(1),
+            worker_memory,
+            runs: AtomicUsize::new(0),
+        }
+    }
+    /// A budget that stays at `bytes`.
+    #[cfg(test)]
+    pub(super) fn fixed(bytes: usize) -> Arc<Self> {
+        Arc::new(Self::new(bytes, None, 1))
+    }
+
+    /// The frame budget for a sorter's next run, after it spilled a run of
+    /// its own (`spilled_*` count all of them) on a budget of `current`.
+    fn after_spill(&self, current: usize, spilled_frames: u64, spilled_records: u64) -> usize {
+        let runs = self.runs.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        if runs < GROW_AFTER_RUNS || spilled_frames == 0 {
+            return current;
+        }
+        // A record costs its frame and its entry, and the entries' vector
+        // may hold as much spare capacity again once it has doubled.
+        let entry_bytes = 2 * spilled_records as u128 * size_of::<SortEntry>() as u128;
+        let frames = spilled_frames as u128;
+        let ceiling = self.worker_memory as u128 * frames / (frames + entry_bytes);
+        let ceiling = (ceiling.min(MAX_FRAME_BUDGET as u128) as usize).max(self.floor);
+        let doubled = usize::try_from(spilled_frames).unwrap_or(usize::MAX);
+        doubled.max(current).min(ceiling)
+    }
 }
 
 /// A buffered record's sort key, less what the frame at `offset` holds: the
@@ -498,6 +567,7 @@ impl Sorter {
         if self.frames.capacity() == 0 {
             // The buffer fills to the budget before it spills; reserving it
             // whole saves growing (and holding up to twice) as it fills.
+            // `spill` reserves budgets grown past this.
             self.frames.reserve(self.budget.min(MAX_RECORD_BYTES));
         }
         let offset = u32::try_from(self.frames.len())
@@ -539,8 +609,20 @@ impl Sorter {
         }
         let spilled = writer.finish()?;
         self.spilled.fetch_add(spilled, AtomicOrdering::Relaxed);
+        self.spilled_frames += self.frames.len() as u64;
+        self.spilled_records += self.entries.len() as u64;
         self.entries.clear();
         self.frames.clear();
+        let budget =
+            self.limits
+                .after_spill(self.budget, self.spilled_frames, self.spilled_records);
+        if budget > self.budget {
+            self.budget = budget;
+            // Free the old buffer before reserving the new one, so the two
+            // are never held together.
+            self.frames = Vec::new();
+            self.frames.reserve_exact(budget);
+        }
         Ok(())
     }
     /// Spills the remainder and hands the run files to the caller.
@@ -608,14 +690,17 @@ impl Store {
             zooms: BTreeMap::new(),
         })
     }
-    pub(super) fn sorter(&self, worker: usize, budget: usize) -> Sorter {
+    pub(super) fn sorter(&self, worker: usize, limits: &Arc<SortBudget>) -> Sorter {
         Sorter {
             directory: self.directory.clone(),
             worker,
-            budget,
+            budget: limits.floor,
+            limits: limits.clone(),
             frames: vec![],
             entries: vec![],
             runs: vec![],
+            spilled_frames: 0,
+            spilled_records: 0,
             spilled: self.spilled.clone(),
         }
     }
@@ -651,31 +736,43 @@ impl Store {
             "raw_bytes":self.spilled.load(AtomicOrdering::Relaxed),
             "bytes":self.runs.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum::<u64>()})
         );
-        // Every pass reads all the records once: the fraction is the bytes
-        // merged over the run bytes times the passes. Both count records as
-        // frames, before compression.
+        // The final merge reads every record once, and each intermediate pass
+        // the records of the runs it merges. Progress counts records as
+        // frames, before compression; a run's share of them is taken to be
+        // its share of the run files' bytes.
         let run_bytes = self.spilled.load(AtomicOrdering::Relaxed);
-        let mut passes = 1;
-        let mut runs = self.runs.len();
-        while runs > MERGE_FAN_IN {
-            runs = runs.div_ceil(MERGE_FAN_IN);
-            passes += 1;
+        let mut sizes = run_sizes(&self.runs)?;
+        let file_bytes = sizes.iter().sum::<u64>();
+        let mut intermediate = 0u64;
+        while sizes.len() > MERGE_FAN_IN {
+            let plan = merge_plan(&sizes);
+            let merged = plan.iter().map(|group| group_bytes(&sizes, group));
+            let merged = merged.collect::<Vec<_>>();
+            intermediate += merged.iter().sum::<u64>();
+            sizes = unmerged(sizes, &plan);
+            sizes.extend(merged);
         }
-        control.set_total(run_bytes * passes);
+        let intermediate = (u128::from(run_bytes) * u128::from(intermediate)
+            / u128::from(file_bytes.max(1))) as u64;
+        control.set_total(run_bytes.saturating_add(intermediate));
         let merge_phase = crate::profiling::Phase::start("omt_intermediate_merge");
         while self.runs.len() > MERGE_FAN_IN {
-            let groups = self.runs.len().div_ceil(MERGE_FAN_IN);
-            let outputs = (0..groups).map(|_| self.next_path()).collect::<Vec<_>>();
+            let plan = merge_plan(&run_sizes(&self.runs)?);
+            let groups = plan
+                .iter()
+                .map(|group| group.iter().map(|&run| self.runs[run].clone()).collect())
+                .collect::<Vec<Vec<_>>>();
+            let outputs = groups.iter().map(|_| self.next_path()).collect::<Vec<_>>();
             // Keys are unique, so any grouping merges to the same record order.
-            if let Err(error) = merge_groups(&self.runs, &outputs, threads, control) {
+            if let Err(error) = merge_groups(&groups, &outputs, threads, control) {
                 for path in &outputs {
                     let _ = fs::remove_file(path);
                 }
                 return Err(error);
             }
-            for input in std::mem::replace(&mut self.runs, outputs) {
-                fs::remove_file(input).map_err(|e| e.to_string())?;
-            }
+            // `merge_groups` removed the merged runs.
+            self.runs = unmerged(std::mem::take(&mut self.runs), &plan);
+            self.runs.extend(outputs);
         }
         drop(merge_phase);
         let metadata = metadata(
@@ -767,20 +864,79 @@ impl Store {
     }
 }
 
-/// Merges each `MERGE_FAN_IN`-sized group of `runs` into the matching path in
-/// `outputs`, at most `threads` groups at a time.
+/// The sizes of the run files at `runs`.
+fn run_sizes(runs: &[PathBuf]) -> Result<Vec<u64>, String> {
+    runs.iter()
+        .map(|run| {
+            fs::metadata(run)
+                .map(|metadata| metadata.len())
+                .map_err(|e| format!("Failed to read {}: {e}", run.display()))
+        })
+        .collect()
+}
+
+/// The runs, of these `sizes`, that the next intermediate pass merges, as
+/// groups of indexes: the fewest and smallest runs whose merging leaves at
+/// most `MERGE_FAN_IN` runs for the final merge, or all of them, in groups
+/// of at most `MERGE_FAN_IN`, when one pass can't get that far. Growing sort
+/// buffers (`SortBudget`) leave many small early runs and few large ones, so
+/// a pass usually rewrites a small part of the records rather than all.
+fn merge_plan(sizes: &[u64]) -> Vec<Vec<usize>> {
+    let (runs, fan_in) = (sizes.len(), MERGE_FAN_IN);
+    if runs <= fan_in {
+        return vec![];
+    }
+    // Each group of k runs turns into one, so g groups taking
+    // runs - fan_in + g runs between them leave exactly fan_in.
+    let groups = (runs - fan_in).div_ceil(fan_in - 1);
+    let (groups, merged) = if groups <= fan_in {
+        (groups, runs - fan_in + groups)
+    } else {
+        (runs.div_ceil(fan_in), runs)
+    };
+    let mut order = (0..runs).collect::<Vec<_>>();
+    order.sort_by_key(|&run| (sizes[run], run));
+    (0..groups)
+        .map(|group| order[group * merged / groups..(group + 1) * merged / groups].to_vec())
+        .collect()
+}
+
+fn group_bytes(sizes: &[u64], group: &[usize]) -> u64 {
+    group.iter().map(|&run| sizes[run]).sum()
+}
+
+/// The items of `items` that no group of `plan` takes, in their order.
+fn unmerged<T>(items: Vec<T>, plan: &[Vec<usize>]) -> Vec<T> {
+    let mut merged = vec![false; items.len()];
+    for &index in plan.iter().flatten() {
+        merged[index] = true;
+    }
+    items
+        .into_iter()
+        .zip(merged)
+        .filter_map(|(item, merged)| (!merged).then_some(item))
+        .collect()
+}
+
+/// Merges each group of runs into the matching path in `outputs`, at most
+/// `threads` groups at a time, and removes a group's runs once it is merged,
+/// so a pass needs scratch space for one group's records twice, not all.
 fn merge_groups(
-    runs: &[PathBuf],
+    groups: &[Vec<PathBuf>],
     outputs: &[PathBuf],
     threads: usize,
     control: &Control,
 ) -> Result<(), String> {
     let next = AtomicUsize::new(0);
     let merge_group = |group: usize| -> Result<(), String> {
-        let batch = &runs[group * MERGE_FAN_IN..((group + 1) * MERGE_FAN_IN).min(runs.len())];
+        let batch = &groups[group];
         let mut writer = RunWriter::create(&outputs[group])?;
         merge_controlled(batch, control, |record| writer.write(&record))?;
-        writer.finish().map(drop)
+        writer.finish()?;
+        for run in batch {
+            fs::remove_file(run).map_err(|e| format!("Failed to remove {}: {e}", run.display()))?;
+        }
+        Ok(())
     };
     let results = std::thread::scope(|scope| {
         let workers = (0..threads.min(outputs.len()))
@@ -3403,7 +3559,7 @@ mod tests {
         // budget small enough to spill several runs.
         let layers = ["poi", "zzz_custom", "building", "aaa_custom", "water"];
         let mut expected = vec![];
-        let mut sorter = store.sorter(0, 600);
+        let mut sorter = store.sorter(0, &SortBudget::fixed(600));
         for i in 0..200u64 {
             let mut r = record(i % 3);
             r.tile_id = (i * 7) % 4;
@@ -3439,12 +3595,62 @@ mod tests {
     }
 
     #[test]
+    fn merge_plan_merges_only_the_smallest_runs_it_needs() {
+        let f = MERGE_FAN_IN;
+        assert!(merge_plan(&vec![1; f]).is_empty());
+        // One run too many: the two smallest become one.
+        let mut sizes = (0..=f as u64).map(|run| 1000 - run).collect::<Vec<_>>();
+        assert_eq!(merge_plan(&sizes), vec![vec![f, f - 1]]);
+        // Many small early runs and a few large ones: only small ones merge.
+        sizes = [vec![8; 3 * f], vec![1 << 20; 40]].concat();
+        let plan = merge_plan(&sizes);
+        assert!(plan.iter().flatten().all(|&run| sizes[run] == 8));
+        let left = sizes.len() - plan.iter().map(Vec::len).sum::<usize>() + plan.len();
+        assert_eq!(left, f);
+        assert!(plan.iter().all(|group| (2..=f).contains(&group.len())));
+        // More than one pass can reach: every run, in groups of at most f.
+        sizes = vec![1; f * f + 1];
+        let plan = merge_plan(&sizes);
+        assert_eq!(plan.len(), f + 1);
+        assert_eq!(plan.iter().map(Vec::len).sum::<usize>(), sizes.len());
+        assert!(plan.iter().all(|group| group.len() <= f));
+        let mut runs = plan.concat();
+        runs.sort_unstable();
+        assert!(runs.iter().copied().eq(0..sizes.len()));
+    }
+
+    #[test]
+    fn sort_budget_grows_after_many_runs_up_to_its_memory() {
+        let entry = size_of::<SortEntry>() as u64;
+        let budget = SortBudget::new(100, Some(4 * 10_000), 4);
+        // Runs below `GROW_AFTER_RUNS` keep the floor.
+        for run in 1..GROW_AFTER_RUNS as u64 {
+            assert_eq!(budget.after_spill(100, run * 100, run), 100);
+        }
+        // Then a run is as large as the sorter's earlier ones together.
+        assert_eq!(budget.after_spill(100, 300, 3), 300);
+        assert_eq!(budget.after_spill(300, 600, 6), 600);
+        // Up to the worker's 10,000 bytes, less its entries and their spare
+        // capacity: records of 100 frame bytes leave 100 / (100 + 2 * 32).
+        let ceiling = (10_000 * 100 / (100 + 2 * entry)) as usize;
+        assert_eq!(budget.after_spill(600, 100 << 14, 1 << 14), ceiling);
+        // Never below the floor, however little memory there is.
+        let starved = SortBudget::new(100, Some(10), 4);
+        starved.runs.store(GROW_AFTER_RUNS, AtomicOrdering::Relaxed);
+        assert_eq!(starved.after_spill(100, 1 << 20, 1 << 14), 100);
+        // Unknown memory keeps the floor too.
+        let unknown = SortBudget::new(100, None, 4);
+        unknown.runs.store(GROW_AFTER_RUNS, AtomicOrdering::Relaxed);
+        assert_eq!(unknown.after_spill(100, 1 << 20, 1 << 14), 100);
+    }
+
+    #[test]
     fn opaque_merge_orders_equal_keys_by_sequence_across_multiple_passes() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = Store::new(temp.path()).unwrap();
         // Equal sort keys; sequences are interleaved across runs and workers.
         for run in 0..20u64 {
-            let mut sorter = store.sorter(run as usize, usize::MAX);
+            let mut sorter = store.sorter(run as usize, &SortBudget::fixed(usize::MAX));
             for offset in 0..3u64 {
                 let sequence = offset * 20 + run;
                 let mut r = record(7);
@@ -3730,7 +3936,7 @@ mod tests {
     /// Sorts records into one run owned by `store`; the position in `records`
     /// plus `first` is the insertion sequence.
     fn add_run(store: &mut Store, worker: usize, first: u64, records: Vec<Record>) {
-        let mut sorter = store.sorter(worker, usize::MAX);
+        let mut sorter = store.sorter(worker, &SortBudget::fixed(usize::MAX));
         for (offset, r) in records.iter().enumerate() {
             sorter
                 .add(EncodedRecord::encode(r, seq(first + offset as u64)).unwrap())

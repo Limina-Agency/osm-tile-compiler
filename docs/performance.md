@@ -90,9 +90,50 @@ supplemental datasets of the tests rather than the real 1.5 GB:
 | Monaco (`fixtures/monaco.osm.pbf`, 0.4 MB), command line | 82–85 MiB | 98–114 MiB |
 | Monaco, `compile_basemap` (`examples/compile_basemap.rs`) | 91 MiB | 101–105 MiB |
 
-Most of that is fixed: per-thread sort buffers (8 MiB each), queues and
+Most of that is fixed: per-thread sort buffers (8 MiB each; see "Sort
+runs" for when they grow), queues and
 decoder state. Building levels read the basemap a tile at a time (see
 "Building levels" below).
+
+## Sort runs
+
+The render workers sort tile records in 8 MiB buffers and spill each full
+buffer to a run in the scratch directory; the final merge reads up to 128
+runs at once. A planet spills about 240 GB of records, which at 8 MiB is
+some 30,000 runs, and those used to be merged twice in full (30,000 to 235
+to 2) before the final merge.
+
+Once the workers have spilled 64 runs between them, each worker's next
+buffer is as large as everything it has spilled so far, up to its share of
+the sort memory: half of what is available when rendering starts (Linux:
+`MemAvailable` and cgroup limits; Windows: available physical memory;
+macOS: half the installed memory; elsewhere the buffers stay at 8 MiB).
+`--sort-memory <MIB>` or `BasemapRequest::sort_memory` sets it instead. An
+intermediate pass then merges only the smallest runs needed to leave 128,
+which are the small early ones. Extracts that spill fewer than 64 runs
+(Berlin, Pomorskie and Małopolskie spill 30 to 67) are unchanged.
+
+Measured on 2026-11-21 in a cloud container (4 cores, 15 GiB, Linux), 4
+threads, `--omit-sources all`, Geofabrik extracts of 2026-11-18. Every
+archive is byte-identical to main's.
+
+| Compile | main | memory-sized runs |
+|---|---|---|
+| Berlin | 12.4 s, 358 MiB, 31 runs | 12.3 s, 355 MiB, 30 runs |
+| Pomorskie | 17.3 s, 373 MiB, 41 runs | 16.7 s, 387 MiB, 42 runs |
+| Małopolskie | 28.5 s, 497 MiB, 67 runs | 27.9 s, 498 MiB, 67 runs |
+
+To see the planet's case on a small file, the 8 MiB start was scaled down
+to 18 KiB in a build for this measurement only, so that Małopolskie spills
+as many runs as a planet does. `--sort-memory 16` matches, at that scale,
+this machine's 4 workers with half of its 15 GiB on a planet; 64 matches a
+machine with four times the memory per worker.
+
+| Małopolskie, 18 KiB start | Runs | Intermediate passes | Time | Peak RSS |
+|---|---|---|---|---|
+| main | 30,032 | 7.4 s | 40.1 s | 452 MiB |
+| memory-sized, `--sort-memory 16` | 314 | 3.4 s | 34.5 s | 461 MiB |
+| memory-sized, `--sort-memory 64` | 148 | 0.0 s | 29.3 s | 502 MiB |
 
 ## Cost in an app's process
 

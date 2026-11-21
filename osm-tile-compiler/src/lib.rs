@@ -89,6 +89,7 @@ mod extracts;
 #[doc(hidden)]
 pub mod fuzzing;
 mod generalization;
+mod memory;
 mod omt;
 mod profiling;
 mod request;

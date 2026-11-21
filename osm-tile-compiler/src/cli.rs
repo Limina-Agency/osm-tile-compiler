@@ -119,6 +119,9 @@ Compile options:
   --min-zoom <N>        Lowest zoom, 0-14 [default: 0]
   --max-zoom <N>        Highest zoom, 0-14 [default: 14]
   --threads <N>         Worker threads [default: available cores]
+  --sort-memory <MIB>   Memory the tile sort may hold before it writes runs
+                        to scratch, at least 8 MiB per thread [default: half
+                        of the memory available when rendering starts]
   --temp-dir <DIR>      Scratch space [default: <FILE>.tmp, removed afterwards]
   --fetch               Download any supplemental dataset missing from --sources
   --building-levels     Also write the building levels beside the archive, as
@@ -217,6 +220,7 @@ struct CompileArgs {
     archive: ArchiveOptions,
     zoom: ZoomRange,
     threads: Option<usize>,
+    sort_memory: Option<u64>,
     temp_dir: Option<PathBuf>,
     fetch: bool,
     building_levels: bool,
@@ -506,6 +510,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut min_zoom = 0;
     let mut max_zoom = 14;
     let mut threads = None;
+    let mut sort_memory = None;
     let mut temp_dir = None;
     let mut fetch = false;
     let mut building_levels = false;
@@ -578,6 +583,13 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                     return Err("--threads must be at least 1".into());
                 }
                 threads = Some(count);
+            }
+            "--sort-memory" => {
+                let mib: u64 = number(value(&mut args, &flag)?, &flag)?;
+                sort_memory = Some(
+                    mib.checked_mul(1 << 20)
+                        .ok_or("--sort-memory is too large")?,
+                );
             }
             "--fetch" => fetch = true,
             "--building-levels" => building_levels = true,
@@ -678,6 +690,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         archive,
         zoom,
         threads,
+        sort_memory,
         temp_dir,
         fetch,
         building_levels,
@@ -1366,6 +1379,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.layers = args.layers;
     request.languages = args.languages;
     request.building_levels = args.building_levels;
+    request.sort_memory = args.sort_memory;
     let start = Instant::now();
     let mut stage = None;
     let output = compile_basemap(
