@@ -37,6 +37,124 @@ pub(super) const MERGE_FAN_IN: usize = 128;
 /// merge, counting one being decoded.
 const BLOCKS_AHEAD: usize = 2;
 
+/// An attribute name: the profile's names are static, so records decoded at
+/// encode time borrow them instead of allocating a string per attribute.
+pub(super) type AttrKey = std::borrow::Cow<'static, str>;
+
+/// A record's attributes, sorted by name: a `BTreeMap`'s order and lookups
+/// over one vector, which a decoded record fills with a single allocation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct AttrMap(Vec<(AttrKey, AttrValue)>);
+
+impl AttrMap {
+    #[cfg(test)]
+    pub(super) fn new() -> Self {
+        Self(Vec::new())
+    }
+    fn find(&self, key: &str) -> Result<usize, usize> {
+        self.0.binary_search_by(|(k, _)| (**k).cmp(key))
+    }
+    pub(super) fn get(&self, key: &str) -> Option<&AttrValue> {
+        self.find(key).ok().map(|i| &self.0[i].1)
+    }
+    pub(super) fn contains_key(&self, key: &str) -> bool {
+        self.find(key).is_ok()
+    }
+    /// Sets `key` to `value` and returns the value it replaced.
+    pub(super) fn insert(&mut self, key: AttrKey, value: AttrValue) -> Option<AttrValue> {
+        match self.find(&key) {
+            Ok(i) => Some(std::mem::replace(&mut self.0[i].1, value)),
+            Err(i) => {
+                self.0.insert(i, (key, value));
+                None
+            }
+        }
+    }
+    pub(super) fn remove(&mut self, key: &str) -> Option<AttrValue> {
+        self.find(key).ok().map(|i| self.0.remove(i).1)
+    }
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&AttrKey, &mut AttrValue) -> bool) {
+        self.0.retain_mut(|(k, v)| keep(k, v));
+    }
+    pub(super) fn iter(&self) -> AttrIter<'_> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+    #[cfg(test)]
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+    }
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+type AttrIter<'a> = std::iter::Map<
+    std::slice::Iter<'a, (AttrKey, AttrValue)>,
+    fn(&'a (AttrKey, AttrValue)) -> (&'a AttrKey, &'a AttrValue),
+>;
+
+impl std::ops::Index<&str> for AttrMap {
+    type Output = AttrValue;
+    fn index(&self, key: &str) -> &AttrValue {
+        self.get(key).expect("no attribute of that name")
+    }
+}
+
+impl<'a> IntoIterator for &'a AttrMap {
+    type Item = (&'a AttrKey, &'a AttrValue);
+    type IntoIter = AttrIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for AttrMap {
+    type Item = (AttrKey, AttrValue);
+    type IntoIter = std::vec::IntoIter<(AttrKey, AttrValue)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl FromIterator<(AttrKey, AttrValue)> for AttrMap {
+    /// As `BTreeMap` collects: sorted by key, the last value of a repeated
+    /// key kept.
+    fn from_iter<I: IntoIterator<Item = (AttrKey, AttrValue)>>(iter: I) -> Self {
+        let mut entries: Vec<_> = iter.into_iter().collect();
+        if !entries.is_sorted_by(|a, b| a.0 < b.0) {
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut deduped: Vec<(AttrKey, AttrValue)> = Vec::with_capacity(entries.len());
+            for entry in entries {
+                match deduped.last_mut() {
+                    Some(last) if last.0 == entry.0 => *last = entry,
+                    _ => deduped.push(entry),
+                }
+            }
+            entries = deduped;
+        }
+        Self(entries)
+    }
+}
+
+impl<const N: usize> From<[(AttrKey, AttrValue); N]> for AttrMap {
+    fn from(entries: [(AttrKey, AttrValue); N]) -> Self {
+        entries.into_iter().collect()
+    }
+}
+
+impl Serialize for AttrMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for AttrMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        BTreeMap::<AttrKey, AttrValue>::deserialize(deserializer)
+            .map(|map| map.into_iter().collect())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) enum AttrValue {
     String(String),
@@ -123,8 +241,8 @@ pub(super) struct Seq {
 /// counts only when it precedes every explicit `rank` attribute.
 #[derive(Default)]
 pub(super) struct MetadataSummary {
-    fields: BTreeMap<String, BTreeMap<String, FieldSummary>>,
-    zooms: BTreeMap<String, (u8, u8)>,
+    fields: BTreeMap<AttrKey, BTreeMap<AttrKey, FieldSummary>>,
+    zooms: BTreeMap<AttrKey, (u8, u8)>,
 }
 #[derive(Default)]
 struct FieldSummary {
@@ -195,7 +313,7 @@ impl MetadataSummary {
         for (layer, (min, max)) in self.zooms {
             store
                 .zooms
-                .entry(layer)
+                .entry(layer.into_owned())
                 .and_modify(|range| {
                     range.0 = range.0.min(min);
                     range.1 = range.1.max(max);
@@ -203,7 +321,7 @@ impl MetadataSummary {
                 .or_insert((min, max));
         }
         for (layer, fields) in self.fields {
-            let target = store.fields.entry(layer).or_default();
+            let target = store.fields.entry(layer.into_owned()).or_default();
             for (key, field) in fields {
                 let mut kind = field.explicit;
                 if field
@@ -214,7 +332,7 @@ impl MetadataSummary {
                 }
                 if let Some(kind) = kind {
                     target
-                        .entry(key)
+                        .entry(key.into_owned())
                         .and_modify(|old| {
                             if old != kind {
                                 *old = "String".into();
@@ -259,6 +377,12 @@ impl Layer {
         match self {
             Self::Known(id) => LAYER_NAMES[usize::from(*id)],
             Self::Other(name) => name,
+        }
+    }
+    fn into_name(self) -> AttrKey {
+        match self {
+            Self::Known(id) => AttrKey::Borrowed(LAYER_NAMES[usize::from(id)]),
+            Self::Other(name) => AttrKey::Owned(name.into_string()),
         }
     }
 }
@@ -324,7 +448,7 @@ impl EncodedRecord {
         decode_payload(
             &self.payload,
             self.key.tile_id,
-            self.key.layer.name(),
+            self.key.layer.into_name(),
             self.key.sort_key,
             self.key.id,
         )
@@ -1260,7 +1384,7 @@ fn encode_tile(
     gzip_level: u32,
     control: &Control,
 ) -> Result<Option<EncodedTile>, String> {
-    let mut layers: BTreeMap<String, Vec<Record>> = BTreeMap::new();
+    let mut layers: BTreeMap<AttrKey, Vec<Record>> = BTreeMap::new();
     for record in records {
         layers.entry(record.layer.clone()).or_default().push(record);
     }
@@ -1286,7 +1410,7 @@ fn encode_tile(
         timings
             .protobuf_gzip
             .measure(|| tile.extend_from_slice(&layer.encode()));
-        sizes.push((name, (tile.len() - start) as u64));
+        sizes.push((name.into_owned(), (tile.len() - start) as u64));
     }
     if sizes.is_empty() {
         return Ok(None);
@@ -1389,7 +1513,7 @@ fn point_density(records: Vec<Record>) -> Vec<Record> {
             if record.grid_limit > 0 && record.grid_cell.is_some() && count > record.grid_limit {
                 continue;
             }
-            if (record.rank || matches!(record.layer.as_str(), "place" | "mountain_peak"))
+            if (record.rank || matches!(&*record.layer, "place" | "mountain_peak"))
                 && !record.attrs.contains_key("rank")
             {
                 record.attrs.insert(
@@ -1454,7 +1578,7 @@ fn merge_geometries_controlled(
             false
         };
         let merge = match &record.geometry {
-            TileGeometry::Polygon(_) => match record.layer.as_str() {
+            TileGeometry::Polygon(_) => match &*record.layer {
                 "water" | "building" => true,
                 "landcover" => cover_merge,
                 "landuse" => {
@@ -1465,7 +1589,7 @@ fn merge_geometries_controlled(
             },
             TileGeometry::Line { .. } => {
                 matches!(
-                    record.layer.as_str(),
+                    &*record.layer,
                     "transportation" | "transportation_name" | "boundary"
                 ) || (record.layer == "waterway" && (6..=11).contains(&record.zoom))
             }
@@ -1604,7 +1728,7 @@ fn merge_geometries_controlled(
                 // Transportation, its name layer, and waterway use the same graph with their
                 // zoom-dependent loop, stub, and final length thresholds.
                 let full_graph = matches!(
-                    first.layer.as_str(),
+                    &*first.layer,
                     "boundary" | "transportation" | "transportation_name" | "waterway"
                 );
                 if !full_graph {
@@ -2160,11 +2284,7 @@ fn overlay_buffer_union_unbuffer(
     merged
 }
 
-fn line_merge_policy(
-    layer: &str,
-    zoom: u8,
-    attrs: &BTreeMap<String, AttrValue>,
-) -> Option<(f64, f64)> {
+fn line_merge_policy(layer: &str, zoom: u8, attrs: &AttrMap) -> Option<(f64, f64)> {
     let pixels = |meters: f64| meters / 40_075_016.685_578_49 * 256. * 2_f64.powi(i32::from(zoom));
     match layer {
         "waterway" if (6..=11).contains(&zoom) => Some((
@@ -3350,7 +3470,7 @@ mod tests {
         ]);
         for name in names {
             let mut r = record(17);
-            r.layer = name.clone();
+            r.layer = name.clone().into();
             r.tile_id = 42;
             r.sort_key = -9;
             let encoded = EncodedRecord::encode(
@@ -3396,7 +3516,7 @@ mod tests {
             );
         }
         let mut long = record(17);
-        long.layer = "z".repeat(MAX_LAYER_BYTES + 1);
+        long.layer = "z".repeat(MAX_LAYER_BYTES + 1).into();
         assert!(EncodedRecord::encode(&long, seq(0)).is_err());
     }
     #[test]
@@ -3409,7 +3529,7 @@ mod tests {
             for b in &names {
                 let key = |name: &str| {
                     let mut r = record(17);
-                    r.layer = name.into();
+                    r.layer = name.to_owned().into();
                     SortKey::of(&r, seq(0))
                 };
                 assert_eq!(key(a).cmp(&key(b)), a.cmp(b), "{a} vs {b}");
@@ -3486,13 +3606,13 @@ mod tests {
             assert_eq!(actual, expected);
         }
         assert_eq!(
-            line_merge_policy("transportation", 8, &BTreeMap::new())
+            line_merge_policy("transportation", 8, &AttrMap::new())
                 .unwrap()
                 .0,
             0.
         );
         assert!(
-            line_merge_policy("transportation", 7, &BTreeMap::new())
+            line_merge_policy("transportation", 7, &AttrMap::new())
                 .unwrap()
                 .0
                 > 0.
@@ -3557,11 +3677,11 @@ mod tests {
             let mut zooms: BTreeMap<String, (u8, u8)> = BTreeMap::new();
             for record in records {
                 let z = zooms
-                    .entry(record.layer.clone())
+                    .entry(record.layer.to_string())
                     .or_insert((record.zoom, record.zoom));
                 z.0 = z.0.min(record.zoom);
                 z.1 = z.1.max(record.zoom);
-                let fields = fields.entry(record.layer.clone()).or_default();
+                let fields = fields.entry(record.layer.to_string()).or_default();
                 for (key, value) in &record.attrs {
                     if !key.starts_with('_') {
                         let kind = match value {
@@ -3570,7 +3690,7 @@ mod tests {
                             _ => "Number",
                         };
                         fields
-                            .entry(key.clone())
+                            .entry(key.to_string())
                             .and_modify(|old| {
                                 if old != kind {
                                     *old = "String".into();
@@ -4160,7 +4280,7 @@ mod tests {
             id,
             layer: "poi".into(),
             geometry: TileGeometry::Point(vec![TilePoint::new(20, 20)]),
-            attrs: BTreeMap::new(),
+            attrs: AttrMap::new(),
             sort_key: 0,
             grid_size: 64.,
             grid_cell: Some((0, 0)),
@@ -4170,7 +4290,7 @@ mod tests {
     }
     fn polygon_record(layer: &str, zoom: u8, id: u64, x: i32) -> Record {
         let mut r = record(id);
-        r.layer = layer.into();
+        r.layer = layer.to_owned().into();
         r.zoom = zoom;
         r.grid_size = 0.;
         r.grid_cell = None;
@@ -4491,14 +4611,14 @@ mod tests {
         simplify_merged_lines(&mut paths, 1.6);
         assert_eq!(paths, vec![vec![p(0, 0), p(4, 0)]]);
         assert_eq!(
-            line_merge_policy("boundary", 8, &BTreeMap::new()),
+            line_merge_policy("boundary", 8, &AttrMap::new()),
             Some((1. / 16., 4.))
         );
     }
 
     #[test]
     fn transportation_name_length_threshold_matches_pinned_profile() {
-        let mut attrs = BTreeMap::new();
+        let mut attrs = AttrMap::new();
         attrs.insert("name".into(), AttrValue::String("A😀".into()));
         assert_eq!(
             line_merge_policy("transportation_name", 12, &attrs),
