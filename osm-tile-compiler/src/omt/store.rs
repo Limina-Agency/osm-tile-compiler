@@ -5343,6 +5343,234 @@ mod merge_replay {
     }
 
     /// The proximity clusters' members, without merging them.
+    /// Checks the strip bound (`jts_buffer::strip_bound_area`) against the
+    /// real output of every merged cluster, and counts the dropped clusters it
+    /// lets skip beyond the eroded hull, with the time they cost.
+    #[test]
+    #[ignore]
+    fn merge_replay_tight_bound() {
+        use super::super::jts_buffer as jts;
+        let Some(groups) = groups() else { return };
+        let min_area: f64 = std::env::var("OTC_BENCH_MIN_AREA")
+            .ok()
+            .map_or(4., |v| v.parse().unwrap())
+            * 256.;
+        let steps: Vec<f64> = std::env::var("OTC_BENCH_STEPS")
+            .ok()
+            .map_or(vec![1., 2., 4., 8.], |v| {
+                v.split(',').map(|s| s.parse().unwrap()).collect()
+            });
+        let (mut merged_clusters, mut dropped_clusters, mut hull_skips) = (0usize, 0usize, 0usize);
+        let (mut dropped_secs, mut hull_secs, mut hull_bound_secs) = (0., 0., 0.);
+        let mut worst_hull = f64::MIN;
+        // per step: skips beyond hull, their secs, violations, wrong skips, bound secs, worst slack
+        let mut per = vec![(0usize, 0f64, 0usize, 0usize, 0f64, f64::MIN); steps.len()];
+        let mut by_size = vec![[0usize; 4]; 5];
+        // dropped, not hull-skipped: histograms of out/min, strip(first)/min, hull/min, exact erosion/min
+        let mut hist = [[0usize; 12]; 5];
+        let mut row_stats = (0usize, 0f64, 0usize, 0usize, 0f64, f64::MIN);
+        let row_step: f64 = std::env::var("OTC_BENCH_ROW_STEP")
+            .ok()
+            .map_or(1., |v| v.parse().unwrap());
+        let mut hist_secs = [0f64; 12];
+        let bin = |v: f64| ((v * 4.).floor().max(0.) as usize).min(11);
+        for (distance, geoms) in &groups {
+            if *distance <= 1. {
+                continue;
+            }
+            for (members, ..) in merge_nearby_collect(geoms, *distance) {
+                if members.len() == 1 {
+                    continue;
+                }
+                let cluster: Vec<MultiPolygon<f64>> =
+                    members.iter().map(|&i| geoms[i].clone()).collect();
+                let Some(expanded) = cluster
+                    .iter()
+                    .map(|g| jts::buffer(g, *distance))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                let t0 = Instant::now();
+                let Some(merged) = jts::union(&expanded).and_then(|u| jts::buffer(&u, -*distance))
+                else {
+                    continue;
+                };
+                let envelope = merged
+                    .bounding_rect()
+                    .map_or(0., |r| r.width() * r.height());
+                let rings = if envelope < min_area {
+                    vec![]
+                } else {
+                    jts::snap_and_fix(&merged)
+                        .map(from_grid_polygons)
+                        .unwrap_or_else(|| from_polygons(merged.clone()))
+                };
+                let polys = to_polygons(&rings);
+                let exterior =
+                    |p: &Polygon<f64>| Polygon::new(p.exterior().clone(), vec![]).unsigned_area();
+                // The merged (unsnapped) output too, in case snapping drops
+                // something the bound should still cover. Every exterior ring
+                // must be within the bound; a sum would count a polygon in
+                // another's hole twice.
+                let out_max = polys
+                    .0
+                    .iter()
+                    .map(exterior)
+                    .fold(0., f64::max)
+                    .max(merged.0.iter().map(exterior).fold(0., f64::max));
+                let dropped = filter_tile_polygon_areas(rings, min_area, min_area).is_empty();
+                let secs = t0.elapsed().as_secs_f64();
+                merged_clusters += 1;
+                let bucket = match members.len() {
+                    2 => 0,
+                    3..=5 => 1,
+                    6..=20 => 2,
+                    21..=100 => 3,
+                    _ => 4,
+                };
+                if dropped {
+                    dropped_clusters += 1;
+                    dropped_secs += secs;
+                }
+                let t1 = Instant::now();
+                let hull = jts::eroded_hull_area(&expanded, *distance - 0.8);
+                hull_bound_secs += t1.elapsed().as_secs_f64();
+                worst_hull = worst_hull.max(out_max - hull);
+                let hull_skip = hull <= min_area;
+                if hull_skip {
+                    hull_skips += 1;
+                    hull_secs += secs;
+                }
+                by_size[bucket][0] += 1;
+                by_size[bucket][1] += usize::from(dropped);
+                by_size[bucket][2] += usize::from(hull_skip);
+                if dropped && !hull_skip {
+                    let strip =
+                        jts::strip_bound_area(&expanded, *distance - 0.8, steps[0], f64::INFINITY);
+                    // The exact erosion of the union by the distance less 0.8,
+                    // filled: the best a bound of this kind can reach.
+                    let exact = jts::union(&expanded)
+                        .and_then(|u| jts::buffer(&u, -(*distance - 0.8)))
+                        .map_or(f64::INFINITY, |m| m.0.iter().map(exterior).sum::<f64>());
+                    hist[0][bin(out_max / min_area)] += 1;
+                    hist_secs[bin(out_max / min_area)] += secs;
+                    hist[1][bin(strip / min_area)] += 1;
+                    hist[2][bin(hull / min_area)] += 1;
+                    hist[3][bin(exact / min_area)] += 1;
+                    let row =
+                        jts::row_bound_area(&expanded, *distance - 0.8, row_step, f64::INFINITY);
+                    hist[4][bin(row / min_area)] += 1;
+                }
+                let gate: f64 = std::env::var("OTC_BENCH_GATE")
+                    .ok()
+                    .map_or(f64::INFINITY, |v| v.parse().unwrap());
+                if !hull_skip && hull <= gate * min_area {
+                    let t3 = Instant::now();
+                    let row = jts::row_bound_area(&expanded, *distance - 0.8, row_step, min_area);
+                    row_stats.4 += t3.elapsed().as_secs_f64();
+                    let full =
+                        jts::row_bound_area(&expanded, *distance - 0.8, row_step, f64::INFINITY);
+                    if out_max > full {
+                        row_stats.2 += 1;
+                    }
+                    row_stats.5 = row_stats.5.max(out_max - full);
+                    if row <= min_area {
+                        if !dropped {
+                            row_stats.3 += 1;
+                        }
+                        row_stats.0 += 1;
+                        row_stats.1 += secs;
+                    }
+                }
+                for (i, &step) in steps.iter().enumerate() {
+                    let t2 = Instant::now();
+                    let strip =
+                        jts::strip_bound_area(&expanded, *distance - 0.8, step, f64::INFINITY);
+                    per[i].4 += t2.elapsed().as_secs_f64();
+                    per[i].5 = per[i].5.max(out_max - strip);
+                    if out_max > strip {
+                        per[i].2 += 1;
+                    }
+                    let skip = strip <= min_area;
+                    if skip && !dropped {
+                        per[i].3 += 1;
+                    }
+                    if skip && !hull_skip {
+                        per[i].0 += 1;
+                        per[i].1 += secs;
+                        if i == 0 {
+                            by_size[bucket][3] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "merged {merged_clusters}, dropped {dropped_clusters} ({dropped_secs:.2} s), \
+             hull skips {hull_skips} ({hull_secs:.2} s, bound {hull_bound_secs:.3} s, worst excess {worst_hull:.1})"
+        );
+        for (i, step) in steps.iter().enumerate() {
+            let (skips, secs, violations, wrong, bound_secs, worst) = per[i];
+            eprintln!(
+                "step {step}: extra skips {skips} ({secs:.2} s), violations {violations}, \
+                 wrong skips {wrong}, bound time {bound_secs:.3} s, worst excess {worst:.1}"
+            );
+        }
+        eprintln!(
+            "rows step {row_step}: extra skips {} ({:.2} s), violations {}, wrong skips {}, \
+             bound time with early exit {:.3} s, worst excess {:.1}",
+            row_stats.0, row_stats.1, row_stats.2, row_stats.3, row_stats.4, row_stats.5
+        );
+        eprintln!(
+            "bins of 0.25 x min area (last = 2.75+): out, strip, hull, exact-erosion; secs by out bin"
+        );
+        for h in &hist {
+            eprintln!("{h:?}");
+        }
+        eprintln!("{:?}", hist_secs.map(|s| (s * 100.).round() / 100.));
+        for (b, row) in by_size.iter().enumerate() {
+            eprintln!(
+                "size bucket {b}: clusters {}, dropped {}, hull skips {}, extra strip skips (first step) {}",
+                row[0], row[1], row[2], row[3]
+            );
+        }
+    }
+
+    /// Times the positive-distance dissolve with the area early-out, with the
+    /// cross-section bound on and off, interleaved.
+    #[test]
+    #[ignore]
+    fn merge_replay_row_bound_timing() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(groups) = groups() else { return };
+        let min_area: f64 = std::env::var("OTC_BENCH_MIN_AREA")
+            .ok()
+            .map_or(4., |v| v.parse().unwrap())
+            * 256.;
+        let mut secs = [Vec::new(), Vec::new()];
+        for _ in 0..5 {
+            for (i, state) in [2u8, 1].into_iter().enumerate() {
+                super::super::jts_buffer::ROW_BOUND.store(state, Relaxed);
+                DROP_BELOW.with(|d| d.set(min_area));
+                let started = Instant::now();
+                let mut out = 0usize;
+                for (distance, geoms) in &groups {
+                    if *distance > 0. {
+                        out += merge_nearby(geoms.clone(), *distance).len();
+                    }
+                }
+                secs[i].push(started.elapsed().as_secs_f64());
+                DROP_BELOW.with(|d| d.set(0.));
+                std::hint::black_box(out);
+            }
+        }
+        for s in &mut secs {
+            s.sort_by(f64::total_cmp);
+        }
+        eprintln!("row bound off: {:?}\nrow bound on:  {:?}", secs[0], secs[1]);
+    }
+
     fn merge_nearby_collect(
         geoms: &[MultiPolygon<f64>],
         distance: f64,

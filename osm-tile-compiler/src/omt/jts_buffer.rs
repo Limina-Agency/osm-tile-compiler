@@ -205,11 +205,17 @@ pub(super) fn buffer_union_unbuffer(
         .iter()
         .map(|g| buffer(g, distance))
         .collect::<Option<Vec<_>>>()?;
-    if drop_below > 0.0
-        && distance > 1.0
-        && eroded_hull_area(&expanded, distance - 0.8) <= drop_below
-    {
-        return Some(MultiPolygon(vec![]));
+    if drop_below > 0.0 && distance > 1.0 {
+        let hull = eroded_hull_area(&expanded, distance - 0.8);
+        // The cross-section bound costs more than the eroded hull, and pays
+        // off only where the hull is close to the minimum.
+        if hull <= drop_below
+            || (hull <= drop_below * 1.5
+                && row_bound_enabled()
+                && row_bound_area(&expanded, distance - 0.8, 2.0, drop_below) <= drop_below)
+        {
+            return Some(MultiPolygon(vec![]));
+        }
     }
     let mut merged = buffer(&union(&expanded)?, -distance)?;
     let largest = cluster
@@ -230,6 +236,22 @@ pub(super) fn buffer_union_unbuffer(
     Some(merged)
 }
 
+/// Experiment switch: `OTC_NO_ROW_BOUND` turns the cross-section bound off.
+/// 0 is unread, 1 on, 2 off.
+pub(super) static ROW_BOUND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn row_bound_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match ROW_BOUND.load(Relaxed) {
+        0 => {
+            let on = std::env::var_os("OTC_NO_ROW_BOUND").is_none();
+            ROW_BOUND.store(if on { 1 } else { 2 }, Relaxed);
+            on
+        }
+        state => state == 1,
+    }
+}
+
 /// An upper bound on the area of anything the unbuffered union of `expanded`
 /// can cover: the area of the convex hull of the buffered polygons, eroded by
 /// `amount`. The negative mitre buffer of a region lies within its erosion by
@@ -237,7 +259,7 @@ pub(super) fn buffer_union_unbuffer(
 /// erosion of a region lies within the erosion of its convex hull. `amount`
 /// is the buffer distance less the slack for rounding to the grid (0.71) and
 /// for the input simplification (0.01 of the distance).
-fn eroded_hull_area(expanded: &[MultiPolygon<f64>], amount: f64) -> f64 {
+pub(super) fn eroded_hull_area(expanded: &[MultiPolygon<f64>], amount: f64) -> f64 {
     let mut points = Vec::<Point>::new();
     for g in expanded {
         for p in &g.0 {
@@ -304,6 +326,340 @@ fn eroded_hull_area(expanded: &[MultiPolygon<f64>], amount: f64) -> f64 {
         twice += p[0] * q[1] - q[0] * p[1];
     }
     twice.abs() / 2.0
+}
+
+#[cfg(test)]
+/// Andrew's monotone chain over `points` (sorted and deduplicated in place):
+/// the hull counter-clockwise, without collinear points.
+fn convex_hull(points: &mut Vec<Point>) -> Vec<Point> {
+    points.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    points.dedup();
+    let cross = |o: Point, a: Point, b: Point| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
+    let mut hull = Vec::<Point>::with_capacity(points.len() + 1);
+    if points.len() < 3 {
+        return hull;
+    }
+    for reverse in [false, true] {
+        let start = hull.len();
+        for i in 0..points.len() {
+            let p = points[if reverse { points.len() - 1 - i } else { i }];
+            while hull.len() >= start + 2
+                && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
+            {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    hull
+}
+
+#[cfg(test)]
+/// Keeps the part of convex `polygon` where `side(p) >= 0`.
+fn clip_convex(polygon: &mut Vec<Point>, scratch: &mut Vec<Point>, side: impl Fn(Point) -> f64) {
+    scratch.clear();
+    for j in 0..polygon.len() {
+        let (p, q) = (polygon[j], polygon[(j + 1) % polygon.len()]);
+        let (sp, sq) = (side(p), side(q));
+        if sp >= 0.0 {
+            scratch.push(p);
+        }
+        if (sp >= 0.0) != (sq >= 0.0) {
+            let t = sp / (sp - sq);
+            scratch.push([p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])]);
+        }
+    }
+    std::mem::swap(polygon, scratch);
+}
+
+#[cfg(test)]
+/// The area of convex `hull` (counter-clockwise) eroded by `amount` and cut
+/// to `low <= y <= high`.
+fn eroded_convex_area(
+    hull: &[Point],
+    amount: f64,
+    low: f64,
+    high: f64,
+    scratch: &mut Vec<Point>,
+) -> f64 {
+    if hull.len() < 3 {
+        return 0.0;
+    }
+    let mut polygon = hull.to_vec();
+    for i in 0..hull.len() {
+        let (a, b) = (hull[i], hull[(i + 1) % hull.len()]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let length = dx.hypot(dy);
+        clip_convex(&mut polygon, scratch, |c| {
+            ((c[0] - a[0]) * -dy + (c[1] - a[1]) * dx) / length - amount
+        });
+        if polygon.len() < 3 {
+            return 0.0;
+        }
+    }
+    clip_convex(&mut polygon, scratch, |c| c[1] - low);
+    clip_convex(&mut polygon, scratch, |c| high - c[1]);
+    if polygon.len() < 3 {
+        return 0.0;
+    }
+    let mut twice = 0.0;
+    for j in 0..polygon.len() {
+        let (p, q) = (polygon[j], polygon[(j + 1) % polygon.len()]);
+        twice += p[0] * q[1] - q[0] * p[1];
+    }
+    twice.abs() / 2.0
+}
+
+#[cfg(test)]
+/// An upper bound on the area within any exterior ring of the polygons that
+/// the unbuffered union of `expanded` can yield, tighter than the eroded hull for
+/// clusters that are not compact, such as rows of houses along a curved street.
+///
+/// The output lies in the erosion of the union U by `amount` (see
+/// `eroded_hull_area`). Cut the plane into horizontal strips. A point p of
+/// the output in a strip has its disc of radius `amount` inside U and inside
+/// the slab that widens the strip by `amount` on both sides, so p lies in the
+/// convex hull of U's part in that slab, eroded by `amount`. That piece is
+/// convex. A point inside a hole of an output polygon has that polygon's
+/// boundary on both sides of it along its horizontal line, so it lies between
+/// two points of the piece and hence in the piece too: the pieces together
+/// cover each exterior ring, holes included, so their summed area bounds the
+/// area of each ring (not the sum over rings, as a polygon may lie in
+/// another's hole). The bound is the smaller of the sums
+/// over horizontal and vertical strips; it stops once a sum exceeds `limit`.
+pub(super) fn strip_bound_area(
+    expanded: &[MultiPolygon<f64>],
+    amount: f64,
+    step: f64,
+    limit: f64,
+) -> f64 {
+    let mut rings = Vec::<Vec<Point>>::new();
+    for g in expanded {
+        for p in &g.0 {
+            let ring: Vec<Point> = p.exterior().0.iter().map(point).collect();
+            if ring.iter().any(|p| !p[0].is_finite() || !p[1].is_finite()) {
+                return f64::INFINITY;
+            }
+            rings.push(ring);
+        }
+    }
+    let first = strips(&rings, amount, step, limit);
+    if first <= limit {
+        return first;
+    }
+    for ring in &mut rings {
+        for p in ring.iter_mut() {
+            p.swap(0, 1);
+        }
+    }
+    first.min(strips(&rings, amount, step, limit))
+}
+
+/// Like `strip_bound_area`, from the union's cross-sections instead of
+/// hulls. A point p = (x, y) of the output has its disc of radius `amount`
+/// inside U, so on every horizontal line y' within `amount` of y the disc's
+/// chord, of half-width sqrt(amount² - (y' - y)²), lies within one of U's
+/// intervals on that line. Lines are spaced `step` apart and the strips lie
+/// between them. For a strip, each line close enough to all of it narrows
+/// the x where output may lie, with the chord half-width at the strip's
+/// farther edge; the strip contributes its height times the span from the
+/// leftmost to the rightmost x left over, which covers holes as in
+/// `strip_bound_area`.
+pub(super) fn row_bound_area(
+    expanded: &[MultiPolygon<f64>],
+    amount: f64,
+    step: f64,
+    limit: f64,
+) -> f64 {
+    let mut rings = Vec::<Vec<Point>>::new();
+    for g in expanded {
+        for p in &g.0 {
+            let ring: Vec<Point> = p.exterior().0.iter().map(point).collect();
+            if ring.iter().any(|p| !p[0].is_finite() || !p[1].is_finite()) {
+                return f64::INFINITY;
+            }
+            rings.push(ring);
+        }
+    }
+    let transpose = |rings: &mut Vec<Vec<Point>>| {
+        for ring in rings.iter_mut() {
+            for p in ring.iter_mut() {
+                p.swap(0, 1);
+            }
+        }
+    };
+    let first = rows(&rings, amount, step, limit);
+    if first <= limit {
+        return first;
+    }
+    transpose(&mut rings);
+    first.min(rows(&rings, amount, step, limit))
+}
+
+/// U's intervals on the horizontal line at `y`, merged and sorted. Edges
+/// count half-open in y, so the intervals are those of the lines just above,
+/// whose limit they are.
+fn cross_section(rings: &[Vec<Point>], y: f64, crossings: &mut Vec<f64>, out: &mut Vec<[f64; 2]>) {
+    out.clear();
+    for ring in rings {
+        crossings.clear();
+        for edge in ring.windows(2) {
+            let (p, q) = (edge[0], edge[1]);
+            if (p[1] <= y && y < q[1]) || (q[1] <= y && y < p[1]) {
+                let t = (y - p[1]) / (q[1] - p[1]);
+                crossings.push(p[0] + t * (q[0] - p[0]));
+            }
+        }
+        crossings.sort_unstable_by(f64::total_cmp);
+        for pair in crossings.chunks_exact(2) {
+            out.push([pair[0], pair[1]]);
+        }
+    }
+    out.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]));
+    let mut merged = 0;
+    for i in 0..out.len() {
+        if merged > 0 && out[i][0] <= out[merged - 1][1] {
+            out[merged - 1][1] = out[merged - 1][1].max(out[i][1]);
+        } else {
+            out[merged] = out[i];
+            merged += 1;
+        }
+    }
+    out.truncate(merged);
+}
+
+fn rows(rings: &[Vec<Point>], amount: f64, step: f64, limit: f64) -> f64 {
+    let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+    for ring in rings {
+        for p in ring {
+            min_y = min_y.min(p[1]);
+            max_y = max_y.max(p[1]);
+        }
+    }
+    let (low, high) = (min_y + amount, max_y - amount);
+    if !(high > low) {
+        return 0.0;
+    }
+    let step = step.min(amount / 2.0);
+    let strips = ((high - low) / step).ceil() as usize;
+    let margin = (amount / step).ceil() as usize;
+    // Line j lies at low + (j - margin) * step; strip k lies between lines
+    // k + margin and k + margin + 1 (the last one cut at `high`).
+    let line_y = |j: usize| low + (j as f64 - margin as f64) * step;
+    let lines = strips + 2 * margin + 1;
+    // Computed as the strips reach them, so an early exit skips the rest.
+    let mut sections = Vec::<Vec<[f64; 2]>>::with_capacity(lines);
+    let mut crossings = Vec::new();
+    let mut allowed = Vec::<[f64; 2]>::new();
+    let mut next = Vec::<[f64; 2]>::new();
+    let mut total = 0.0;
+    for k in 0..strips {
+        let s0 = low + k as f64 * step;
+        let s1 = (s0 + step).min(high);
+        let mut any = false;
+        for j in k..(k + 2 * margin + 2).min(lines) {
+            while sections.len() <= j {
+                let mut out = Vec::new();
+                cross_section(rings, line_y(sections.len()), &mut crossings, &mut out);
+                sections.push(out);
+            }
+            let section = &sections[j];
+            let y = line_y(j);
+            let far = (y - s0).abs().max((y - s1).abs());
+            if !(far < amount) {
+                continue;
+            }
+            let w = (amount * amount - far * far).sqrt();
+            if !any {
+                any = true;
+                allowed.clear();
+                allowed.extend(
+                    section
+                        .iter()
+                        .map(|i| [i[0] + w, i[1] - w])
+                        .filter(|i| i[0] <= i[1]),
+                );
+            } else {
+                next.clear();
+                let (mut a, mut b) = (0, 0);
+                while a < allowed.len() && b < section.len() {
+                    let (lo, hi) = (section[b][0] + w, section[b][1] - w);
+                    let start = allowed[a][0].max(lo);
+                    let end = allowed[a][1].min(hi);
+                    if start <= end {
+                        next.push([start, end]);
+                    }
+                    if allowed[a][1] < hi {
+                        a += 1;
+                    } else {
+                        b += 1;
+                    }
+                }
+                std::mem::swap(&mut allowed, &mut next);
+            }
+            if allowed.is_empty() {
+                break;
+            }
+        }
+        if !any {
+            return f64::INFINITY;
+        }
+        if let (Some(first), Some(last)) = (allowed.first(), allowed.last()) {
+            total += (s1 - s0) * (last[1] - first[0]);
+            if total > limit {
+                return total;
+            }
+        }
+    }
+    total
+}
+
+#[cfg(test)]
+fn strips(rings: &[Vec<Point>], amount: f64, step: f64, limit: f64) -> f64 {
+    let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+    for ring in rings {
+        for p in ring {
+            min_y = min_y.min(p[1]);
+            max_y = max_y.max(p[1]);
+        }
+    }
+    let (low, high) = (min_y + amount, max_y - amount);
+    if !(high > low) {
+        return 0.0;
+    }
+    let count = ((high - low) / step).ceil() as usize;
+    let mut points = Vec::<Point>::new();
+    let mut scratch = Vec::<Point>::new();
+    let mut total = 0.0;
+    for k in 0..count {
+        let a = low + k as f64 * step;
+        let b = (a + step).min(high);
+        let (bottom, top) = (a - amount, b + amount);
+        points.clear();
+        for ring in rings {
+            for edge in ring.windows(2) {
+                let (p, q) = (edge[0], edge[1]);
+                if p[1] >= bottom && p[1] <= top {
+                    points.push(p);
+                }
+                for line in [bottom, top] {
+                    if (p[1] < line && q[1] > line) || (p[1] > line && q[1] < line) {
+                        let t = (line - p[1]) / (q[1] - p[1]);
+                        points.push([p[0] + t * (q[0] - p[0]), line]);
+                    }
+                }
+            }
+        }
+        let hull = convex_hull(&mut points);
+        total += eroded_convex_area(&hull, amount, a, b, &mut scratch);
+        if total > limit {
+            return total;
+        }
+    }
+    total
 }
 
 /// `Geometry.union()` of a collection of valid polygons: JTS's classic
@@ -2984,6 +3340,50 @@ fn in_ring(p: Point, ring: &[Point]) -> bool {
 mod tests {
     use super::*;
     use geo::Area;
+
+    /// Three houses in an L: the eroded hull spans the empty corner, the
+    /// cross-section bound doesn't, and both cover the real output.
+    #[test]
+    fn row_bound_covers_output_and_beats_hull() {
+        let square = |x: f64, y: f64| {
+            MultiPolygon(vec![Polygon::new(
+                LineString::from(vec![
+                    (x, y),
+                    (x + 16., y),
+                    (x + 16., y + 16.),
+                    (x, y + 16.),
+                    (x, y),
+                ]),
+                vec![],
+            )])
+        };
+        let cluster = [
+            square(0., 0.),
+            square(20., 0.),
+            square(40., 0.),
+            square(40., 20.),
+            square(40., 40.),
+        ];
+        let distance = 8.;
+        let expanded: Vec<_> = cluster
+            .iter()
+            .map(|g| buffer(g, distance).unwrap())
+            .collect();
+        let output = buffer_union_unbuffer(&cluster, distance, 0.).unwrap();
+        let largest = output
+            .0
+            .iter()
+            .map(|p| Polygon::new(p.exterior().clone(), vec![]).unsigned_area())
+            .fold(0., f64::max);
+        let hull = eroded_hull_area(&expanded, distance - 0.8);
+        let rows = row_bound_area(&expanded, distance - 0.8, 2., f64::INFINITY);
+        let strips = strip_bound_area(&expanded, distance - 0.8, 2., f64::INFINITY);
+        assert!(
+            largest > 0. && largest <= rows && largest <= strips,
+            "{largest} {rows} {strips}"
+        );
+        assert!(rows < hull * 0.8, "{rows} {hull}");
+    }
 
     #[test]
     fn zero_buffer_takes_depth_from_jts_least_stabbed_segment() {
