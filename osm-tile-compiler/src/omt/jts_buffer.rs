@@ -38,7 +38,6 @@
 //! `src/omt/LICENSE.jts-edl-1.0.txt` and `src/omt/LICENSE.planetiler`.
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeMap;
 
 use geo::Orientation;
 use geo::kernels::{Kernel, RobustKernel};
@@ -2451,8 +2450,10 @@ fn build(noded: Vec<Noded>, mode: Mode) -> Option<MultiPolygon<f64>> {
 /// edges, propagated around a graph of their segments.
 fn overlay_depths(edges: &[(Vec<Point>, i64)]) -> Option<Vec<(Option<i64>, Option<i64>)>> {
     // Depths are propagated on the segments, whose every vertex is a node.
-    let mut vertices = Vec::<Point>::new();
+    let point_count: usize = edges.iter().map(|(points, _)| points.len()).sum();
+    let mut vertices = Vec::<Point>::with_capacity(point_count);
     let mut ids = HashMap::<(u64, u64), usize>::default();
+    ids.reserve(point_count);
     let mut id = |p: Point, vertices: &mut Vec<Point>| {
         *ids.entry(key(p)).or_insert_with(|| {
             vertices.push(p);
@@ -2460,7 +2461,8 @@ fn overlay_depths(edges: &[(Vec<Point>, i64)]) -> Option<Vec<(Option<i64>, Optio
         })
     };
     let mut segment_index = HashMap::<(usize, usize), usize>::default();
-    let mut segments = Vec::<((usize, usize), i64)>::new();
+    segment_index.reserve(point_count);
+    let mut segments = Vec::<((usize, usize), i64)>::with_capacity(point_count);
     // The first segment of each edge, as a half-edge in the edge's direction.
     let mut edge_first = Vec::with_capacity(edges.len());
     for (points, delta) in edges {
@@ -2493,16 +2495,29 @@ fn overlay_depths(edges: &[(Vec<Point>, i64)]) -> Option<Vec<(Option<i64>, Optio
             -segments[h / 2].1
         }
     };
-    let mut outgoing = vec![Vec::<usize>::new(); vertices.len()];
+    // The half-edges out of each vertex, in one vector: those of vertex v
+    // are `out_edges[out_start[v]..out_start[v + 1]]`, in star order.
+    let mut out_start = vec![0usize; vertices.len() + 1];
     for h in 0..segments.len() * 2 {
-        outgoing[from(h)].push(h);
+        out_start[from(h) + 1] += 1;
     }
-    for (vertex, list) in outgoing.iter_mut().enumerate() {
+    for v in 0..vertices.len() {
+        out_start[v + 1] += out_start[v];
+    }
+    let mut out_edges = vec![0usize; segments.len() * 2];
+    let mut fill = out_start[..vertices.len()].to_vec();
+    for h in 0..segments.len() * 2 {
+        let v = from(h);
+        out_edges[fill[v]] = h;
+        fill[v] += 1;
+    }
+    for vertex in 0..vertices.len() {
         let origin = vertices[vertex];
-        list.sort_by(|&g, &h| {
+        out_edges[out_start[vertex]..out_start[vertex + 1]].sort_by(|&g, &h| {
             edge_end_order(origin, vertices[to(g)], vertices[to(h)]).then(g.cmp(&h))
         });
     }
+    let outgoing = |v: usize| &out_edges[out_start[v]..out_start[v + 1]];
     // Connected components (BufferBuilder.createSubgraphs).
     let mut parent = (0..vertices.len()).collect::<Vec<_>>();
     fn root(parent: &mut [usize], mut i: usize) -> usize {
@@ -2516,12 +2531,13 @@ fn overlay_depths(edges: &[(Vec<Point>, i64)]) -> Option<Vec<(Option<i64>, Optio
         let (ra, rb) = (root(&mut parent, *a), root(&mut parent, *b));
         parent[ra] = rb;
     }
-    let mut components = BTreeMap::<usize, Vec<usize>>::new();
-    for (v, list) in outgoing.iter().enumerate() {
-        if !list.is_empty() {
-            components.entry(root(&mut parent, v)).or_default().push(v);
-        }
-    }
+    // (root, vertex) of every vertex with an edge, by root and then vertex:
+    // the components in order of their roots.
+    let mut by_root = (0..vertices.len())
+        .filter(|&v| !outgoing(v).is_empty())
+        .map(|v| (root(&mut parent, v), v))
+        .collect::<Vec<_>>();
+    by_root.sort_unstable();
     let segment_roots = segments
         .iter()
         .map(|((a, _), _)| root(&mut parent, *a))
@@ -2530,11 +2546,12 @@ fn overlay_depths(edges: &[(Vec<Point>, i64)]) -> Option<Vec<(Option<i64>, Optio
     let mut right = vec![None::<i64>; segments.len() * 2];
     // Shared by the components' searches, which stay each in its own.
     let mut visited = vec![false; vertices.len()];
-    for (component, members) in &components {
+    for members in by_root.chunk_by(|a, b| a.0 == b.0) {
+        let component = &members[0].0;
         // The rightmost vertex; the sector around it containing +x is
         // outside this component, at the depth the other components give
         // that point (SubgraphDepthLocater).
-        let start = *members.iter().max_by(|&&a, &&b| {
+        let start = members.iter().map(|&(_, v)| v).max_by(|&a, &b| {
             vertices[a][0]
                 .total_cmp(&vertices[b][0])
                 .then(vertices[a][1].total_cmp(&vertices[b][1]))
@@ -2556,13 +2573,13 @@ fn overlay_depths(edges: &[(Vec<Point>, i64)]) -> Option<Vec<(Option<i64>, Optio
         }
         // BufferSubgraph.computeDepths: breadth-first over the nodes, each
         // node's star walked counter-clockwise from an edge of known depth.
-        let first = outgoing[start][0];
+        let first = outgoing(start)[0];
         right[first] = Some(outside);
         right[first ^ 1] = Some(outside + delta(first));
         let mut queue = std::collections::VecDeque::from([start]);
         visited[start] = true;
         while let Some(node) = queue.pop_front() {
-            let star = &outgoing[node];
+            let star = outgoing(node);
             let seed = (0..star.len()).find(|&i| right[star[i]].is_some())?;
             // DirectedEdgeStar.computeDepths
             let target = right[star[seed]]?;
