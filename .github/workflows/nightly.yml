@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Checks too slow, too broad or too dependent on the outside world for every
+# pull request. Apart from the live download, they run on GitHub's hosted
+# runners, free for a public repository. A failure blocks nothing; GitHub
+# mails it to whoever last changed this schedule.
+#
 # Actions are pinned by commit; the comment names the tag.
 jobs:
   # `compile --area monaco` against download.geofabrik.de itself: the index
@@ -22,3 +27,84 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --locked -p osm-tile-compiler --test area_download -- --ignored --nocapture
+
+  # The PR job's macOS leg waits on GitHub's few free macOS runners and is
+  # often cancelled; this runs it once a day when they are idle.
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  # The newest versions of every dependency that Cargo.toml allows, as a new
+  # project that adds the library would resolve them, rather than Cargo.lock's.
+  latest-dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - run: cargo update --verbose
+      - run: cargo test --workspace
+
+  # The lowest versions Cargo.toml allows for the direct dependencies: a
+  # requirement set lower than what the code needs passes CI with Cargo.lock
+  # but breaks a user whose lockfile holds an older version.
+  minimal-versions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          rustup toolchain install
+          rustup toolchain install nightly --profile minimal
+      - run: cargo +nightly update -Z direct-minimal-versions
+      - run: cargo test --workspace
+
+  # The next Rust release, about six weeks early. Tests only: clippy's new
+  # lints wait for the deliberate bump in rust-toolchain.toml.
+  beta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install beta --profile minimal
+      - run: cargo +beta test --workspace --locked
+
+  # Ten minutes of each cargo-fuzz target (fuzz/, CONTRIBUTING.md), from the
+  # seeds. A crash fails the job and its input is kept as an artifact, to
+  # become a unit test beside the code it fixes.
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: polygon_geojson, seeds: polygon_geojson, args: "" }
+          - { target: polygon_poly, seeds: polygon_poly, args: "" }
+          - { target: pmtiles_inspect, seeds: pmtiles, args: "-max_len=65536" }
+          # Starts a thread pool per input, which LeakSanitizer reports.
+          - { target: pmtiles_building_levels, seeds: pmtiles, args: "-max_len=65536 -detect_leaks=0" }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - working-directory: fuzz
+        run: |
+          mkdir -p corpus/${{ matrix.target }}
+          cargo +nightly fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} \
+            seeds/${{ matrix.seeds }} -- -max_total_time=600 ${{ matrix.args }}
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

@@ -19,8 +19,8 @@ geojson = "1.0"
 osm-pbf-ingest = "0.4.0"
 pmtiles = { version = "0.28.1", default-features = false }
 rayon = "1.10"
-serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = "1.0"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.154"
 sha2 = "0.11"
 tokio = { version = "1.54.1", default-features = false, features = ["rt"] }
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
