@@ -9,7 +9,7 @@ use protobuf::Message;
 use std::path::Path;
 
 /// A PBF frame: big-endian length, `BlobHeader`, uncompressed blob.
-fn frame(blob_type: &str, payload: &[u8]) -> Vec<u8> {
+pub fn frame(blob_type: &str, payload: &[u8]) -> Vec<u8> {
     let mut blob = Blob::new();
     blob.set_raw(payload.to_vec());
     blob.set_raw_size(payload.len() as i32);

@@ -65,7 +65,7 @@ struct Shared {
     failed: AtomicBool,
     /// Raised when the compile is cancelled: workers drop what is queued.
     cancelled: Arc<AtomicBool>,
-    /// Messages fully processed; `Pipeline::sync` waits for it to catch up.
+    /// Messages fully processed; `Pipeline::sync_with` waits for it to catch up.
     done: Mutex<u64>,
     progress: Condvar,
     contributions: Mutex<Vec<(u64, Contribution)>>,
@@ -209,12 +209,23 @@ impl Pipeline {
         self.shared.failed.load(Ordering::Relaxed) || self.shared.cancelled.load(Ordering::Relaxed)
     }
 
+    /// Fails, stopping the workers, if a worker failed or stopped or the
+    /// compile was cancelled. For a caller that waits on something else the
+    /// workers produce.
+    pub fn check(&mut self) -> Result<(), String> {
+        if self.stopped() || self.workers.iter().any(|w| w.is_finished()) {
+            return Err(self.abort());
+        }
+        Ok(())
+    }
+
     /// How many queued items the workers have finished.
     pub fn processed(&self) -> u64 {
         *lock(&self.shared.done)
     }
 
     /// Waits until the workers have processed everything queued so far.
+    #[cfg(test)]
     pub fn sync(&mut self) -> Result<(), String> {
         self.sync_with(|_, _| {})
     }
@@ -242,7 +253,7 @@ impl Pipeline {
     }
 
     /// What OSM sources added to the profile state, in source order. Call after
-    /// `sync`.
+    /// `sync_with`.
     pub fn take_contributions(&mut self) -> Vec<(u64, Contribution)> {
         let mut all = std::mem::take(&mut *lock(&self.shared.contributions));
         all.sort_unstable_by_key(|(ordinal, _)| *ordinal);

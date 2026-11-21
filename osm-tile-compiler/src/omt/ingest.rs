@@ -21,12 +21,13 @@ use osm_pbf_ingest::{
     Pass2Sink, PrepareOptions, PreparedIngestIndex, RelationBatch, RelationMemberType, WayBatch,
     WayRef, prepare_ingest_index_with_options, run_pass2_with_options,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 fn tags(input: &NodeTags) -> Tags {
     input
@@ -213,6 +214,16 @@ const JOB_SHIFT: u32 = 32;
 /// Relations are queued in runs of about this many members: relation cost
 /// tracks size, and a run of small relations should cost about one big one.
 const MEMBERS_PER_RELATION_JOB: usize = 256;
+/// Relation jobs all take this job number, above any way or junction job, and
+/// emit relation `k` of `prepared.supported_relations` at ordinal
+/// `RELATION_JOB << JOB_SHIFT | k`: after every way and junction, in relation
+/// order, as serial emission had them, whenever each relation is queued.
+const RELATION_JOB: u64 = 1 << 31;
+/// While pass 2 still reads ways, relations are queued once their ready
+/// members add up to about this many, or to an eighth of all relation members
+/// in a small extract, so the member ways are sealed into a modest number of
+/// chunks.
+const RELATION_DISPATCH_MEMBERS: usize = 16 * MEMBERS_PER_RELATION_JOB;
 
 /// Everything workers share while assembling OSM sources. It is read-only
 /// except for the collectors that ways fill for relation assembly.
@@ -223,9 +234,12 @@ pub(super) struct Index {
     profile_memberships: ProfileMembershipIndex,
     /// Highest-ranked highway touching each motorway junction node.
     junction_classes: Mutex<HashMap<i64, (u8, String)>>,
-    /// Node IDs of ways that relations may join, with the ordinal of the way
-    /// and, in an area-only compile, the way's extent.
-    member_ways: Mutex<HashMap<i64, MemberWay>>,
+    /// The member ways each way job found, by job number, until the reader
+    /// collects them. Every way job leaves an entry, even an empty one, so
+    /// the entries also tell which way jobs have finished.
+    member_batches: Mutex<HashMap<u64, Vec<MemberWay>>>,
+    /// Signalled whenever a way job leaves its entry in `member_batches`.
+    member_batch_left: Condvar,
     missing_ways: AtomicUsize,
     missing_relations: AtomicUsize,
     skipped_ways: AtomicUsize,
@@ -252,18 +266,97 @@ enum Task {
     /// Motorway junction node IDs seen before this batch.
     Ways(WayBatch, Arc<HashSet<i64>>),
     Sources(Vec<Source>),
-    /// Relations `first..end`.
-    Relations(usize, usize, Arc<MemberWays>),
+    /// These positions in `prepared.supported_relations`, whose member ways
+    /// have all been collected.
+    Relations(Vec<usize>, Arc<MemberWays>),
 }
 
-/// A way relations may join: its ordinal, nodes and extent.
-type MemberWay = (u64, Vec<i64>, Extent);
+/// A way relations may join: its ID, nodes and, in an area-only compile,
+/// extent.
+type MemberWay = (i64, Vec<i64>, Extent);
 
-/// The ways relations join, collected while pass 2 reads the ways.
-struct MemberWays {
+/// Member ways collected from a run of consecutive way jobs.
+#[derive(Default)]
+struct MemberChunk {
+    /// The lowest and highest way ID in the chunk.
+    first: i64,
+    last: i64,
     nodes: HashMap<i64, Vec<i64>>,
     /// Each way's extent, in an area-only compile.
     extents: HashMap<i64, Extent>,
+}
+
+impl MemberChunk {
+    /// Adds a way; a repeated way ID keeps the later way, as serial order did.
+    fn insert(&mut self, (id, nodes, extent): MemberWay, area: bool) {
+        if self.nodes.is_empty() {
+            (self.first, self.last) = (id, id);
+        }
+        self.first = self.first.min(id);
+        self.last = self.last.max(id);
+        self.nodes.insert(id, nodes);
+        if area {
+            self.extents.insert(id, extent);
+        }
+    }
+}
+
+/// The ways relations join, as chunks in way job order. Chunks are sealed
+/// before relations that read them are queued and never change after, so
+/// relation jobs read them without a lock while way jobs still run.
+struct MemberWays {
+    chunks: Vec<Arc<MemberChunk>>,
+    /// Whether each chunk's IDs all follow the last chunk's, as in a file
+    /// sorted by ID, so a lookup can bisect.
+    ascending: bool,
+}
+
+impl MemberWays {
+    fn new(chunks: Vec<Arc<MemberChunk>>) -> Self {
+        let ascending = chunks.windows(2).all(|w| w[0].last <= w[1].first);
+        Self { chunks, ascending }
+    }
+
+    /// The chunks that may hold `id`, latest first, so that a way repeated
+    /// across chunks resolves to its later copy.
+    fn candidates(&self, id: i64) -> impl Iterator<Item = &MemberChunk> {
+        let end = if self.ascending {
+            self.chunks.partition_point(|c| c.first <= id)
+        } else {
+            self.chunks.len()
+        };
+        let ascending = self.ascending;
+        self.chunks[..end]
+            .iter()
+            .rev()
+            .take_while(move |c| !ascending || c.last >= id)
+            .filter(move |c| c.first <= id && id <= c.last)
+            .map(|c| &**c)
+    }
+
+    fn nodes(&self, id: i64) -> Option<&Vec<i64>> {
+        self.candidates(id).find_map(|c| c.nodes.get(&id))
+    }
+
+    fn extent(&self, id: i64) -> Option<&Extent> {
+        self.candidates(id).find_map(|c| c.extents.get(&id))
+    }
+}
+
+/// Leaves a way job's member ways in `Index::member_batches` when dropped, so
+/// the entry appears however the job ends, error and panic included.
+struct MemberBatch<'a> {
+    index: &'a Index,
+    job: u64,
+    members: Vec<MemberWay>,
+}
+
+impl Drop for MemberBatch<'_> {
+    fn drop(&mut self) {
+        let members = std::mem::take(&mut self.members);
+        lock(&self.index.member_batches).insert(self.job, members);
+        self.index.member_batch_left.notify_all();
+    }
 }
 
 /// Tagged nodes per job when an area-only read hands on pass 1's nodes.
@@ -307,6 +400,11 @@ pub fn read_osm(
     // The index cannot tell which blocks hold ways without decoding them, so
     // pass 2 counts them as all blocks but those its nodes came in.
     let all_blobs = blobs.as_ref().map_or(1, |index| index.len()).max(1) as f64;
+    // Relations can start while pass 2 still reads ways only when no later
+    // way can have a lower ID than the ones already read.
+    let sorted = blobs
+        .as_ref()
+        .is_some_and(|index| index.header().sorted_type_then_id());
     let mut node_batches = 0.0;
     drop(blobs);
     control.set_total(pass1_blobs);
@@ -355,7 +453,8 @@ pub fn read_osm(
         relations,
         profile_memberships,
         junction_classes: Mutex::new(HashMap::new()),
-        member_ways: Mutex::new(HashMap::new()),
+        member_batches: Mutex::new(HashMap::new()),
+        member_batch_left: Condvar::new(),
         missing_ways: AtomicUsize::new(0),
         missing_relations: AtomicUsize::new(0),
         skipped_ways: AtomicUsize::new(0),
@@ -371,6 +470,7 @@ pub fn read_osm(
         jobs: 0,
         junctions: HashMap::new(),
         junction_ids: Arc::new(HashSet::new()),
+        relations: RelationQueue::new(&index, sorted),
     };
     // The relations come from pass 1; pass 2 would decode them all again
     // for nothing. The render workers are slower than the decode workers, so
@@ -468,7 +568,8 @@ impl Drop for NodeStoreDir {
 
 /// Pass 2 callbacks run on the calling thread. They only forward batches to the
 /// render workers, apart from the motorway junction nodes: ways need to know
-/// which nodes are junctions, and junctions are emitted after all ways.
+/// which nodes are junctions, and junctions are emitted after all ways. They
+/// also queue each relation once the ways it joins have been collected.
 struct SourceSink<'a> {
     pipeline: &'a mut Pipeline,
     index: Arc<Index>,
@@ -476,7 +577,79 @@ struct SourceSink<'a> {
     jobs: u64,
     junctions: HashMap<i64, Source>,
     junction_ids: Arc<HashSet<i64>>,
+    relations: RelationQueue,
 }
+
+/// The relations still to queue and the member ways collected for them.
+///
+/// In a file sorted by type then ID, a relation can be assembled as soon as
+/// every way job up to the first way past its highest member way ID has
+/// finished: no later way can be one of its members. Way jobs leave their
+/// member ways by job number; the reader collects them in job order into an
+/// open chunk, seals it whenever it queues relations, and hands each relation
+/// job the sealed chunks. Way jobs take the `member_batches` lock once each,
+/// as they took the member map's lock before, and relation jobs take none.
+struct RelationQueue {
+    /// Way jobs not yet collected, in job order, with their lowest way ID.
+    way_jobs: VecDeque<(u64, i64)>,
+    /// Highest way ID read so far.
+    last_way: Option<i64>,
+    /// Whether relations may be queued before pass 2 ends: the file declares
+    /// `Sort.Type_then_ID` and its ways have kept to it so far.
+    early: bool,
+    /// Every way below this ID had been collected when relations were last
+    /// queued early. A way read later below it breaks those relations.
+    queued_below: i64,
+    open: MemberChunk,
+    sealed: Vec<Arc<MemberChunk>>,
+    /// Area relations with way members still to queue, as (highest member way
+    /// ID, position), highest ID first.
+    pending: Vec<(i64, usize)>,
+    /// Members of ready relations that make it worth queueing them early.
+    dispatch_members: usize,
+}
+
+impl RelationQueue {
+    fn new(index: &Index, sorted: bool) -> Self {
+        // Only the relations `Index::relation` can assemble are queued.
+        let mut pending = index
+            .prepared
+            .supported_relations
+            .iter()
+            .enumerate()
+            .filter(|(_, relation)| {
+                let kind = relation.tags.get("type").unwrap_or("");
+                matches!(kind, "multipolygon" | "boundary" | "land_area")
+            })
+            .filter_map(|(position, relation)| {
+                let last = relation
+                    .members
+                    .iter()
+                    .filter(|m| m.member_type == RelationMemberType::Way)
+                    .map(|m| m.member_id)
+                    .max()?;
+                Some((last, position))
+            })
+            .collect::<Vec<_>>();
+        pending.sort_unstable_by_key(|&(last, position)| std::cmp::Reverse((last, position)));
+        let relations = &index.prepared.supported_relations;
+        let members = pending
+            .iter()
+            .map(|&(_, position)| relations[position].members.len() + 1)
+            .sum::<usize>();
+        Self {
+            way_jobs: VecDeque::new(),
+            last_way: None,
+            early: sorted,
+            queued_below: i64::MIN,
+            open: MemberChunk::default(),
+            sealed: Vec::new(),
+            pending,
+            dispatch_members: (members / 8).clamp(1, RELATION_DISPATCH_MEMBERS),
+        }
+    }
+}
+
 impl SourceSink<'_> {
     /// Queues `task` as job number `job`. Jobs are numbered in serial order.
     fn submit(&mut self, job: u64, task: Task) -> Result<(), String> {
@@ -493,10 +666,152 @@ impl SourceSink<'_> {
         self.submit(self.jobs, task)
     }
 
-    /// Waits for pass 2 to finish, then queues the junctions and relations,
-    /// which need what the ways collected.
+    /// Checks that a way batch keeps to the ID order relations were queued
+    /// by. Returns its lowest way ID, or the last one read if it is empty.
+    fn check_way_order(&mut self, batch: &WayBatch) -> Result<i64, String> {
+        let queue = &mut self.relations;
+        let previous = queue.last_way.unwrap_or(i64::MIN);
+        let ids = || batch.ways.iter().map(|w| w.way_id);
+        let (Some(first), Some(last)) = (ids().min(), ids().max()) else {
+            return Ok(previous);
+        };
+        queue.last_way = Some(last.max(previous));
+        // A way below `queued_below` arriving now may be a member of a
+        // relation already assembled without it. Only an out-of-order file
+        // can do that.
+        if first < queue.queued_below {
+            let prepared = &self.index.prepared;
+            if let Some(way) = ids().find(|&id| {
+                id < queue.queued_below
+                    && (prepared.multipolygon_way_ids.contains(id as u64)
+                        || !prepared.way_relation_memberships.get(id).is_empty())
+            }) {
+                return Err(format!(
+                    "the PBF declares Sort.Type_then_ID, but member way {way} comes after \
+                     way {previous}: relations were already assembled without it"
+                ));
+            }
+        }
+        let ascending =
+            first >= previous && batch.ways.windows(2).all(|w| w[0].way_id <= w[1].way_id);
+        if !ascending {
+            // From here on relations wait for pass 2 to end; those already
+            // queued stand, as no member way of theirs has come late.
+            queue.early = false;
+        }
+        Ok(first)
+    }
+
+    /// Moves the member ways of finished way jobs, in job order, into the
+    /// open chunk. With `wait`, waits until every way job has finished.
+    fn collect_member_ways(&mut self, wait: bool) -> Result<(), String> {
+        let index = self.index.clone();
+        let area = index.area.is_some();
+        loop {
+            // The lock is held only to take the entries, not to index them.
+            let mut taken = Vec::new();
+            let mut batches = lock(&index.member_batches);
+            while let Some(&(job, _)) = self.relations.way_jobs.front() {
+                let Some(members) = batches.remove(&job) else {
+                    break;
+                };
+                self.relations.way_jobs.pop_front();
+                taken.push(members);
+            }
+            if taken.is_empty() && wait && !self.relations.way_jobs.is_empty() {
+                // Woken by a way job leaving its entry, or after a while to
+                // check whether the compile failed or was cancelled, in which
+                // case some job may never run.
+                drop(
+                    index
+                        .member_batch_left
+                        .wait_timeout(batches, Duration::from_millis(20))
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                self.pipeline.check()?;
+                continue;
+            }
+            drop(batches);
+            for member in taken.into_iter().flatten() {
+                self.relations.open.insert(member, area);
+            }
+            if !wait || self.relations.way_jobs.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Queues the relations whose member ways have all been collected. Until
+    /// pass 2 ends (`all`), it waits for enough of them to fill several jobs.
+    fn queue_relations(&mut self, all: bool) -> Result<(), String> {
+        let queue = &mut self.relations;
+        let ready_below = if all {
+            i64::MAX
+        } else if !queue.early {
+            return Ok(());
+        } else {
+            // A repeated way ID may continue into the next batch, hence `<`.
+            match queue.way_jobs.front() {
+                Some(&(_, first)) => first,
+                None => queue.last_way.unwrap_or(i64::MIN),
+            }
+        };
+        let split = queue
+            .pending
+            .partition_point(|&(last, _)| !all && last >= ready_below);
+        let relations = &self.index.prepared.supported_relations;
+        let weight = |position: usize| relations[position].members.len() + 1;
+        if !all
+            && queue.pending[split..]
+                .iter()
+                .map(|&(_, position)| weight(position))
+                .sum::<usize>()
+                < queue.dispatch_members
+        {
+            return Ok(());
+        }
+        let mut ready = queue
+            .pending
+            .drain(split..)
+            .map(|(_, position)| position)
+            .collect::<Vec<_>>();
+        if !all {
+            queue.queued_below = queue.queued_below.max(ready_below);
+        }
+        if !queue.open.nodes.is_empty() {
+            queue.sealed.push(Arc::new(std::mem::take(&mut queue.open)));
+        }
+        if ready.is_empty() {
+            return Ok(());
+        }
+        let member_ways = Arc::new(MemberWays::new(queue.sealed.clone()));
+        // Runs are queued heaviest first, so a huge relation does not start
+        // last and leave the other workers idle.
+        ready.sort_unstable();
+        let mut runs = Vec::new();
+        let (mut run, mut run_weight) = (Vec::new(), 0);
+        for position in ready {
+            run.push(position);
+            run_weight += weight(position);
+            if run_weight >= MEMBERS_PER_RELATION_JOB {
+                runs.push((std::mem::take(&mut run), run_weight));
+                run_weight = 0;
+            }
+        }
+        if !run.is_empty() {
+            runs.push((run, run_weight));
+        }
+        runs.sort_by_key(|(_, weight)| std::cmp::Reverse(*weight));
+        for (run, _) in runs {
+            self.submit(RELATION_JOB, Task::Relations(run, member_ways.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// Waits for pass 2's way jobs to finish, then queues the junctions and
+    /// the relations not yet queued, which need what the ways collected.
     fn finish(&mut self) -> Result<(), String> {
-        self.pipeline.sync()?;
+        self.collect_member_ways(true)?;
         let mut junctions = self.junctions.drain().collect::<Vec<_>>();
         junctions.sort_by_key(|(id, _)| *id);
         let classes = std::mem::take(&mut *lock(&self.index.junction_classes));
@@ -514,42 +829,7 @@ impl SourceSink<'_> {
         if !junctions.is_empty() {
             self.submit_next(Task::Sources(junctions))?;
         }
-        let collected = std::mem::take(&mut *lock(&self.index.member_ways));
-        let mut member_ways = MemberWays {
-            nodes: HashMap::with_capacity(collected.len()),
-            extents: HashMap::new(),
-        };
-        for (id, (_, nodes, extent)) in collected {
-            member_ways.nodes.insert(id, nodes);
-            if self.index.area.is_some() {
-                member_ways.extents.insert(id, extent);
-            }
-        }
-        let member_ways = Arc::new(member_ways);
-        // Jobs are numbered in relation order but queued heaviest first, so a
-        // huge relation does not start last and leave the other workers idle.
-        let mut runs = Vec::new();
-        let (mut first, mut weight) = (0, 0);
-        let relations = &self.index.prepared.supported_relations;
-        for (position, relation) in relations.iter().enumerate() {
-            weight += relation.members.len() + 1;
-            if weight >= MEMBERS_PER_RELATION_JOB || position + 1 == relations.len() {
-                runs.push((first, position + 1, weight));
-                (first, weight) = (position + 1, 0);
-            }
-        }
-        let first_job = self.jobs + 1;
-        self.jobs += runs.len() as u64;
-        let mut order = (0..runs.len()).collect::<Vec<_>>();
-        order.sort_by_key(|&run| std::cmp::Reverse(runs[run].2));
-        for run in order {
-            let (first, end, _) = runs[run];
-            self.submit(
-                first_job + run as u64,
-                Task::Relations(first, end, member_ways.clone()),
-            )?;
-        }
-        Ok(())
+        self.queue_relations(true)
     }
 }
 impl Pass2Sink for SourceSink<'_> {
@@ -567,8 +847,15 @@ impl Pass2Sink for SourceSink<'_> {
         self.submit_next(Task::Nodes(batch))
     }
     fn on_way_batch(&mut self, batch: WayBatch) -> Result<(), String> {
+        let first = self.check_way_order(&batch)?;
         let junctions = self.junction_ids.clone();
-        self.submit_next(Task::Ways(batch, junctions))
+        self.submit_next(Task::Ways(batch, junctions))?;
+        self.relations.way_jobs.push_back((self.jobs, first));
+        if self.relations.early {
+            self.collect_member_ways(false)?;
+            self.queue_relations(false)?;
+        }
+        Ok(())
     }
 }
 
@@ -614,10 +901,10 @@ impl Job {
                 }
                 Ok(())
             }
-            Task::Relations(first, end, member_ways) => {
-                let relations = &self.index.prepared.supported_relations[first..end];
-                for (position, relation) in relations.iter().enumerate() {
-                    if let Some(source) = self.index.relation(relation, &member_ways)? {
+            Task::Relations(positions, member_ways) => {
+                let relations = &self.index.prepared.supported_relations;
+                for position in positions {
+                    if let Some(source) = self.index.relation(&relations[position], &member_ways)? {
                         emit(base + position as u64, source)?;
                     }
                 }
@@ -706,7 +993,7 @@ impl Index {
             return true;
         };
         let mut extent = Extent::EMPTY;
-        for member in way_ids.iter().filter_map(|id| member_ways.extents.get(id)) {
+        for member in way_ids.iter().filter_map(|&id| member_ways.extent(id)) {
             extent.extend(member);
         }
         area.intersects(&extent)
@@ -745,8 +1032,14 @@ impl Index {
         junctions: &HashSet<i64>,
         emit: &mut dyn FnMut(u64, Source) -> Result<(), String>,
     ) -> Result<(), String> {
+        // Declared first so that it is dropped last, after the junction
+        // classes below: once every way job's entry is in, they are complete.
+        let mut members = MemberBatch {
+            index: self,
+            job: base >> JOB_SHIFT,
+            members: Vec::new(),
+        };
         let mut classes = Vec::new();
-        let mut members = Vec::new();
         let (mut missing, mut skipped, mut skipped_nodes) = (0, 0, 0);
         for (position, mut way) in batch.ways.into_iter().enumerate() {
             let ordinal = base + 2 * position as u64;
@@ -787,12 +1080,9 @@ impl Index {
                     Some(_) => extent.unwrap_or(Extent::EMPTY),
                     None => Extent::EMPTY,
                 };
-                members.push((
-                    way.way_id,
-                    ordinal,
-                    std::mem::take(&mut way.node_ids),
-                    extent,
-                ));
+                members
+                    .members
+                    .push((way.way_id, std::mem::take(&mut way.node_ids), extent));
             }
             if way.tags.is_empty() && parents.is_empty() {
                 continue;
@@ -833,15 +1123,7 @@ impl Index {
                 }
             }
         }
-        if !members.is_empty() {
-            let mut all = lock(&self.member_ways);
-            for (way_id, ordinal, nodes, extent) in members {
-                // A repeated way ID keeps the later way, as serial order did.
-                if all.get(&way_id).is_none_or(|(old, ..)| *old <= ordinal) {
-                    all.insert(way_id, (ordinal, nodes, extent));
-                }
-            }
-        }
+        drop(members);
         Ok(())
     }
 
@@ -864,7 +1146,7 @@ impl Index {
         if way_ids.is_empty() || !self.relation_in_area(&way_ids, member_ways) {
             return Ok(None);
         }
-        let segments = relation_segments_in_order(way_ids, &member_ways.nodes);
+        let segments = relation_segments_in_order(way_ids, |id| member_ways.nodes(id));
         let mut complete = true;
         let Some(rings) = connect_ring_candidates(segments, true) else {
             self.missing_relations.fetch_add(1, Ordering::Relaxed);
@@ -903,11 +1185,14 @@ impl Index {
 
 // OsmReader.computeWorldGeometry walks relation.members() in PBF order and
 // keeps only the first occurrence of each way. Join orientation depends on it.
-fn relation_segments_in_order(ids: Vec<i64>, ways: &HashMap<i64, Vec<i64>>) -> Vec<Vec<i64>> {
+fn relation_segments_in_order<'a>(
+    ids: Vec<i64>,
+    way: impl Fn(i64) -> Option<&'a Vec<i64>>,
+) -> Vec<Vec<i64>> {
     let mut seen = HashSet::new();
     ids.into_iter()
         .filter(|id| seen.insert(*id))
-        .filter_map(|id| ways.get(&id).cloned())
+        .filter_map(|id| way(id).cloned())
         .collect()
 }
 
@@ -1202,7 +1487,7 @@ mod tests {
             })
             .collect();
         let expected: Vec<i64> = serde_json::from_value(fixture["expected_outer"].clone()).unwrap();
-        let rings = connect_rings(relation_segments_in_order(ids, &ways)).unwrap();
+        let rings = connect_rings(relation_segments_in_order(ids, |id| ways.get(&id))).unwrap();
         assert_eq!(rings, vec![expected]);
     }
 
@@ -1210,7 +1495,7 @@ mod tests {
     fn relation_member_sequence_preserves_first_occurrence_not_way_id_order() {
         let ways = HashMap::from([(30, vec![3, 4]), (10, vec![1, 2]), (20, vec![2, 3])]);
         assert_eq!(
-            relation_segments_in_order(vec![30, 10, 30, 99, 20, 10], &ways),
+            relation_segments_in_order(vec![30, 10, 30, 99, 20, 10], |id| ways.get(&id)),
             vec![vec![3, 4], vec![1, 2], vec![2, 3]]
         );
     }
@@ -1287,7 +1572,7 @@ mod tests {
         assert_ne!(outer.first(), outer.last());
         assert_eq!(nodes[outer.first().unwrap()], nodes[outer.last().unwrap()]);
         let rings = connect_ring_candidates(
-            relation_segments_in_order(vec![95319986, 93277587], &ways),
+            relation_segments_in_order(vec![95319986, 93277587], |id| ways.get(&id)),
             true,
         )
         .unwrap();
@@ -1572,6 +1857,51 @@ mod tests {
             }
         }
     }
+    fn chunk(ways: &[(i64, &[i64])]) -> Arc<MemberChunk> {
+        let mut chunk = MemberChunk::default();
+        for &(id, nodes) in ways {
+            chunk.insert((id, nodes.to_vec(), Extent::EMPTY), false);
+        }
+        Arc::new(chunk)
+    }
+
+    #[test]
+    fn member_chunk_keeps_the_later_copy_of_a_repeated_way() {
+        let chunk = chunk(&[(20, &[1, 2]), (10, &[3, 4]), (20, &[5, 6])]);
+        assert_eq!((chunk.first, chunk.last), (10, 20));
+        assert_eq!(chunk.nodes[&20], vec![5, 6]);
+    }
+
+    #[test]
+    fn member_ways_bisect_sorted_chunks_and_prefer_the_later_chunk() {
+        let ways = MemberWays::new(vec![
+            chunk(&[(1, &[1]), (5, &[5])]),
+            chunk(&[(5, &[50]), (9, &[9])]),
+            chunk(&[(12, &[12])]),
+        ]);
+        assert!(ways.ascending);
+        assert_eq!(ways.nodes(1), Some(&vec![1]));
+        assert_eq!(ways.nodes(5), Some(&vec![50]));
+        assert_eq!(ways.nodes(9), Some(&vec![9]));
+        assert_eq!(ways.nodes(12), Some(&vec![12]));
+        for missing in [0, 3, 7, 10, 13] {
+            assert_eq!(ways.nodes(missing), None, "way {missing}");
+        }
+    }
+
+    #[test]
+    fn member_ways_scan_unsorted_chunks_latest_first() {
+        let ways = MemberWays::new(vec![
+            chunk(&[(10, &[10]), (30, &[30])]),
+            chunk(&[(5, &[5]), (20, &[20]), (30, &[300])]),
+        ]);
+        assert!(!ways.ascending);
+        assert_eq!(ways.nodes(10), Some(&vec![10]));
+        assert_eq!(ways.nodes(5), Some(&vec![5]));
+        assert_eq!(ways.nodes(30), Some(&vec![300]));
+        assert_eq!(ways.nodes(25), None);
+    }
+
     #[test]
     fn ids_preserve_osm_type_namespace() {
         assert_eq!(encoded_id(42, SourceKind::Node).unwrap(), 421);
