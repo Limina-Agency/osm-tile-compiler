@@ -8,6 +8,7 @@
 use osm_tile_compiler::{
     Area, BasemapRequest, CompileBounds, SupplementalDataset, compile_basemap,
 };
+#[allow(dead_code)]
 mod common;
 #[allow(dead_code)]
 #[path = "common/pbf.rs"]
