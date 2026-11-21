@@ -17,6 +17,7 @@ mod land;
 mod line_merge;
 mod pipeline;
 mod polygon_validity;
+mod raster_merge;
 mod record_codec;
 mod render;
 mod repair;

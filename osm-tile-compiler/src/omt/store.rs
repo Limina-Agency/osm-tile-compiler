@@ -1392,6 +1392,13 @@ fn merge_geometries_controlled(
                         min_hole_area,
                         distance,
                     } => {
+                        merge_dump::record(
+                            &first.layer,
+                            first.zoom,
+                            first.tile_id,
+                            distance,
+                            &originals,
+                        );
                         let mut result = Vec::new();
                         let mut cluster_ids = Vec::new();
                         for (cluster_id, (members, merged, jts)) in
@@ -1790,8 +1797,18 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
             // FeatureMerge.bufferUnionUnbuffer, through the port of the
             // pinned JTS buffer and union; the integer overlay remains for
             // inputs outside the port's bounds.
-            super::jts_buffer::buffer_union_unbuffer(&cluster, distance)
-                .unwrap_or_else(|| overlay_buffer_union_unbuffer(&cluster, distance, buffer))
+            match merge_mode() {
+                MergeMode::Raster(cell) => {
+                    super::raster_merge::raster_buffer_union_unbuffer(&cluster, distance, cell)
+                }
+                MergeMode::Overlay => overlay_buffer_union_unbuffer(&cluster, distance, buffer),
+                #[cfg(test)]
+                MergeMode::Collect => {
+                    MultiPolygon(cluster.iter().flat_map(|g| g.0.iter().cloned()).collect())
+                }
+                MergeMode::Jts => super::jts_buffer::buffer_union_unbuffer(&cluster, distance)
+                    .unwrap_or_else(|| overlay_buffer_union_unbuffer(&cluster, distance, buffer)),
+            }
         } else {
             // Pinned mergeOverlappingPolygons uses minDist=buffer=0: a zero
             // buffer of each connected cluster's collection, through the
@@ -1813,6 +1830,40 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
     }
     result.sort_by_key(|(members, ..)| members[0]);
     result
+}
+
+/// Experiment: `OTC_MERGE_MODE=raster[:cell]|overlay` replaces the JTS port in
+/// positive-distance dissolves (default `jts`).
+#[derive(Clone, Copy, PartialEq)]
+enum MergeMode {
+    Jts,
+    Overlay,
+    Raster(f64),
+    /// Proximity only: the cluster's polygons, not unioned.
+    #[cfg(test)]
+    Collect,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MODE_OVERRIDE: std::cell::Cell<Option<MergeMode>> = const { std::cell::Cell::new(None) };
+}
+
+fn merge_mode() -> MergeMode {
+    #[cfg(test)]
+    if let Some(mode) = MODE_OVERRIDE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<MergeMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("OTC_MERGE_MODE").as_deref() {
+        Ok("overlay") => MergeMode::Overlay,
+        Ok(m) if m.starts_with("raster") => MergeMode::Raster(
+            m.strip_prefix("raster:")
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(1.),
+        ),
+        _ => MergeMode::Jts,
+    })
 }
 
 fn overlay_buffer_union_unbuffer(
@@ -4184,5 +4235,321 @@ mod tests {
         });
         let path = std::env::var("OSM_TILE_COMPILER_BUILDING_STAGES").unwrap();
         std::fs::write(path, serde_json::to_vec_pretty(&output).unwrap()).unwrap();
+    }
+}
+
+/// Experiment: with `OTC_MERGE_DUMP=<path>`, every dissolve group is appended
+/// to that file as one JSON line, for the offline merge benchmark
+/// (`merge_bench` in omt/raster_merge.rs).
+pub(super) mod merge_dump {
+    use crate::tile_geometry::TileRingGroup;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    static FILE: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+
+    pub(in crate::omt) fn record(
+        layer: &str,
+        zoom: u8,
+        tile_id: u64,
+        distance: f64,
+        members: &[Vec<TileRingGroup>],
+    ) {
+        let Some(file) = FILE.get_or_init(|| {
+            std::env::var_os("OTC_MERGE_DUMP").map(|p| {
+                Mutex::new(std::io::BufWriter::new(
+                    std::fs::File::create(p).expect("merge dump file"),
+                ))
+            })
+        }) else {
+            return;
+        };
+        let geoms: Vec<Vec<Vec<Vec<[i32; 2]>>>> = members
+            .iter()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .map(|g| {
+                        std::iter::once(&g.exterior)
+                            .chain(g.holes.iter())
+                            .map(|r| r.iter().map(|p| [p.x, p.y]).collect())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let line = serde_json::json!({
+            "layer": layer, "zoom": zoom, "tile": tile_id, "distance": distance, "geoms": geoms
+        });
+        let mut f = file.lock().unwrap();
+        writeln!(f, "{line}").unwrap();
+        f.flush().unwrap();
+    }
+}
+
+/// Offline benchmark of the positive-distance dissolve on groups dumped with
+/// `OTC_MERGE_DUMP`: `OTC_BENCH_GROUPS=<file> cargo test --release --lib
+/// merge_bench -- --ignored --nocapture`.
+#[cfg(test)]
+mod merge_bench {
+    use super::*;
+    use geo::BooleanOps;
+    use std::time::Instant;
+
+    #[derive(Deserialize)]
+    struct Group {
+        layer: String,
+        zoom: u8,
+        distance: f64,
+        geoms: Vec<Vec<Vec<Vec<[i32; 2]>>>>,
+    }
+
+    fn to_geo(member: &[Vec<Vec<[i32; 2]>>]) -> MultiPolygon<f64> {
+        let line = |r: &Vec<[i32; 2]>| {
+            LineString(
+                r.iter()
+                    .map(|p| Coord {
+                        x: f64::from(p[0]),
+                        y: f64::from(p[1]),
+                    })
+                    .collect(),
+            )
+        };
+        MultiPolygon(
+            member
+                .iter()
+                .map(|rings| Polygon::new(line(&rings[0]), rings[1..].iter().map(line).collect()))
+                .collect(),
+        )
+    }
+
+    /// The dissolve branch of `merge_geometries_controlled`, up to snapping.
+    fn dissolve(geoms: Vec<MultiPolygon<f64>>, distance: f64) -> (MultiPolygon<f64>, usize) {
+        let mut out = Vec::new();
+        let mut merged_clusters = 0;
+        for (members, merged, _) in merge_nearby(geoms, distance * 16.) {
+            if members.len() == 1 {
+                out.extend(merged.0);
+            } else {
+                merged_clusters += 1;
+                out.extend(
+                    super::super::jts_buffer::snap_and_fix(&merged)
+                        .unwrap_or(merged)
+                        .0,
+                );
+            }
+        }
+        (MultiPolygon(out), merged_clusters)
+    }
+
+    #[test]
+    #[ignore]
+    fn merge_bench() {
+        let Ok(path) = std::env::var("OTC_BENCH_GROUPS") else {
+            return;
+        };
+        let only = std::env::var("OTC_BENCH_LAYER").ok();
+        let modes: Vec<(&str, Option<MergeMode>)> = vec![
+            ("jts", Some(MergeMode::Jts)),
+            ("collect", Some(MergeMode::Collect)),
+            ("overlay", Some(MergeMode::Overlay)),
+            ("raster1", Some(MergeMode::Raster(1.))),
+            ("raster2", Some(MergeMode::Raster(2.))),
+        ];
+        // (layer, zoom) -> per mode: seconds, xor area (px^2), vertices; groups, members, clusters
+        let mut stats: BTreeMap<(String, u8), (Vec<(f64, f64, f64, usize)>, usize, usize, usize)> =
+            BTreeMap::new();
+        let text = fs::read_to_string(path).unwrap();
+        for line in text.lines() {
+            let g: Group = serde_json::from_str(line).unwrap();
+            if g.distance <= 0. || only.as_ref().is_some_and(|l| *l != g.layer) {
+                continue;
+            }
+            let geoms: Vec<_> = g.geoms.iter().map(|m| to_geo(m)).collect();
+            let entry = stats
+                .entry((g.layer.clone(), g.zoom))
+                .or_insert_with(|| (vec![(0., 0., 0., 0); modes.len()], 0, 0, 0));
+            entry.1 += 1;
+            entry.2 += geoms.len();
+            let mut reference = None;
+            for (k, (_, mode)) in modes.iter().enumerate() {
+                MODE_OVERRIDE.with(|m| m.set(*mode));
+                let input = geoms.clone();
+                let started = Instant::now();
+                let (out, clusters) = dissolve(input, g.distance);
+                let secs = started.elapsed().as_secs_f64();
+                let vertices: usize = out
+                    .0
+                    .iter()
+                    .map(|p| {
+                        p.exterior().0.len()
+                            + p.interiors().iter().map(|r| r.0.len()).sum::<usize>()
+                    })
+                    .sum();
+                let s = &mut entry.0[k];
+                s.0 += secs;
+                s.3 += vertices;
+                if k == 0 {
+                    entry.3 += clusters;
+                    reference = Some(out);
+                } else if *mode != Some(MergeMode::Collect) {
+                    let left = reference.as_ref().unwrap();
+                    let Ok(xor) =
+                        catch_unwind(AssertUnwindSafe(|| left.xor(&out).unsigned_area() / 256.))
+                    else {
+                        continue;
+                    };
+                    s.1 += xor;
+                    s.2 = s.2.max(xor);
+                }
+            }
+            MODE_OVERRIDE.with(|m| m.set(None));
+        }
+        println!(
+            "layer zoom groups members merged_clusters | per mode: seconds, xor px^2 total, max xor px^2 per tile, vertices"
+        );
+        for ((layer, zoom), (per, groups, members, clusters)) in &stats {
+            print!("{layer} z{zoom} {groups} {members} {clusters}");
+            for ((name, _), (secs, xor, max, v)) in modes.iter().zip(per) {
+                print!(" | {name} {secs:.2}s {xor:.1} {max:.2} {v}");
+            }
+            println!();
+        }
+    }
+
+    /// Prints the cluster whose raster closing differs most from JTS.
+    #[test]
+    #[ignore]
+    fn merge_worst_cluster() {
+        let Ok(path) = std::env::var("OTC_BENCH_GROUPS") else {
+            return;
+        };
+        let mut worst = (0., String::new());
+        for line in fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"building\""))
+            .take(40)
+        {
+            let g: Group = serde_json::from_str(line).unwrap();
+            if g.layer != "building" {
+                continue;
+            }
+            let geoms: Vec<_> = g.geoms.iter().map(|m| to_geo(m)).collect();
+            for (members, merged, _) in merge_nearby(geoms.clone(), g.distance * 16.) {
+                if members.len() < 2 {
+                    continue;
+                }
+                let cluster: Vec<_> = members.iter().map(|&i| geoms[i].clone()).collect();
+                let raster = super::super::raster_merge::raster_buffer_union_unbuffer(
+                    &cluster,
+                    g.distance * 16.,
+                    1.,
+                );
+                let Ok(xor) =
+                    catch_unwind(AssertUnwindSafe(|| merged.xor(&raster).unsigned_area()))
+                else {
+                    continue;
+                };
+                if xor > worst.0 {
+                    worst = (
+                        xor,
+                        format!(
+                            "{:?}\n{:?}\n{:?}",
+                            MultiPolygon(cluster.iter().flat_map(|m| m.0.clone()).collect()),
+                            merged,
+                            raster
+                        ),
+                    );
+                }
+            }
+        }
+        println!("worst xor {} units^2\n{}", worst.0, worst.1);
+    }
+
+    fn cluster_key(cluster: &[MultiPolygon<f64>], distance: f64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        distance.to_bits().hash(&mut h);
+        for m in cluster {
+            for p in &m.0 {
+                for r in std::iter::once(p.exterior()).chain(p.interiors()) {
+                    r.0.len().hash(&mut h);
+                    for c in &r.0 {
+                        (c.x.to_bits(), c.y.to_bits()).hash(&mut h);
+                    }
+                }
+            }
+        }
+        h.finish()
+    }
+
+    /// Building clusters of `OTC_BENCH_NEW` whose exact input already appears
+    /// in `OTC_BENCH_GROUPS`, and the JTS time left for the others.
+    #[test]
+    #[ignore]
+    fn merge_cache_reuse() {
+        let (Ok(old), Ok(new)) = (
+            std::env::var("OTC_BENCH_GROUPS"),
+            std::env::var("OTC_BENCH_NEW"),
+        ) else {
+            return;
+        };
+        let clusters_of = |path: &str| {
+            let mut out = Vec::new();
+            for line in fs::read_to_string(path).unwrap().lines() {
+                if !line.contains("\"building\"") {
+                    continue;
+                }
+                let g: Group = serde_json::from_str(line).unwrap();
+                let geoms: Vec<_> = g.geoms.iter().map(|m| to_geo(m)).collect();
+                MODE_OVERRIDE.with(|m| m.set(Some(MergeMode::Collect)));
+                for (members, ..) in merge_nearby(geoms.clone(), g.distance * 16.) {
+                    if members.len() > 1 {
+                        let cluster: Vec<_> = members.iter().map(|&i| geoms[i].clone()).collect();
+                        out.push((cluster_key(&cluster, g.distance), cluster, g.distance * 16.));
+                    }
+                }
+                MODE_OVERRIDE.with(|m| m.set(None));
+            }
+            out
+        };
+        let old: std::collections::HashSet<u64> =
+            clusters_of(&old).into_iter().map(|(k, ..)| k).collect();
+        let new = clusters_of(&new);
+        let (mut all, mut miss, mut n_miss) = (0., 0., 0usize);
+        let mut buckets: BTreeMap<usize, (usize, f64)> = BTreeMap::new();
+        for (key, cluster, d) in &new {
+            let started = Instant::now();
+            let merged = super::super::jts_buffer::buffer_union_unbuffer(cluster, *d);
+            let _ = merged.map(|m| super::super::jts_buffer::snap_and_fix(&m));
+            let secs = started.elapsed().as_secs_f64();
+            all += secs;
+            let bucket = buckets
+                .entry(match cluster.len() {
+                    0..=2 => 2,
+                    3..=5 => 5,
+                    6..=20 => 20,
+                    21..=100 => 100,
+                    101..=1000 => 1000,
+                    _ => usize::MAX,
+                })
+                .or_default();
+            bucket.0 += 1;
+            bucket.1 += secs;
+            if !old.contains(key) {
+                miss += secs;
+                n_miss += 1;
+            }
+        }
+        println!(
+            "clusters {} reused {} recomputed {} | buffer+union+unbuffer+snap all {all:.2}s, misses only {miss:.2}s",
+            new.len(),
+            new.len() - n_miss,
+            n_miss
+        );
+        for (size, (count, secs)) in buckets {
+            println!("members <= {size}: {count} clusters, {secs:.2}s");
+        }
     }
 }
