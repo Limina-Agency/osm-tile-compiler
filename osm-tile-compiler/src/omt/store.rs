@@ -8,7 +8,7 @@ use crate::control::Control;
 use crate::{
     ArchiveCenter, CompileBounds,
     archive::ArchiveOptions,
-    chunk_store::PmtilesArchiveWriter,
+    output::{ArchiveSpec, ArchiveTarget},
     tile_geometry::{TileGeometry, TilePoint, TileRingGroup},
     tile_stats::{TILE_WARNING_BYTES, TileStats, TileStatsBuilder},
 };
@@ -629,11 +629,11 @@ impl Store {
         self.sequence += 1;
         path
     }
-    /// Writes the archive into `archive`, an empty file the caller owns, and
-    /// returns the sizes of the tiles written.
+    /// Writes the archive into `archive`, an empty file or partial archive
+    /// the caller owns, and returns the sizes of the tiles written.
     pub fn finish(
         mut self,
-        archive: &File,
+        archive: &dyn ArchiveTarget,
         header: &ArchiveHeader,
         threads: usize,
         control: &Control,
@@ -686,8 +686,13 @@ impl Store {
             options,
             header.omitted_sources,
         );
-        let mut archive =
-            PmtilesArchiveWriter::create(archive, bounds, center, &metadata, minzoom, maxzoom)?;
+        let mut archive = archive.open_writer(&ArchiveSpec {
+            bounds,
+            center,
+            metadata_json: &metadata,
+            min_zoom: minzoom,
+            max_zoom: maxzoom,
+        })?;
         let mut writing = crate::profiling::Accumulator::new("omt_archive_write");
         let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
         let final_merge = crate::profiling::Phase::start("omt_final_merge_encode_write");

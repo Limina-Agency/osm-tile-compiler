@@ -6,7 +6,7 @@ use crate::control::{self, CompileError, CompileProgress, CompileStage, Control,
 use crate::omt::{self, CompileResult, OpenMapTilesRequest};
 use crate::request::{Area, LayerSelection, ReadScope, ZoomRange};
 use crate::sources::{self, CachedInput, FetchEvent, FetchMode, SupplementalDataset};
-use crate::{ArchiveCenter, CompileBounds, archive::ArchiveOptions};
+use crate::{ArchiveCenter, CompileBounds, OutputFormat, archive::ArchiveOptions};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,6 +39,9 @@ pub struct BasemapRequest {
     /// The archive to write; it must not exist yet. Building levels, when
     /// asked for, go beside it ([`building_levels_path`]).
     pub output: PathBuf,
+    /// The archive format [default: the one `output`'s extension names, see
+    /// [`OutputFormat::from_path`]].
+    pub format: Option<OutputFormat>,
     /// The directory of the supplemental datasets: downloads go there, and
     /// the first compile that reads one extracts it there too.
     pub sources: PathBuf,
@@ -93,6 +96,7 @@ impl BasemapRequest {
         Self {
             input_pbf: input_pbf.into(),
             output: output.into(),
+            format: None,
             sources: sources.into(),
             sources_policy: SourcesPolicy::UsePresent,
             omit_sources: Vec::new(),
@@ -108,6 +112,13 @@ impl BasemapRequest {
         }
     }
 
+    /// The archive format the compile writes: `format`, or the one the
+    /// output's extension names.
+    pub fn output_format(&self) -> OutputFormat {
+        self.format
+            .unwrap_or_else(|| OutputFormat::from_path(&self.output))
+    }
+
     /// The datasets the compile reads.
     pub fn used_sources(&self) -> Vec<SupplementalDataset> {
         SupplementalDataset::ALL
@@ -118,7 +129,8 @@ impl BasemapRequest {
 
     /// Checks everything about the request that needs no reading or
     /// network: the layers, languages, threads, gzip level, bounds, center
-    /// and area, and that no output would be replaced.
+    /// and area, that building levels are asked for only with PMTiles, and
+    /// that no output would be replaced.
     /// [`compile_basemap`] starts with the same checks, so this is for
     /// callers that want to refuse a request before starting it.
     pub fn validate(&self) -> Result<(), CompileError> {
@@ -148,6 +160,12 @@ impl BasemapRequest {
         if let Some(center) = self.center {
             omt::check_center(center, self.zoom).map_err(invalid)?;
         }
+        if self.building_levels && self.output_format() != OutputFormat::PmTiles {
+            return Err(invalid(format!(
+                "building levels are written beside PMTiles archives only, not {}",
+                self.output_format().name()
+            )));
+        }
         if self.area.read == ReadScope::NearArea && !self.area.is_limited() {
             return Err(invalid(
                 "reading only near the area needs bounds or a polygon".into(),
@@ -174,6 +192,8 @@ pub struct BasemapOutput {
     pub result: CompileResult,
     /// The archive: the request's `output`.
     pub archive: PathBuf,
+    /// The archive's format.
+    pub format: OutputFormat,
     /// The building levels and what they hold, if written.
     pub building_levels: Option<(PathBuf, BuildingLevelsReport)>,
     /// The area compiled.
@@ -301,6 +321,7 @@ fn compile(
         languages: request.languages.clone(),
         omit_sources: request.omit_sources.clone(),
         area_only: request.area.read == ReadScope::NearArea,
+        format: request.output_format(),
     };
     omt::validate(&compile_request)?;
     let used = request.used_sources();
@@ -350,6 +371,7 @@ fn compile(
     Ok(BasemapOutput {
         result,
         archive: request.output.clone(),
+        format: request.output_format(),
         building_levels,
         bounds,
         supplemental_inputs,

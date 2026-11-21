@@ -23,7 +23,7 @@
 //! a thread, plus the finished tiles.
 
 use crate::control::{CompileError, Control};
-use crate::omt::PartialArchive;
+use crate::output::{OutputFormat, PartialArchive};
 use fast_mvt::{MvtFeatureRef, MvtReaderRef, MvtValueRef};
 use flate2::{read::GzDecoder, write::GzEncoder};
 use pmtiles::{Compression, PmTilesWriter, TileCoord, TileId, TileType};
@@ -279,7 +279,7 @@ pub(crate) fn has_building_layer(archive: &Path) -> Result<bool, String> {
 
 fn write_archive(output: &Path, header: &Header, tiles: &[(u64, Vec<u8>)]) -> Result<(), String> {
     let failed = |e: pmtiles::PmtError| format!("Failed to write {}: {e}", output.display());
-    let partial = PartialArchive::create(output)?;
+    let partial = PartialArchive::create(output, OutputFormat::PmTiles)?;
     let [west, south, east, north] = header.bounds;
     let [longitude, latitude] = header.center;
     let mut writer = PmTilesWriter::new(TileType::Unknown)

@@ -46,4 +46,5 @@ These belong to other projects and follow them:
 | Planetiler OpenMapTiles profile | commit `91516fdf` | `omt::PROFILE_REVISION`; written as `planetiler_openmaptiles_profile_commit` |
 | Planetiler (comparison) | 0.10.2 | `benchmarks/compiler-parity/` |
 | PMTiles | specification v3 | the archive header |
+| MBTiles | specification 1.3 | `application_id` 0x4d504258 and the `metadata` table of `--format mbtiles` archives |
 | Mapbox Vector Tiles | specification 2.1 | every tile |
