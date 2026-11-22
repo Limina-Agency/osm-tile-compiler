@@ -7,8 +7,11 @@
 //! See `LICENSE.planetiler` and `LICENSE.jts-edl-1.0.txt` in this directory.
 
 use crate::tile_geometry::TilePoint;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{BTreeSet, BinaryHeap};
 
 #[derive(Clone, Copy)]
 struct QueueItem {
@@ -74,7 +77,8 @@ fn node_and_deduplicate(paths: &mut Vec<Vec<TilePoint>>) {
         path.dedup();
     }
     paths.retain(|path| path.len() >= 2);
-    let mut counts = BTreeMap::<TilePoint, usize>::new();
+    // Only looked up, never iterated, so the map's order cannot matter.
+    let mut counts = FxHashMap::<TilePoint, usize>::default();
     for point in paths.iter().flatten() {
         *counts.entry(*point).or_default() += 1;
     }
@@ -89,19 +93,20 @@ fn node_and_deduplicate(paths: &mut Vec<Vec<TilePoint>>) {
         }
         segments.push(path[start..].to_vec());
     }
-    let mut unique = BTreeSet::new();
+    // Membership only: segments keep their input order.
+    let mut unique = FxHashSet::default();
     for segment in segments {
         if segment.len() < 2 {
             continue;
         }
-        let reversed: Vec<_> = segment.iter().rev().copied().collect();
         // Java Node.addEdge compares directed coordinates at the start node.
         // For a closed loop both orientations start at that same node, so a
         // reversed loop remains a distinct input edge until graph merging.
-        let key = if segment.first() == segment.last() || segment <= reversed {
+        // Vec ordering is the iterators' lexicographic ordering.
+        let key = if segment.first() == segment.last() || segment.iter().le(segment.iter().rev()) {
             segment.clone()
         } else {
-            reversed
+            segment.iter().rev().copied().collect()
         };
         if unique.insert(key) {
             paths.push(segment);
@@ -242,7 +247,7 @@ struct GraphEdge {
 #[derive(Default)]
 struct LineGraph {
     nodes: Vec<GraphNode>,
-    node_index: BTreeMap<TilePoint, usize>,
+    node_index: FxHashMap<TilePoint, usize>,
     edges: Vec<GraphEdge>,
 }
 
@@ -286,6 +291,25 @@ impl LineGraph {
     fn other(&self, directed: DirectedEdge) -> usize {
         let edge = &self.edges[directed.edge];
         if directed.forward { edge.to } else { edge.from }
+    }
+
+    /// `angle(&self.oriented(directed), true)`, without the copy.
+    fn start_angle(&self, directed: DirectedEdge) -> f64 {
+        angle(&self.edges[directed.edge].points, directed.forward)
+    }
+
+    /// Whether the two directed edges run through the same points in order.
+    fn same_oriented(&self, a: DirectedEdge, b: DirectedEdge) -> bool {
+        let (pa, pb) = (&self.edges[a.edge].points, &self.edges[b.edge].points);
+        if pa.len() != pb.len() {
+            return false;
+        }
+        match (a.forward, b.forward) {
+            (true, true) => pa == pb,
+            (false, false) => pa.iter().rev().eq(pb.iter().rev()),
+            (true, false) => pa.iter().eq(pb.iter().rev()),
+            (false, true) => pa.iter().rev().eq(pb.iter()),
+        }
     }
 
     fn oriented(&self, directed: DirectedEdge) -> Vec<TilePoint> {
@@ -363,7 +387,8 @@ impl LineGraph {
         if start == exclude {
             return f64::INFINITY;
         }
-        let mut best = BTreeMap::<usize, f64>::new();
+        // Only looked up, never iterated.
+        let mut best = FxHashMap::<usize, f64>::default();
         let mut pending = BinaryHeap::<Reverse<QueueItem>>::new();
         let mut sequence = 0;
         let heuristic = |node: usize| {
@@ -562,7 +587,7 @@ impl LineGraph {
                 for &b in &incident[i + 1..] {
                     if self.edges[b.edge].alive
                         && self.other(a) == self.other(b)
-                        && self.oriented(a) == self.oriented(b)
+                        && self.same_oriented(a, b)
                     {
                         self.remove(b.edge);
                     }
@@ -585,9 +610,7 @@ impl LineGraph {
                     if a.edge == b.edge {
                         continue;
                     }
-                    let pa = self.oriented(a);
-                    let pb = self.oriented(b);
-                    pairs.push((separation(angle(&pa, true), angle(&pb, true)), i, j));
+                    pairs.push((separation(self.start_angle(a), self.start_angle(b)), i, j));
                 }
             }
             pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
