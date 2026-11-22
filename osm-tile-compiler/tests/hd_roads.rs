@@ -100,8 +100,15 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
                     };
                     *kinds.entry(format!("{} {kind}", layer.name())).or_default() += 1;
                     let geometry = feature.geometry().unwrap();
-                    let reach = |v: i32| (-64..=4160).contains(&v);
-                    assert!(geometry.coords_iter().all(|c| reach(c.x) && reach(c.y)));
+                    // a crossing, a line to stop at and an arrow are whole
+                    let whole = ["zebra", "dots", "crossing", "stop", "signal"].contains(kind)
+                        || ["give_way", "arrow", "arrow-head"].contains(kind);
+                    let past = if whole { 800 } else { 64 };
+                    let reach = |v: i32| (-past..=4096 + past).contains(&v);
+                    assert!(
+                        geometry.coords_iter().all(|c| reach(c.x) && reach(c.y)),
+                        "{kind} {geometry:?}"
+                    );
                     if layer.name() == "surface" {
                         surfaces += 1;
                         for polygon in polygons(&geometry) {
@@ -113,7 +120,9 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
                         }
                     } else {
                         markings += 1;
-                        assert!(matches!(geometry, Geometry::LineString(_)));
+                        let head = matches!(geometry, Geometry::Polygon(_));
+                        assert!(head || matches!(geometry, Geometry::LineString(_)));
+                        assert_eq!(head, *kind == "arrow-head");
                     }
                 }
             }
@@ -125,6 +134,7 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
     let y =
         |lat: f64| ((1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n) as u32;
     let (mut pieces, mut crossings, mut groups) = (0, 0, 0);
+    let mut barriers = 0;
     for tx in x(header.min_longitude) - 1..=x(header.max_longitude) + 1 {
         for ty in y(header.max_latitude) - 1..=y(header.min_latitude) + 1 {
             let coord = TileCoord::new(14, tx, ty).unwrap();
@@ -137,8 +147,9 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
             let tile = MvtReaderRef::new(&raw).unwrap();
             // the pieces of each group, and the pieces its crossings name
             let mut seen: BTreeMap<u64, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
+            let mut named: Vec<(u64, u64)> = Vec::new();
             for layer in tile.layers() {
-                assert_eq!((layer.name(), layer.extent()), ("structure", 65_536));
+                assert_eq!(layer.extent(), 65_536);
                 for feature in layer.features() {
                     let properties: BTreeMap<_, _> =
                         feature.properties_vec().unwrap().into_iter().collect();
@@ -146,6 +157,14 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
                         Some(MvtValueRef::UInt(v)) => Some(*v),
                         _ => None,
                     };
+                    if layer.name() != "structure" {
+                        assert!(["paint", "barrier"].contains(&layer.name()));
+                        barriers += u64::from(layer.name() == "barrier");
+                        let on = uint("group").zip(uint("piece"));
+                        assert!(on.is_some() || layer.name() == "barrier");
+                        named.extend(on);
+                        continue;
+                    }
                     let group = seen.entry(uint("group").unwrap()).or_default();
                     match feature.geometry().unwrap() {
                         Geometry::LineString(_) => {
@@ -161,6 +180,9 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
                     }
                 }
             }
+            for (group, piece) in named {
+                assert!(piece < seen[&group].0.len() as u64);
+            }
             groups += seen.len() as u64;
             for (numbers, named) in seen.values() {
                 let count = numbers.len() as u64;
@@ -171,8 +193,13 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
     }
     assert!(pieces > 10 && crossings > 5, "{pieces} {crossings}");
     assert_eq!(
-        (groups, pieces, crossings),
-        (report.groups, report.pieces, report.crossings)
+        (groups, pieces, crossings, barriers),
+        (
+            report.groups,
+            report.pieces,
+            report.crossings,
+            report.barriers
+        )
     );
     assert_eq!(
         (tiles, surfaces, markings),
@@ -183,6 +210,7 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
         "surface sidewalk",
         "marking lane",
         "marking centre",
+        "marking zebra",
     ] {
         assert!(kinds.get(kind).is_some_and(|&n| n > 0), "{kind}: {kinds:?}");
     }

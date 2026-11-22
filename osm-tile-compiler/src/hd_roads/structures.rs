@@ -304,6 +304,117 @@ fn approaches(ways: &[Way], pieces: &[Piece]) -> Vec<Piece> {
     out
 }
 
+/// By cell, segments: group, piece and place in it.
+type Segments = FxHashMap<(i64, i64), Vec<(u32, u32, u32)>>;
+
+/// What lies along the groups' pieces.
+pub(super) struct Index<'a> {
+    groups: &'a [Group],
+    /// The tile each group is in.
+    tiles: Vec<(u32, u32)>,
+    at: Segments,
+}
+
+/// A piece something lies on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Found {
+    pub group: u32,
+    pub piece: u32,
+    pub approach: bool,
+    /// Metres within the surface's nearer edge; below nothing, beyond it.
+    pub inside: f64,
+    pub tile: (u32, u32),
+}
+
+/// The sine of the angle to a piece beyond which a line crosses it and does
+/// not run along it.
+const ALONG: f64 = 0.4;
+
+impl<'a> Index<'a> {
+    pub(super) fn new(
+        groups: &'a [Group],
+        ways: &[Way],
+        tile: impl Fn(Point) -> (u32, u32),
+    ) -> Self {
+        let mut at = Segments::default();
+        for (g, group) in groups.iter().enumerate() {
+            for (i, piece) in group.pieces.iter().enumerate() {
+                let way = &ways[piece.way as usize];
+                let reach = (way.profile.width / 2.0 + way.profile.centre.abs() + 3.0) * way.scale;
+                for (k, p) in piece.points.windows(2).enumerate() {
+                    let cell = |v: f64| (v / CELL).floor() as i64;
+                    let low = |i: usize| cell(p[0][i].min(p[1][i]) - reach);
+                    let high = |i: usize| cell(p[0][i].max(p[1][i]) + reach);
+                    for x in low(0)..=high(0) {
+                        for y in low(1)..=high(1) {
+                            let entry = (g as u32, i as u32, k as u32);
+                            at.entry((x, y)).or_default().push(entry);
+                        }
+                    }
+                }
+            }
+        }
+        let tiles = groups.iter().map(|g| tile(g.pieces[0].points[0])).collect();
+        Self { groups, tiles, at }
+    }
+
+    /// The pieces' segments about `p` that `p` lies beside, with metres right of
+    /// them.
+    fn beside(&self, ways: &'a [Way], p: Point) -> impl Iterator<Item = (u32, u32, Point, f64)> {
+        let cell = |v: f64| (v / CELL).floor() as i64;
+        let near = self.at.get(&(cell(p[0]), cell(p[1])));
+        near.into_iter().flatten().filter_map(move |&(g, i, k)| {
+            let piece = &self.groups[g as usize].pieces[i as usize];
+            let (a, b) = (piece.points[k as usize], piece.points[k as usize + 1]);
+            let length = distance(a, b).max(f64::MIN_POSITIVE);
+            let d = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
+            let q = [p[0] - a[0], p[1] - a[1]];
+            let t = q[0] * d[0] + q[1] * d[1];
+            let right = (q[1] * d[0] - q[0] * d[1]) / ways[piece.way as usize].scale;
+            (-1e-6..=length + 1e-6)
+                .contains(&t)
+                .then_some((g, i, d, right))
+        })
+    }
+
+    /// The piece whose line the point of a way's line is on.
+    pub(super) fn on(&self, ways: &'a [Way], way: u32, p: Point) -> Option<(u32, u32)> {
+        let bridge = layer(ways[way as usize].profile.level).is_some();
+        self.beside(ways, p)
+            .filter(|&(g, i, _, right)| {
+                let piece = &self.groups[g as usize].pieces[i as usize];
+                right.abs() < 0.2
+                    && piece.approach != bridge
+                    && (piece.approach || piece.way == way)
+            })
+            .map(|(g, i, ..)| (g, i))
+            .min()
+    }
+
+    /// The piece the line from `a` to `b` runs along, the one it is furthest
+    /// within, on it or within `beyond` metres of its edge.
+    pub(super) fn along(&self, ways: &'a [Way], a: Point, b: Point, beyond: f64) -> Option<Found> {
+        let length = distance(a, b).max(f64::MIN_POSITIVE);
+        let along = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
+        let middle = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        self.beside(ways, middle)
+            .filter(|(_, _, d, _)| (along[0] * d[1] - along[1] * d[0]).abs() < ALONG)
+            .filter_map(|(group, piece, _, right)| {
+                let of = &self.groups[group as usize].pieces[piece as usize];
+                let p = &ways[of.way as usize].profile;
+                let inside = p.width / 2.0 - (right - p.centre).abs();
+                (inside >= -beyond).then_some(Found {
+                    group,
+                    piece,
+                    approach: of.approach,
+                    inside,
+                    tile: self.tiles[group as usize],
+                })
+            })
+            .reduce(|a, b| if b.inside > a.inside { b } else { a })
+    }
+}
+
 /// Where each piece passes over what is lower, pieces numbered over all groups.
 fn crossings(ways: &[Way], obstacles: &[Obstacle], pieces: &[Piece]) -> Vec<Crossing> {
     let mut at: FxHashMap<(i64, i64), Vec<(u32, u32)>> = FxHashMap::default();

@@ -1251,11 +1251,14 @@ fn hd_roads(args: HdRoadsArgs) -> Result<(), String> {
         report.profiles
     ));
     status.line(&format!(
-        "  {} tiles, {} surfaces, {} markings, {} bridge groups ({} pieces, {} crossings), \
-         {} raw, {} gzipped",
+        "  {} tiles, {} surfaces, {} markings ({} crossings, stops and arrows, {} areas), \
+         {} barriers, {} bridge groups ({} pieces, {} crossings), {} raw, {} gzipped",
         report.tiles,
         report.surfaces,
         report.markings,
+        report.details,
+        report.areas,
+        report.barriers,
         report.groups,
         report.pieces,
         report.crossings,

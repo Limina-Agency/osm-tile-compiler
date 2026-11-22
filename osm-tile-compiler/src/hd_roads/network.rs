@@ -3,7 +3,7 @@
 //! plane of every tile at once.
 
 use super::profile::{Class, Level, Profile};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(super) type Point = [f64; 2];
 
@@ -37,7 +37,14 @@ pub(super) struct Patch {
 
 #[derive(Default)]
 pub(super) struct Network {
+    /// Between junctions and ends, for the tests.
+    #[cfg(test)]
     pub edges: Vec<Edge>,
+    /// The edges of a way joined where nothing keeps their markings apart: past
+    /// driveways, a road's markings go on.
+    pub runs: Vec<Edge>,
+    /// The nodes of `junctions`.
+    pub junction_nodes: FxHashSet<i64>,
     /// Where three or more arms of motor roads meet.
     pub junctions: u64,
     pub patches: Vec<Patch>,
@@ -76,6 +83,7 @@ pub(super) fn build(ways: &[Way]) -> Network {
         }
     }
     let mut network = Network::default();
+    let mut edges: Vec<Edge> = Vec::new();
     let mut arms: FxHashMap<i64, Vec<Arm>> = FxHashMap::default();
     let mut order = Vec::new();
     for (index, way) in ways.iter().enumerate() {
@@ -88,7 +96,7 @@ pub(super) fn build(ways: &[Way]) -> Network {
             if to < last && uses[&way.nodes[to]] < 3 {
                 continue;
             }
-            let edge = network.edges.len() as u32;
+            let edge = edges.len() as u32;
             let points = from..to + 1;
             for (end, node) in [(0, way.nodes[from]), (1, way.nodes[to])] {
                 if uses[&node] >= 2 {
@@ -101,7 +109,7 @@ pub(super) fn build(ways: &[Way]) -> Network {
                     list.push(arm);
                 }
             }
-            network.edges.push(Edge {
+            edges.push(Edge {
                 way: index as u32,
                 points,
                 cut: [0.0; 2],
@@ -116,12 +124,37 @@ pub(super) fn build(ways: &[Way]) -> Network {
             continue;
         }
         for (edge, end, cut) in cuts(arms) {
-            network.edges[edge as usize].cut[end] = cut;
+            edges[edge as usize].cut[end] = cut;
         }
         network.junctions += 1;
+        network.junction_nodes.insert(node);
         network.patches.extend(corners(arms, at, scale));
     }
+    network.runs = runs(&edges);
+    #[cfg(test)]
+    {
+        network.edges = edges;
+    }
     network
+}
+
+fn runs(edges: &[Edge]) -> Vec<Edge> {
+    let mut out: Vec<Edge> = Vec::with_capacity(edges.len());
+    for edge in edges {
+        match out.last_mut() {
+            Some(run)
+                if run.way == edge.way
+                    && run.points.end == edge.points.start + 1
+                    && run.cut[1] == 0.0
+                    && edge.cut[0] == 0.0 =>
+            {
+                run.points.end = edge.points.end;
+                run.cut[1] = edge.cut[1];
+            }
+            _ => out.push(edge.clone()),
+        }
+    }
+    out
 }
 
 fn arm(way: &Way, edge: u32, end: usize, points: &std::ops::Range<usize>) -> Arm {
@@ -385,6 +418,12 @@ mod tests {
         ];
         let n = build(&ways);
         assert!(n.edges[..2].iter().all(|e| e.cut == [0.0, 0.0]));
+        // past it they are one run
+        assert_eq!(n.runs.len(), 2);
+        assert_eq!(
+            (n.runs[0].points.clone(), n.runs[0].cut),
+            (0..3, [0.0, 0.0])
+        );
         assert!(n.edges[2].cut[0] > 0.0);
     }
 

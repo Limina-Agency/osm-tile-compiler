@@ -92,6 +92,77 @@ impl Line {
     }
 }
 
+/// Where a lane's arrow points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) enum Turn {
+    Through,
+    SlightLeft,
+    Left,
+    SharpLeft,
+    SlightRight,
+    Right,
+    SharpRight,
+    Reverse,
+    MergeLeft,
+    MergeRight,
+}
+
+impl Turn {
+    fn read(text: &str) -> Option<Self> {
+        Some(match text.trim() {
+            "through" => Self::Through,
+            "slight_left" => Self::SlightLeft,
+            "left" => Self::Left,
+            "sharp_left" => Self::SharpLeft,
+            "slight_right" => Self::SlightRight,
+            "right" => Self::Right,
+            "sharp_right" => Self::SharpRight,
+            "reverse" => Self::Reverse,
+            "merge_to_left" => Self::MergeLeft,
+            "merge_to_right" => Self::MergeRight,
+            _ => return None,
+        })
+    }
+}
+
+/// A motor road's lanes, metres across as [`Profile`]'s.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Lanes {
+    /// The left edge of the leftmost.
+    pub left: f64,
+    /// Metres across one.
+    pub width: f64,
+    /// How many run against the way (the left ones), and along it. One lane of
+    /// a two-way road is counted along it.
+    pub backward: u32,
+    pub forward: u32,
+    /// Whether traffic goes along the way, and against it.
+    pub along: bool,
+    pub against: bool,
+    /// The arrows of each lane along the way and against it, from the driver's
+    /// left, where they are tagged for as many lanes as there are.
+    pub turns: [Vec<Vec<Turn>>; 2],
+}
+
+impl Lanes {
+    /// Metres across that traffic along the way (`true`) or against it takes.
+    pub(super) fn span(&self, along: bool) -> [f64; 2] {
+        let at = |lane: f64| self.left + lane * self.width;
+        let (backward, all) = (
+            f64::from(self.backward),
+            f64::from(self.backward + self.forward),
+        );
+        match (self.along, self.against, self.backward) {
+            // one lane for both, or one way
+            (true, true, 0) if along => [at(all / 2.0), at(all)],
+            (true, true, 0) => [at(0.0), at(all / 2.0)],
+            (true, true, _) if along => [at(backward), at(all)],
+            (true, true, _) => [at(0.0), at(backward)],
+            _ => [at(0.0), at(all)],
+        }
+    }
+}
+
 /// Metres, across the way and to the right of its direction.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Profile {
@@ -105,6 +176,11 @@ pub(super) struct Profile {
     pub centre: f64,
     /// Painted lines, left to right.
     pub lines: Vec<(f64, Line)>,
+    /// A motor road's.
+    pub lanes: Option<Box<Lanes>>,
+    /// Metres of parking beside the surface, on its left and right.
+    pub parking: [f64; 2],
+    pub roundabout: bool,
 }
 
 /// Metres of hard shoulder right of a motorway's lanes, and left of them.
@@ -151,7 +227,7 @@ pub(super) fn profile<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Profi
         _ => return None,
     };
     let level = level(&get);
-    let paved = get("surface").is_none_or(|surface| !UNPAVED.contains(&surface));
+    let paved = paved(&get);
     let width = get("width").and_then(metres);
     if !class.is_motor() {
         let width = width.filter(|w| (0.5..=8.0).contains(w));
@@ -167,16 +243,18 @@ pub(super) fn profile<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Profi
             width: width.unwrap_or_else(|| class.lane_width()),
             centre: 0.0,
             lines: Vec::new(),
+            lanes: None,
+            parking: [0.0; 2],
+            roundabout: false,
         });
     }
+    let roundabout = matches!(get("junction"), Some("roundabout" | "circular"));
     let reversed = get("oneway") == Some("-1");
     let oneway = reversed
         || match get("oneway") {
             Some("yes" | "true" | "1") => true,
             Some("no") => false,
-            _ => {
-                highway == "motorway" || matches!(get("junction"), Some("roundabout" | "circular"))
-            }
+            _ => highway == "motorway" || roundabout,
         };
     let count = |key: &str| {
         get(key)
@@ -227,6 +305,7 @@ pub(super) fn profile<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Profi
     } else {
         (0.0, 0.0)
     };
+    let turns = turns(&get, oneway, reversed, [forward, backward]);
     Some(Profile {
         class,
         level,
@@ -235,7 +314,71 @@ pub(super) fn profile<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Profi
         width: across + left_shoulder + right_shoulder,
         centre: left + across / 2.0 + (right_shoulder - left_shoulder) / 2.0,
         lines,
+        lanes: Some(Box::new(Lanes {
+            left,
+            width: lane,
+            backward,
+            forward,
+            along: !reversed,
+            against: reversed || !oneway,
+            turns,
+        })),
+        parking: [parking(&get, "left"), parking(&get, "right")],
+        roundabout,
     })
+}
+
+/// The arrows of the lanes along the way and against it: those tagged for as
+/// many lanes as there are.
+fn turns<'a>(
+    get: impl Fn(&str) -> Option<&'a str>,
+    oneway: bool,
+    reversed: bool,
+    [forward, backward]: [u32; 2],
+) -> [Vec<Vec<Turn>>; 2] {
+    let read = |key: &str, lanes: u32| -> Vec<Vec<Turn>> {
+        let Some(text) = get(key) else {
+            return Vec::new();
+        };
+        let turns: Vec<Vec<Turn>> = text
+            .split('|')
+            .map(|lane| lane.split(';').filter_map(Turn::read).collect())
+            .collect();
+        if turns.len() == lanes as usize && turns.iter().any(|t| !t.is_empty()) {
+            turns
+        } else {
+            Vec::new()
+        }
+    };
+    if reversed {
+        // a road against its way has its lanes tagged as its traffic sees them
+        return [Vec::new(), read("turn:lanes", forward)];
+    }
+    if oneway {
+        return [read("turn:lanes", forward), Vec::new()];
+    }
+    if backward == 0 {
+        return [Vec::new(), Vec::new()];
+    }
+    [
+        read("turn:lanes:forward", forward),
+        read("turn:lanes:backward", backward),
+    ]
+}
+
+/// Metres of parking beside the carriageway, where it has a surface of its own.
+fn parking<'a>(get: impl Fn(&str) -> Option<&'a str>, side: &str) -> f64 {
+    let of = |suffix: &str| {
+        get(&format!("parking:{side}{suffix}")).or_else(|| get(&format!("parking:both{suffix}")))
+    };
+    if of("") != Some("street_side") {
+        return 0.0;
+    }
+    match of(":orientation") {
+        Some("perpendicular") => 5.0,
+        Some("diagonal") => 4.5,
+        _ => 2.2,
+    }
 }
 
 /// The lines of a carriageway whose left edge is at `left`: nothing the tags
@@ -305,7 +448,7 @@ fn placement<'a>(
     Some(-edge * lane)
 }
 
-fn level<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Level {
+pub(super) fn level<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Level {
     let layer = get("layer").and_then(|v| v.trim().parse::<i8>().ok());
     if get("bridge").is_some_and(|v| v != "no") {
         Level::Bridge(layer.unwrap_or(1))
@@ -316,8 +459,13 @@ fn level<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Level {
     }
 }
 
+/// Whether a way with these tags is of a hard surface.
+pub(super) fn paved<'a>(get: impl Fn(&str) -> Option<&'a str>) -> bool {
+    get("surface").is_none_or(|surface| !UNPAVED.contains(&surface))
+}
+
 /// A length in metres: `3.5`, `3.5 m`. Other units are not read.
-fn metres(text: &str) -> Option<f64> {
+pub(super) fn metres(text: &str) -> Option<f64> {
     let text = text.trim();
     let text = text.strip_suffix('m').unwrap_or(text).trim_end();
     text.parse::<f64>()
@@ -422,6 +570,81 @@ mod tests {
         // not a lane there is: as if untagged
         assert_eq!(at("right_of:9"), -5.625);
         assert_eq!(at("transition"), -5.625);
+    }
+
+    #[test]
+    fn arrows_are_read_for_as_many_lanes_as_there_are() {
+        let turns = |tags: &[(&str, &'static str)]| read(tags).unwrap().lanes.unwrap().turns;
+        let one = turns(&[
+            ("highway", "primary"),
+            ("oneway", "yes"),
+            ("lanes", "3"),
+            ("turn:lanes", "left|through;right|"),
+        ]);
+        assert_eq!(
+            one[0],
+            [
+                vec![Turn::Left],
+                vec![Turn::Through, Turn::Right],
+                Vec::new()
+            ]
+        );
+        assert!(one[1].is_empty());
+        // two lanes have no three arrows, and a two-way road's are by direction
+        let wrong = turns(&[
+            ("highway", "primary"),
+            ("oneway", "yes"),
+            ("lanes", "2"),
+            ("turn:lanes", "left|through|right"),
+        ]);
+        assert!(wrong.iter().all(Vec::is_empty));
+        let both = turns(&[
+            ("highway", "primary"),
+            ("lanes", "3"),
+            ("lanes:forward", "2"),
+            ("turn:lanes", "left|through|right"),
+            ("turn:lanes:forward", "left|through"),
+            ("turn:lanes:backward", "none"),
+        ]);
+        assert_eq!((both[0].len(), both[1].len()), (2, 0));
+        let against = turns(&[
+            ("highway", "primary"),
+            ("oneway", "-1"),
+            ("lanes", "2"),
+            ("turn:lanes", "left|right"),
+        ]);
+        assert_eq!((against[0].len(), against[1].len()), (0, 2));
+    }
+
+    #[test]
+    fn each_direction_has_its_own_span() {
+        let lanes = |tags: &[(&str, &'static str)]| read(tags).unwrap().lanes.unwrap();
+        let three = lanes(&[
+            ("highway", "primary"),
+            ("lanes", "3"),
+            ("lanes:backward", "1"),
+        ]);
+        assert_eq!(three.span(true), [-1.75, 5.25]);
+        assert_eq!(three.span(false), [-5.25, -1.75]);
+        let narrow = lanes(&[("highway", "residential"), ("lanes", "1")]);
+        assert_eq!(narrow.span(true), [0.0, 1.375]);
+        assert_eq!(narrow.span(false), [-1.375, 0.0]);
+        let one_way = lanes(&[("highway", "primary"), ("oneway", "-1"), ("lanes", "2")]);
+        assert_eq!((one_way.along, one_way.against), (false, true));
+        assert_eq!(one_way.span(false), [-3.5, 3.5]);
+    }
+
+    #[test]
+    fn parking_beside_a_road_is_a_strip_only_where_it_has_ground_of_its_own() {
+        let strips = |tags: &[(&str, &'static str)]| read(tags).unwrap().parking;
+        let street = [
+            ("highway", "residential"),
+            ("parking:both", "street_side"),
+            ("parking:right:orientation", "perpendicular"),
+        ];
+        assert_eq!(strips(&street), [2.2, 5.0]);
+        let lane = [("highway", "residential"), ("parking:left", "lane")];
+        assert_eq!(strips(&lane), [0.0, 0.0]);
     }
 
     #[test]
