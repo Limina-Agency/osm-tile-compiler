@@ -44,7 +44,7 @@ pub(super) fn layer_id(name: &str) -> Option<u8> {
 
 // Every attribute name the profile can produce, in byte order (at most 254).
 // A missing name only costs bytes.
-const ATTR_KEYS: [&str; 153] = [
+pub(super) const ATTR_KEYS: [&str; 153] = [
     "__agg_stop_key",
     "__agg_stop_order",
     "__housenumber_has_name",

@@ -1,6 +1,6 @@
 //! Schema-neutral rendering for the OpenMapTiles profile.
 use super::{
-    store::{AttrMap, AttrValue},
+    store::{AttrKey, AttrMap, AttrValue},
     types::Feature,
 };
 use crate::{
@@ -33,11 +33,12 @@ pub(super) struct Record {
     pub rank: bool,
 }
 
-fn attrs(feature: &Feature, z: u8) -> AttrMap {
+/// The feature's attributes as records hold them, in key order, each with
+/// the zoom it starts at; `attrs` picks those of one zoom.
+fn feature_attrs(feature: &Feature) -> Vec<(u8, AttrKey, AttrValue)> {
     feature
         .attrs
         .iter()
-        .filter(|(k, _)| feature.attr_minzoom.get(*k).is_none_or(|min| z >= *min))
         .filter_map(|(k, v)| {
             let value = match v {
                 serde_json::Value::String(v) => AttrValue::String(v.clone()),
@@ -53,8 +54,21 @@ fn attrs(feature: &Feature, z: u8) -> AttrMap {
                 }
                 _ => return None,
             };
-            Some((Cow::Owned(k.clone()), value))
+            let min_zoom = feature.attr_minzoom.get(k).copied().unwrap_or(0);
+            // A known name is shared rather than copied for every record.
+            let key = match super::record_codec::ATTR_KEYS.binary_search(&k.as_str()) {
+                Ok(index) => Cow::Borrowed(super::record_codec::ATTR_KEYS[index]),
+                Err(_) => Cow::Owned(k.clone()),
+            };
+            Some((min_zoom, key, value))
         })
+        .collect()
+}
+
+fn attrs(all: &[(u8, AttrKey, AttrValue)], z: u8) -> AttrMap {
+    all.iter()
+        .filter(|(min_zoom, ..)| z >= *min_zoom)
+        .map(|(_, key, value)| (key.clone(), value.clone()))
         .collect()
 }
 
@@ -975,6 +989,8 @@ pub(super) fn emit_records(
 ) -> Result<(), String> {
     let unit_geometry = std::cell::OnceCell::new();
     let unit_source = std::cell::OnceCell::new();
+    let all_attrs = std::cell::OnceCell::new();
+    let university_min_size = feature.attrs.contains_key("__university_min_size");
     for z in feature.min_zoom.max(minzoom)..=feature.max_zoom.min(maxzoom) {
         let size = if z == maxzoom {
             feature.min_size_at_max_zoom
@@ -1007,7 +1023,7 @@ pub(super) fn emit_records(
         // Poi.setMinPixelSizeBelowZoom(13, 80) uses an inclusive
         // ZoomFunction.maxZoom(13, 80) at the pinned profile revision.
         if z <= 13
-            && feature.attrs.contains_key("__university_min_size")
+            && university_min_size
             && let Some(original) = &feature.min_size_source_geometry
         {
             // WithGeometry.size() is zero for puntal sources. Geometry
@@ -1118,7 +1134,7 @@ pub(super) fn emit_records(
         let maxy = ((bottom + slice_buffer).floor() as i32)
             .min(se.y.floor() as i32)
             .min(max);
-        let mut attributes = attrs(&feature, z);
+        let mut attributes = attrs(all_attrs.get_or_init(|| feature_attrs(&feature)), z);
         if attributes.contains_key("_numpoints") {
             attributes.insert("_numpoints".into(), AttrValue::Int(num_points as i64));
         }
@@ -1144,7 +1160,10 @@ pub(super) fn emit_records(
             tile_id: 0,
             zoom: z,
             id: feature.id,
-            layer: Cow::Owned(feature.layer.clone()),
+            layer: match super::record_codec::layer_id(&feature.layer) {
+                Some(id) => Cow::Borrowed(super::record_codec::LAYER_NAMES[usize::from(id)]),
+                None => Cow::Owned(feature.layer.clone()),
+            },
             geometry: TileGeometry::Point(Vec::new()),
             attrs: attributes,
             sort_key: feature.sort_key,
