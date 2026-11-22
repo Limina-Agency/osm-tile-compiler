@@ -303,6 +303,21 @@ impl<'a> Reader<'a> {
         self.varint().map(unzigzag)
     }
 
+    /// Reads a varint and appends it to `out` as `put_varint` would: its own
+    /// bytes when they are already the shortest form.
+    fn copy_varint(&mut self, out: &mut Vec<u8>) -> Result<u64, String> {
+        let before = self.0;
+        let value = self.varint()?;
+        let used = before.len() - self.0.len();
+        let shortest = (64 - (value | 1).leading_zeros() as usize).div_ceil(7);
+        if used == shortest {
+            out.extend_from_slice(&before[..used]);
+        } else {
+            put_varint(out, value);
+        }
+        Ok(value)
+    }
+
     pub(super) fn str(&mut self) -> Result<&'a str, String> {
         let len = self.length()?;
         std::str::from_utf8(self.take(len)?).map_err(|e| e.to_string())
@@ -341,7 +356,15 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn encode_payload(record: &Record, out: &mut Vec<u8>) {
+    encode_payload_head(record, out);
+    put_attrs(out, &record.attrs);
+}
+
+/// The payload up to its attributes, which `encode_attrs` writes and which
+/// come last: `encode_payload` is the two in turn.
+pub(super) fn encode_payload_head(record: &Record, out: &mut Vec<u8>) {
     out.push(record.zoom);
     let grid_size = record.grid_size.to_bits();
     out.push(
@@ -362,7 +385,11 @@ pub(super) fn encode_payload(record: &Record, out: &mut Vec<u8>) {
     }
     put_varint(out, record.grid_limit as u64);
     put_geometry(out, &record.geometry);
-    put_attrs(out, &record.attrs);
+}
+
+/// The attribute part of a payload, the bytes `encode_payload` ends with.
+pub(super) fn encode_attrs(attrs: &AttrMap, out: &mut Vec<u8>) {
+    put_attrs(out, attrs);
 }
 
 fn put_points(out: &mut Vec<u8>, previous: &mut TilePoint, points: &[TilePoint]) {
@@ -682,19 +709,22 @@ fn split_path(
 ) -> Result<(), String> {
     let count = reader.length()?;
     // The last point equals the first when the deltas after the first sum
-    // to zero.
-    let closed = ring && count >= 2 && {
-        let mut ahead = reader.clone();
-        let (mut x, mut y) = (0i64, 0i64);
-        for point in 0..count {
-            let (dx, dy) = (ahead.zigzag()?, ahead.zigzag()?);
-            if point > 0 {
-                x = x.wrapping_add(dx);
-                y = y.wrapping_add(dy);
-            }
+    // to zero; it is then taken off the stream again.
+    let coords = &mut streams[COORDS];
+    let (mut x, mut y) = (0i64, 0i64);
+    let mut last = coords.len();
+    for point in 0..count {
+        last = coords.len();
+        let (dx, dy) = (reader.copy_varint(coords)?, reader.copy_varint(coords)?);
+        if point > 0 {
+            x = x.wrapping_add(unzigzag(dx));
+            y = y.wrapping_add(unzigzag(dy));
         }
-        x == 0 && y == 0
-    };
+    }
+    let closed = ring && count >= 2 && x == 0 && y == 0;
+    if closed {
+        coords.truncate(last);
+    }
     if ring {
         put_varint(
             &mut streams[COUNTS],
@@ -702,13 +732,6 @@ fn split_path(
         );
     } else {
         put_varint(&mut streams[COUNTS], count as u64);
-    }
-    for point in 0..count {
-        let (dx, dy) = (reader.varint()?, reader.varint()?);
-        if !(closed && point == count - 1) {
-            put_varint(&mut streams[COORDS], dx);
-            put_varint(&mut streams[COORDS], dy);
-        }
     }
     Ok(())
 }

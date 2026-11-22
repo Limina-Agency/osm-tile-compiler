@@ -950,12 +950,28 @@ fn polygon_tile(
         })
 }
 
+#[cfg(test)]
 pub(super) fn emit_with_record_sink(
     feature: Feature,
     region: &Region,
     minzoom: u8,
     maxzoom: u8,
     sink: &mut impl FnMut(Record) -> Result<(), String>,
+) -> Result<(), String> {
+    emit_records(feature, region, minzoom, maxzoom, &mut |record| {
+        sink(record.clone())
+    })
+}
+
+/// Renders `feature` into one record per tile and zoom, handed to `sink` in
+/// order. The records of one zoom differ only in their tile and geometry:
+/// they share the layer, attributes and every other field.
+pub(super) fn emit_records(
+    feature: Feature,
+    region: &Region,
+    minzoom: u8,
+    maxzoom: u8,
+    sink: &mut impl FnMut(&Record) -> Result<(), String>,
 ) -> Result<(), String> {
     let unit_geometry = std::cell::OnceCell::new();
     let unit_source = std::cell::OnceCell::new();
@@ -1122,6 +1138,25 @@ pub(super) fn emit_with_record_sink(
             0.0
         };
         let grid_cell = label_point.and_then(|p| label_grid_cell(p, z, effective_grid_size));
+        // The fields every tile's record of this zoom shares; each tile only
+        // sets its own ID and geometry.
+        let mut record = Record {
+            tile_id: 0,
+            zoom: z,
+            id: feature.id,
+            layer: Cow::Owned(feature.layer.clone()),
+            geometry: TileGeometry::Point(Vec::new()),
+            attrs: attributes,
+            sort_key: feature.sort_key,
+            grid_size: if z <= feature.grid_max_zoom {
+                grid_size
+            } else {
+                0.0
+            },
+            grid_cell,
+            grid_limit,
+            rank: feature.rank,
+        };
         let group_bounds = match &world {
             WorldGeometry::Polygon(groups) => groups
                 .iter()
@@ -1226,23 +1261,9 @@ pub(super) fn emit_with_record_sink(
                 };
                 if let Some(geometry) = geometry {
                     let coord = TileCoord::new(z, x as u32, y as u32).map_err(|e| e.to_string())?;
-                    sink(Record {
-                        tile_id: TileId::from(coord).value(),
-                        zoom: z,
-                        id: feature.id,
-                        layer: Cow::Owned(feature.layer.clone()),
-                        geometry,
-                        attrs: attributes.clone(),
-                        sort_key: feature.sort_key,
-                        grid_size: if z <= feature.grid_max_zoom {
-                            grid_size
-                        } else {
-                            0.0
-                        },
-                        grid_cell,
-                        grid_limit,
-                        rank: feature.rank,
-                    })?;
+                    record.tile_id = TileId::from(coord).value();
+                    record.geometry = geometry;
+                    sink(&record)?;
                 }
             }
         }
