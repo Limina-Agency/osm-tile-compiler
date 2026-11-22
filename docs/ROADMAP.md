@@ -51,7 +51,7 @@ deliberate and explained in its pull request.
 1. ~~Configurable metadata (name, description, attribution); one layer list.~~
 2. ~~Selectable gzip level.~~
 3. ~~`inspect` and `verify` commands.~~
-4. MBTiles output, only if the desktop app needs it.
+4. ~~MBTiles output (`--format mbtiles`).~~
 
 ## Lane E — Configurability
 
