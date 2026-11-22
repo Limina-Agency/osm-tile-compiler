@@ -113,6 +113,7 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
 {
   "inputPbf": "/…/monaco.osm.pbf",
   "output": "/…/monaco.pmtiles",
+  "format": "pmtiles",
   "sources": "/…/omt-sources",
   "tempDir": "/…/tmp",
   "sourcesPolicy": "use_present",
@@ -138,10 +139,14 @@ languages, the datasets present in `sources`). `sourcesPolicy` is
 `use_present`, `fetch_missing` or `fetch_and_verify`. `layers` is
 `{"only": [...]}` or `{"except": [...]}`. `area.read` is `whole_extract` (the
 default) or `near_area`, which reads only the OSM data in and near the area.
+`format` is `pmtiles` or `mbtiles`; without it, an `output` ending in
+`.mbtiles` is MBTiles and anything else PMTiles. Building levels need
+PMTiles.
 
 The result is the basemap manifest the worker writes (`format`,
 `formatVersion`, `schema`, `version`, `result`, `supplementalInputs`,
-`omittedSources`), plus `archive`, `buildingLevels` (a path or `null`) and
+`omittedSources`), plus `archive`, `archiveFormat` (`pmtiles` or
+`mbtiles`), `buildingLevels` (a path or `null`) and
 the `bounds` compiled.
 
 The field layout follows the 0.2 request types (`ZoomRange`,
@@ -149,7 +154,8 @@ The field layout follows the 0.2 request types (`ZoomRange`,
 `BasemapRequest` field by field. `otc_job_start` then runs
 `BasemapRequest::validate()`, so whatever needs no reading or network fails
 synchronously: unknown layers or languages, zooms outside 0 to 14,
-`threads` of 0, a gzip level above 9, bad bounds or center, `near_area`
+`threads` of 0, a gzip level above 9, bad bounds or center, building levels
+with MBTiles, `near_area`
 without bounds or a polygon, an output that already exists. What needs
 reading (a PBF or polygon that cannot be opened, missing datasets) fails the
 job instead, with `error.kind` `invalid_request`. Once the request types get
