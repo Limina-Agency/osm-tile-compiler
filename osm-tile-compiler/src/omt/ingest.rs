@@ -11,8 +11,8 @@ use super::{
 };
 use crate::control::{CompileStage, Control};
 use geo::coordinate_position::CoordPos;
-use geo::{Area, BoundingRect, Contains, CoordinatePosition};
-use geo_types::{Coord, Geometry, LineString, MultiPolygon, Point, Polygon, Rect};
+use geo::{Area, BoundingRect, Contains, CoordinatePosition, Intersects};
+use geo_types::{Coord, Geometry, Line, LineString, MultiPolygon, Point, Polygon, Rect};
 use osm_pbf_ingest::IngestStage;
 use osm_pbf_ingest::blob_index::ObjectKind;
 use osm_pbf_ingest::node_store::DecimicroBox;
@@ -1039,17 +1039,47 @@ fn ring_contains(
     let Some(vertex) = inner.exterior().0.first().filter(|_| inner_area > 0.0) else {
         return outer.contains(inner);
     };
-    let touches = outer.exterior().lines().any(|edge| {
-        edge.start.x.min(edge.end.x) <= inner_bounds.max().x
-            && edge.start.x.max(edge.end.x) >= inner_bounds.min().x
-            && edge.start.y.min(edge.end.y) <= inner_bounds.max().y
-            && edge.start.y.max(edge.end.y) >= inner_bounds.min().y
-    });
-    if touches {
-        outer.contains(inner)
-    } else {
+    let near = outer
+        .exterior()
+        .lines()
+        .filter(|edge| line_meets_rect(edge, inner_bounds))
+        .collect::<Vec<_>>();
+    if near.is_empty() || boundaries_apart(&near, inner) {
         outer.coordinate_position(vertex) == CoordPos::Inside
+    } else {
+        outer.contains(inner)
     }
+}
+
+fn line_meets_rect(edge: &Line<f64>, rect: &Rect<f64>) -> bool {
+    edge.start.x.min(edge.end.x) <= rect.max().x
+        && edge.start.x.max(edge.end.x) >= rect.min().x
+        && edge.start.y.min(edge.end.y) <= rect.max().y
+        && edge.start.y.max(edge.end.y) >= rect.min().y
+}
+
+/// The most pairs of outer edges and inner points or edges that
+/// `boundaries_apart` checks before leaving the pair to `contains`.
+const APART_CHECKS: usize = 1 << 20;
+
+/// Whether no edge of `near`, the outer edges that reach the inner ring's
+/// box, meets the inner ring's boundary or lies inside it. Then the boundaries
+/// share no point and neither reaches into the other's ring, so relate labels
+/// the inner ring by one of its vertices, as for rings whose boxes are apart,
+/// and `contains` is that vertex's position. False when unsure.
+fn boundaries_apart(near: &[Line<f64>], inner: &Polygon<f64>) -> bool {
+    let points = inner.exterior().0.len();
+    if near.len().saturating_mul(points) > APART_CHECKS {
+        return false;
+    }
+    let inner_edges = inner.exterior().lines().collect::<Vec<_>>();
+    near.iter().all(|edge| {
+        let bounds = edge.bounding_rect();
+        inner.coordinate_position(&edge.start) == CoordPos::Outside
+            && inner_edges
+                .iter()
+                .all(|other| !line_meets_rect(other, &bounds) || !other.intersects(edge))
+    })
 }
 
 fn nest_rings(rings: Vec<Polygon<f64>>) -> Geometry<f64> {
@@ -1122,6 +1152,71 @@ fn nest_rings(rings: Vec<Polygon<f64>>) -> Geometry<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ring_contains_matches_geo_contains_on_random_rings() {
+        use geo::{Area, BoundingRect, Contains};
+        use geo_types::{LineString, Polygon};
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |range: i32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % range as u64) as i32
+        };
+        // Rings on a coarse grid touch, share edges and cross each other
+        // often; some are self-intersecting.
+        let mut ring = |next: &mut dyn FnMut(i32) -> i32| {
+            let (cx, cy, r) = (next(12), next(12), 1 + next(8));
+            let n = 3 + next(6) as usize;
+            let mut points = (0..n)
+                .map(|i| {
+                    let a = i as f64 / n as f64 * std::f64::consts::TAU;
+                    let radius = f64::from(r) * (0.5 + f64::from(next(3)) / 4.0);
+                    (
+                        (f64::from(cx) + radius * a.cos()).round(),
+                        (f64::from(cy) + radius * a.sin()).round(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if next(5) == 0 {
+                points.swap(0, 1);
+            }
+            Polygon::new(LineString::from(points), vec![])
+        };
+        let (mut checked, mut fast) = (0, 0);
+        for _ in 0..20_000 {
+            let outer = ring(&mut next);
+            let inner = ring(&mut next);
+            let area = inner.unsigned_area();
+            let (Some(a), Some(b)) = (outer.bounding_rect(), inner.bounding_rect()) else {
+                continue;
+            };
+            if area <= 0.0
+                || !(a.min().x <= b.min().x
+                    && a.min().y <= b.min().y
+                    && a.max().x >= b.max().x
+                    && a.max().y >= b.max().y)
+            {
+                continue;
+            }
+            checked += 1;
+            let near = outer
+                .exterior()
+                .lines()
+                .filter(|edge| super::line_meets_rect(edge, &b))
+                .collect::<Vec<_>>();
+            if !near.is_empty() && super::boundaries_apart(&near, &inner) {
+                fast += 1;
+            }
+            assert_eq!(
+                super::ring_contains(&outer, &inner, &b, area),
+                outer.contains(&inner),
+                "{outer:?} {inner:?}"
+            );
+        }
+        assert!(checked > 1000 && fast > 100, "{checked} {fast}");
+    }
+
     #[test]
     fn node_store_dir_deletes_the_disk_store_osm_pbf_ingest_writes() {
         use osm_pbf_ingest::node_store::{
