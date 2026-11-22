@@ -6,7 +6,7 @@
 //! it is already in the directory.
 use crate::control::{CANCELLED, CompileError};
 use crate::sources::{agent, transfer};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},
@@ -58,12 +58,35 @@ struct Properties {
     name: String,
     #[serde(default)]
     parent: Option<String>,
-    #[serde(default, rename = "iso3166-1:alpha2")]
+    #[serde(default, rename = "iso3166-1:alpha2", deserialize_with = "iso_codes")]
     iso3166_1: Vec<String>,
-    #[serde(default, rename = "iso3166-2")]
+    #[serde(default, rename = "iso3166-2", deserialize_with = "iso_codes")]
     iso3166_2: Vec<String>,
     #[serde(default)]
     urls: Urls,
+}
+
+/// ISO codes as the index writes them: one string, with a comma between the
+/// codes of an extract that covers several countries (`"PS,IL"`), or, as
+/// it used to write them, a list.
+fn iso_codes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Codes {
+        Text(String),
+        List(Vec<String>),
+    }
+    let codes = match Option::<Codes>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(Codes::Text(text)) => text.split(',').map(String::from).collect(),
+        Some(Codes::List(list)) => list,
+    };
+    Ok(codes
+        .iter()
+        .map(|code| code.trim())
+        .filter(|code| !code.is_empty())
+        .map(String::from)
+        .collect())
 }
 
 #[derive(Deserialize, Default)]
@@ -428,6 +451,51 @@ mod tests {
         assert_eq!(poland.parent.as_deref(), Some("europe"));
         assert_eq!(poland.iso_codes, ["PL"]);
         assert!(parse_index(b"{}").is_err());
+    }
+
+    #[test]
+    fn reads_iso_codes_as_text_list_or_nothing() {
+        let codes = |properties: &str| {
+            let json = format!(
+                r#"{{"features": [{{"properties": {{"id": "a", "name": "A",
+                "urls": {{"pbf": "https://example.org/a.osm.pbf"}}{properties}}}}}]}}"#
+            );
+            parse_index(json.as_bytes()).map(|index| index[0].iso_codes.clone())
+        };
+        assert_eq!(codes(r#", "iso3166-1:alpha2": "AF""#).unwrap(), ["AF"]);
+        assert_eq!(codes(r#", "iso3166-1:alpha2": ["AF"]"#).unwrap(), ["AF"]);
+        assert_eq!(codes(r#", "iso3166-2": "US-GA""#).unwrap(), ["US-GA"]);
+        assert_eq!(codes(r#", "iso3166-2": ["US-GA"]"#).unwrap(), ["US-GA"]);
+        // Several countries in one extract.
+        for several in [r#""PS,IL""#, r#""PS, IL""#, r#"["PS", "IL"]"#] {
+            let properties = format!(r#", "iso3166-1:alpha2": {several}"#);
+            assert_eq!(codes(&properties).unwrap(), ["PS", "IL"]);
+        }
+        assert_eq!(
+            codes(r#", "iso3166-1:alpha2": "US", "iso3166-2": "US-PR""#).unwrap(),
+            ["US", "US-PR"]
+        );
+        for none in ["", r#", "iso3166-2": null"#, r#", "iso3166-2": """#] {
+            assert!(codes(none).unwrap().is_empty(), "{none}");
+        }
+        assert!(codes(r#", "iso3166-2": 12"#).is_err());
+    }
+
+    #[test]
+    fn finds_an_extract_of_several_countries_by_any_of_their_codes() {
+        let index = parse_index(
+            br#"{"features": [
+            {"properties": {"id": "israel-and-palestine", "name": "Israel and Palestine",
+              "iso3166-1:alpha2": "PS,IL",
+              "urls": {"pbf": "https://example.org/israel-and-palestine.osm.pbf"}}},
+            {"properties": {"id": "us/georgia", "name": "Georgia", "iso3166-2": "US-GA",
+              "urls": {"pbf": "https://example.org/georgia.osm.pbf"}}}]}"#,
+        )
+        .unwrap();
+        let id = |query| find_extract(&index, query).map(|extract| extract.id.as_str());
+        assert_eq!(id("PS"), Ok("israel-and-palestine"));
+        assert_eq!(id("il"), Ok("israel-and-palestine"));
+        assert_eq!(id("US-GA"), Ok("us/georgia"));
     }
 
     #[test]

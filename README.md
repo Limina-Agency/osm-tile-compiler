@@ -145,7 +145,7 @@ licenses require.
 `--area NAME` compiles a Geofabrik extract instead of a local PBF, as
 Planetiler's `--area` does. NAME is looked up in Geofabrik's index: an
 identifier (`malopolskie`, `us/georgia`), a name with or without accents
-(`Małopolskie`, `Lesser Poland Voivodeship`) or an ISO code (`PL-12`). A
+(`Małopolskie`, `Lesser Poland Voivodeship`) or an ISO code (`US-GA`). A
 name that several regions share, such as `Georgia`, is refused with their
 identifiers. The extract is saved in `--download-dir` (by default the
 `--sources` directory) as `<ID>.osm.pbf` and reused by later compiles;
