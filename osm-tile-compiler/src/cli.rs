@@ -96,7 +96,7 @@ Commands:
 Compile options:
   --area <NAME>         Instead of INPUT.pbf, compile Geofabrik's extract of a
                         region: its identifier (malopolskie, us/georgia), its
-                        name (Małopolskie) or its ISO code (PL-12). It is
+                        name (Małopolskie) or its ISO code (US-GA). It is
                         downloaded into --download-dir as <ID>.osm.pbf, or
                         the one already there is used; remove it to download
                         a newer one. OSM_TILE_COMPILER_GEOFABRIK_INDEX names
