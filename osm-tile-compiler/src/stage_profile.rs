@@ -221,7 +221,7 @@ impl Drop for Stage {
         #[cfg(target_os = "linux")]
         let (thread_groups, peak_rss) = linux::end_stage(&started.threads);
         #[cfg(not(target_os = "linux"))]
-        let (thread_groups, peak_rss) = (Vec::new(), None);
+        let (thread_groups, peak_rss) = (Vec::<ThreadGroup>::new(), None);
         let mut guard = lock(&STATE);
         let Some(state) = guard.as_mut() else {
             return;
