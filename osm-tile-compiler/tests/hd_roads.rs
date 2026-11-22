@@ -128,13 +128,44 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
             }
         }
     }
+    // z15 holds the roads' ways, to be asked of
+    let n = f64::from(1_u32 << 15);
+    let x = |lon: f64| ((lon + 180.0) / 360.0 * n) as u32;
+    let y =
+        |lat: f64| ((1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n) as u32;
+    let mut roads = 0;
+    for tx in x(header.min_longitude) - 1..=x(header.max_longitude) + 1 {
+        for ty in y(header.max_latitude) - 1..=y(header.min_latitude) + 1 {
+            let coord = TileCoord::new(15, tx, ty).unwrap();
+            let Some(bytes) = reader.get_tile(coord).await.unwrap() else {
+                continue;
+            };
+            tiles += 1;
+            let mut raw = Vec::new();
+            GzDecoder::new(&bytes[..]).read_to_end(&mut raw).unwrap();
+            let tile = MvtReaderRef::new(&raw).unwrap();
+            for layer in tile.layers() {
+                assert_eq!((layer.name(), layer.extent()), ("road", 8192));
+                for feature in layer.features() {
+                    let properties: BTreeMap<_, _> =
+                        feature.properties_vec().unwrap().into_iter().collect();
+                    let Some(MvtValueRef::String(lanes)) = properties.get("lanes") else {
+                        panic!("a road without lanes");
+                    };
+                    assert_eq!(lanes.split(',').count(), 5, "{lanes}");
+                    assert!(properties.contains_key("way"));
+                    roads += 1;
+                }
+            }
+        }
+    }
     // z14 holds the structures, whole groups in one tile
     let n = f64::from(1_u32 << 14);
     let x = |lon: f64| ((lon + 180.0) / 360.0 * n) as u32;
     let y =
         |lat: f64| ((1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n) as u32;
     let (mut pieces, mut crossings, mut groups) = (0, 0, 0);
-    let mut barriers = 0;
+    let (mut barriers, mut portals) = (0, 0);
     for tx in x(header.min_longitude) - 1..=x(header.max_longitude) + 1 {
         for ty in y(header.max_latitude) - 1..=y(header.min_latitude) + 1 {
             let coord = TileCoord::new(14, tx, ty).unwrap();
@@ -157,6 +188,10 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
                         Some(MvtValueRef::UInt(v)) => Some(*v),
                         _ => None,
                     };
+                    if layer.name() == "portal" {
+                        portals += 1;
+                        continue;
+                    }
                     if layer.name() != "structure" {
                         assert!(["paint", "barrier"].contains(&layer.name()));
                         barriers += u64::from(layer.name() == "barrier");
@@ -192,6 +227,7 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
         }
     }
     assert!(pieces > 10 && crossings > 5, "{pieces} {crossings}");
+    assert!(roads > report.ways / 3 && portals > 5, "{roads} {portals}");
     assert_eq!(
         (groups, pieces, crossings, barriers),
         (

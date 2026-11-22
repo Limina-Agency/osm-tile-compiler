@@ -168,6 +168,73 @@ pub(super) fn build(ways: &[Way], obstacles: &[Obstacle]) -> Vec<Group> {
     out
 }
 
+/// Where a tunnel comes out onto a road on the ground: its way, the point, and
+/// the points into it from there.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Portal {
+    pub way: u32,
+    pub points: Vec<Point>,
+}
+
+/// Metres of a tunnel from its portal that tell which way it goes in.
+const INTO: f64 = 25.0;
+
+/// The portals of motor roads' tunnels, in the ways' order.
+pub(super) fn portals(ways: &[Way]) -> Vec<Portal> {
+    let motor = || ways.iter().filter(|w| w.profile.class.is_motor());
+    let ends = |level: fn(Level) -> bool| -> FxHashSet<i64> {
+        motor()
+            .filter(|w| level(w.profile.level))
+            .flat_map(|w| [w.nodes[0], w.nodes[w.nodes.len() - 1]])
+            .collect()
+    };
+    let ground = ends(|l| l == Level::Ground);
+    let mut tunnels: FxHashMap<i64, u32> = FxHashMap::default();
+    for way in motor().filter(|w| matches!(w.profile.level, Level::Tunnel(_))) {
+        for node in [way.nodes[0], way.nodes[way.nodes.len() - 1]] {
+            *tunnels.entry(node).or_default() += 1;
+        }
+    }
+    let mut out = Vec::new();
+    for (index, way) in ways.iter().enumerate() {
+        if !way.profile.class.is_motor() || !matches!(way.profile.level, Level::Tunnel(_)) {
+            continue;
+        }
+        for end in 0..2 {
+            let node = if end == 0 {
+                way.nodes[0]
+            } else {
+                way.nodes[way.nodes.len() - 1]
+            };
+            if !ground.contains(&node) || tunnels[&node] != 1 {
+                continue;
+            }
+            let mut inward: Vec<Point> = way.points.clone();
+            if end == 1 {
+                inward.reverse();
+            }
+            let mut points = vec![inward[0]];
+            let mut length = 0.0;
+            for p in inward.windows(2) {
+                length += distance(p[0], p[1]) / way.scale;
+                points.push(p[1]);
+                if length >= INTO {
+                    break;
+                }
+            }
+            // in the way's own direction, for what is to its left and right
+            if end == 1 {
+                points.reverse();
+            }
+            out.push(Portal {
+                way: index as u32,
+                points,
+            });
+        }
+    }
+    out
+}
+
 /// The bridges, split where others join them.
 fn pieces(ways: &[Way]) -> Vec<Piece> {
     let bridges = || {
@@ -694,6 +761,39 @@ mod tests {
         assert_eq!(groups.len(), 1);
         let bridges = groups[0].pieces.iter().filter(|p| !p.approach);
         assert!(bridges.map(|p| p.anchor).eq([[true, true]; 2]));
+    }
+
+    #[test]
+    fn a_tunnel_has_a_portal_where_it_meets_the_ground_and_none_within() {
+        let tunnel = &[("highway", "primary"), ("tunnel", "yes")][..];
+        let ways = [
+            way(
+                1,
+                &[("highway", "primary")],
+                &[(1, -100.0, 0.0), (2, 0.0, 0.0)],
+            ),
+            way(2, tunnel, &[(2, 0.0, 0.0), (3, 60.0, 0.0)]),
+            way(
+                3,
+                tunnel,
+                &[(3, 60.0, 0.0), (4, 90.0, 0.0), (5, 120.0, 0.0)],
+            ),
+            way(
+                4,
+                &[("highway", "primary")],
+                &[(5, 120.0, 0.0), (6, 200.0, 0.0)],
+            ),
+            // a driveway that ends in one, with no road beyond
+            way(
+                5,
+                &[("highway", "service"), ("tunnel", "yes")],
+                &[(7, 0.0, 50.0), (8, 9.0, 50.0)],
+            ),
+        ];
+        let found = portals(&ways);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].points, [[0.0, 0.0], [60.0, 0.0]]);
+        assert_eq!(found[1].points, [[90.0, 0.0], [120.0, 0.0]]);
     }
 
     #[test]

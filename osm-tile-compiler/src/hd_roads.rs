@@ -2,8 +2,8 @@
 //! at their true width, read from an OSM extract. It is a pass of its own, so
 //! it changes nothing in the basemap.
 //!
-//! Every tile is z16 (a unit is about 10 cm at 50 degrees), and renderers
-//! overzoom it. Two layers:
+//! What is drawn on the ground is in z16 tiles (a unit is about 10 cm at 50
+//! degrees), which renderers overzoom. Two layers:
 //!
 //! - `surface`, polygons: the carriageways, `kind` `road`, `sidewalk` or
 //!   `cycleway`, as the union of the roads of one `level` (`ground`, `bridge`
@@ -22,7 +22,16 @@
 //!   itself is tagged, 1 where another tag implies it, 0 where it is usual.
 //!   `bay` is the outline of a parking space.
 //!
-//! Three layers more, in z14 tiles of 65536 units:
+//! One layer in z15 tiles of 8192 units (the same units):
+//!
+//! - `road`, lines: the motor roads' ways but for service roads, not to be
+//!   drawn but asked of: `way`, `class`, `level`, `layer`, and `lanes`, metres and counts
+//!   `<left>,<lane>,<against>,<along>,<traffic>`: the left edge of the leftmost
+//!   lane right of the line, a lane's width, the lanes against the way (the
+//!   left ones) and along it, and which way traffic goes (`+`, `-` or `=`).
+//!   They reach as far out of their tile as their surface does.
+//!
+//! Four layers more, in z14 tiles of 65536 units:
 //!
 //! - `structure`: what a bridge's heights are worked out from (they need
 //!   terrain, so they are not here). Each group of bridges that join or cross
@@ -41,6 +50,8 @@
 //! - `barrier`, lines: `kind` `guard_rail`, `jersey`, `cable` or `noise`,
 //!   `height` (metres), and where it stands on one, the `group` and `piece`.
 //!   What runs along a bridge's edge is left to its parapet.
+//! - `portal`, lines: where a tunnel comes out, `way`, `width`, `centre`
+//!   and `inward` (whether the line, in the way's direction, goes into it).
 //!
 //! Traffic keeps right. Tiles are worked out one by one from the roads that
 //! reach them, in order, so the bytes do not depend on the number of threads.
@@ -72,7 +83,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use structures::{Group, Index, Kind, Obstacle};
+use structures::{Group, Index, Kind, Obstacle, Portal};
 
 /// The `format` of an HD roads archive's metadata.
 pub const HD_ROADS_FORMAT: &str = "hd-roads";
@@ -189,6 +200,7 @@ fn write(
         .iter()
         .filter_map(|d| Some((index.on(ways, d.way, d.at)?, d)))
         .collect();
+    let portals = structures::portals(ways);
     let stretches = furniture::stretches(ways, &index, barriers, structure_tile);
     let scene = Scene {
         ways,
@@ -224,7 +236,12 @@ fn write(
         report.gz_bytes += tile.bytes.len() as u64;
         written.push((tile.id, tile.bytes));
     }
-    for (id, raw, bytes) in structure_tiles(ways, &groups, &painted, &stretches)? {
+    for (id, raw, bytes) in structure_tiles(ways, &groups, &painted, &stretches, &portals)? {
+        report.raw_bytes += raw;
+        report.gz_bytes += bytes.len() as u64;
+        written.push((id, bytes));
+    }
+    for (id, raw, bytes) in road_tiles(ways, control)? {
         report.raw_bytes += raw;
         report.gz_bytes += bytes.len() as u64;
         written.push((id, bytes));
@@ -834,6 +851,102 @@ fn encode(scene: &Scene, (x, y): (u32, u32), content: &Content) -> Result<Option
         })
 }
 
+// The roads to be asked of.
+
+/// The zoom of the tiles they are in, and its units across a tile.
+const ROAD_ZOOM: u8 = 15;
+const ROAD_EXTENT: u32 = 8192;
+
+/// The tiles of the motor roads' ways: id, bytes before gzip, and gzipped.
+fn road_tiles(ways: &[Way], control: &Control) -> Result<Vec<(u64, u64, Vec<u8>)>, String> {
+    let across = f64::from(ROAD_EXTENT);
+    let mut tiles: BTreeMap<(u32, u32), Vec<u32>> = BTreeMap::new();
+    for (i, way) in ways.iter().enumerate() {
+        // driveways and parking aisles are half the ways, and have no lanes to tell
+        if way.profile.lanes.is_none() || way.profile.class == Class::Service {
+            continue;
+        }
+        let mut of: Vec<(u32, u32)> = touched(&way.points, way_reach(way))
+            .into_iter()
+            .map(|(x, y)| (x / 2, y / 2))
+            .collect();
+        of.sort_unstable();
+        of.dedup();
+        for tile in of {
+            tiles.entry(tile).or_default().push(i as u32);
+        }
+    }
+    let failed = |e: fast_mvt::MvtError| format!("Failed to encode a tile of roads: {e}");
+    let extent = fast_mvt::MvtExtent::new(ROAD_EXTENT).expect("an extent is not 0");
+    let encode = |(&(x, y), members): (&(u32, u32), &Vec<u32>)| {
+        control.check()?;
+        let origin = [f64::from(x) * across, f64::from(y) * across];
+        let mut layer = MvtLayerBuilder::new("road").map_err(failed)?;
+        layer.extent(extent);
+        for &index in members {
+            let way = &ways[index as usize];
+            let Some(lanes) = &way.profile.lanes else {
+                continue;
+            };
+            let traffic = match (lanes.along, lanes.against) {
+                (true, true) => "=",
+                (true, false) => "+",
+                (false, _) => "-",
+            };
+            let (name, level) = level_name(way.profile.level);
+            let reach = way_reach(way);
+            let wide: Rect = [
+                origin[0] - reach,
+                origin[1] - reach,
+                origin[0] + across + reach,
+                origin[1] + across + reach,
+            ];
+            for part in geometry::clip(&way.points, wide) {
+                let mut points: Vec<MvtCoord> = part
+                    .iter()
+                    .map(|p| MvtCoord {
+                        x: (p[0] - origin[0]).round() as i32,
+                        y: (p[1] - origin[1]).round() as i32,
+                    })
+                    .collect();
+                points.dedup();
+                if points.len() < 2 {
+                    continue;
+                }
+                let mut f = layer.feature_of(MvtGeomType::LineString);
+                f.tag_sint("way", way.id).map_err(failed)?;
+                f.tag_string("class", class_name(way.profile.class))
+                    .map_err(failed)?;
+                f.tag_string("level", name).map_err(failed)?;
+                f.tag_sint("layer", i64::from(level)).map_err(failed)?;
+                let text = format!(
+                    "{:.2},{:.2},{},{},{traffic}",
+                    lanes.left, lanes.width, lanes.backward, lanes.forward
+                );
+                f.tag_string("lanes", text).map_err(failed)?;
+                f.line(points).map_err(failed)?;
+                layer = f.end();
+            }
+        }
+        if layer.num_features() == 0 {
+            return Ok(None);
+        }
+        let raw = layer.encode();
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
+        let bytes = encoder
+            .write_all(&raw)
+            .and_then(|()| encoder.finish())
+            .map_err(|e| format!("Failed to gzip a tile: {e}"))?;
+        let coord = TileCoord::new(ROAD_ZOOM, x, y).map_err(|e| e.to_string())?;
+        Ok(Some((TileId::from(coord).value(), raw.len() as u64, bytes)))
+    };
+    let encoded = tiles
+        .par_iter()
+        .map(encode)
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(encoded.into_iter().flatten().collect())
+}
+
 // Structures.
 
 /// The zoom of the tiles structures are in, and its units across a tile.
@@ -870,6 +983,7 @@ fn structure_tiles(
     groups: &[Group],
     painted: &[((u32, u32), &Detail)],
     barriers: &[Stretch],
+    portals: &[Portal],
 ) -> Result<Vec<(u64, u64, Vec<u8>)>, String> {
     let across = STRUCTURE_ACROSS;
     let mut paint: BTreeMap<u32, Vec<(u32, &Detail)>> = BTreeMap::new();
@@ -877,7 +991,7 @@ fn structure_tiles(
         paint.entry(group).or_default().push((piece, detail));
     }
     // each tile's groups, and its barriers
-    type Held<'a> = (Vec<usize>, Vec<&'a Stretch>);
+    type Held<'a> = (Vec<usize>, Vec<&'a Stretch>, Vec<&'a Portal>);
     let mut tiles: BTreeMap<(u32, u32), Held> = BTreeMap::new();
     for (i, group) in groups.iter().enumerate() {
         let tile = structure_tile(group.pieces[0].points[0]);
@@ -886,10 +1000,14 @@ fn structure_tiles(
     for stretch in barriers {
         tiles.entry(stretch.tile).or_default().1.push(stretch);
     }
+    for portal in portals {
+        let tile = structure_tile(portal.points[0]);
+        tiles.entry(tile).or_default().2.push(portal);
+    }
     let failed = |e: fast_mvt::MvtError| format!("Failed to encode a tile of structures: {e}");
     let extent = fast_mvt::MvtExtent::new(STRUCTURE_EXTENT).expect("an extent is not 0");
     let mut out = Vec::with_capacity(tiles.len());
-    for ((x, y), (members, barriers)) in tiles {
+    for ((x, y), (members, barriers, portals)) in tiles {
         let origin = [f64::from(x) * across, f64::from(y) * across];
         let coord = |p: &Point| {
             let unit =
@@ -981,8 +1099,21 @@ fn structure_tiles(
             f.line(stretch.points.iter().map(coord)).map_err(failed)?;
             lines = f.end();
         }
+        let mut mouths = MvtLayerBuilder::new("portal").map_err(failed)?;
+        mouths.extent(extent);
+        for portal in portals {
+            let way = &ways[portal.way as usize];
+            let mut f = mouths.feature_of(MvtGeomType::LineString);
+            f.tag_sint("way", way.id).map_err(failed)?;
+            f.tag_double("width", way.profile.width).map_err(failed)?;
+            f.tag_double("centre", way.profile.centre).map_err(failed)?;
+            f.tag_bool("inward", portal.points[0] == way.points[0])
+                .map_err(failed)?;
+            f.line(portal.points.iter().map(coord)).map_err(failed)?;
+            mouths = f.end();
+        }
         let mut raw = Vec::new();
-        for layer in [layer, paints, lines] {
+        for layer in [layer, paints, lines, mouths] {
             if layer.num_features() > 0 {
                 raw.extend_from_slice(&layer.encode());
             }
@@ -1011,9 +1142,12 @@ fn metadata() -> String {
              "fields": {"kind": text, "level": text, "layer": "Number", "paved": "Boolean"}},
             {"id": "marking", "minzoom": ZOOM, "maxzoom": ZOOM,
              "fields": {"kind": text, "dashed": "Boolean", "level": text, "layer": "Number", "confidence": "Number"}},
+            {"id": "road", "minzoom": ROAD_ZOOM, "maxzoom": ROAD_ZOOM,
+             "fields": {"way": "Number", "class": text, "level": text, "layer": "Number", "lanes": text}},
             {"id": "structure", "minzoom": STRUCTURE_ZOOM, "maxzoom": STRUCTURE_ZOOM, "fields": {}},
             {"id": "paint", "minzoom": STRUCTURE_ZOOM, "maxzoom": STRUCTURE_ZOOM, "fields": {}},
             {"id": "barrier", "minzoom": STRUCTURE_ZOOM, "maxzoom": STRUCTURE_ZOOM, "fields": {}},
+            {"id": "portal", "minzoom": STRUCTURE_ZOOM, "maxzoom": STRUCTURE_ZOOM, "fields": {}},
         ],
     })
     .to_string()
