@@ -173,6 +173,10 @@ pub fn java_meters(tag: &str) -> Option<f64> {
     static DISTANCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"(?i)(?P<value>-?[0-9.]+)\s*((?P<mi>mi)|(?P<m>m|$)|(?P<km>km|kilom)|(?P<ft>ft|')|(?P<inch>in|")|(?P<nmi>nmi|international nautical mile|nautical))"#).unwrap()
     });
+    // Every match starts with a digit or a point; most tags are empty.
+    if !tag.bytes().any(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
     let mut matches = DISTANCE.captures_iter(tag);
     let first = matches.next()?;
     let mut value = first.name("value")?.as_str().parse::<f64>().ok()?;
