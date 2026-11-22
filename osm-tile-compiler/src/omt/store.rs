@@ -5108,9 +5108,6 @@ mod merge_replay {
                         })
                         .collect::<Vec<_>>(),
                 );
-                let brect = bpts.bounding_rect().unwrap();
-                let env_bound =
-                    (brect.width() - 2. * dd).max(0.) * (brect.height() - 2. * dd).max(0.);
                 let bhull = bpts.convex_hull();
                 let bhull_area = bhull.unsigned_area();
                 let iso_bound = (bhull_area.sqrt() - dd * std::f64::consts::PI.sqrt())
@@ -5299,8 +5296,7 @@ mod merge_replay {
             "bucket dropped clusters buffer union unbuffer snap | hull_time hull_pred hull_pred_secs env_pred sumbuf_pred"
         );
         for (b, name) in ["2", "3-5", "6-20", "21-100", ">100"].iter().enumerate() {
-            for d in 0..2 {
-                let r = &rows[b][d];
+            for (d, r) in rows[b].iter().enumerate() {
                 println!(
                     "{name:>7} {d} {:>7} {:6.2} {:6.2} {:6.2} {:6.2} | {:5.2} {:>7} {:6.2} {:>7} {:>7}",
                     r.clusters,
