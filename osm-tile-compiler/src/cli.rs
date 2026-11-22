@@ -1,5 +1,5 @@
-//! The human command line: `compile`, `building-levels`, `fetch-sources`,
-//! `style`, `inspect`, `verify`, `diff`, `apply`, `update`, `help`,
+//! The human command line: `compile`, `building-levels`, `hd-roads`,
+//! `fetch-sources`, `style`, `inspect`, `verify`, `diff`, `apply`, `update`, `help`,
 //! `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
 //! the version, `--json`). Usage errors exit with 2, failures with 1, and
@@ -12,7 +12,7 @@ use osm_tile_compiler::{
     SupplementalDataset, UpdateEvent, UpdateReport, UpdateRequest, ZoomRange,
     archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
-    kib, resolve_languages, update_extract, write_building_levels_cancellable,
+    kib, resolve_languages, update_extract, write_building_levels_cancellable, write_hd_roads,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -41,6 +41,7 @@ Usage:
   osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
+  osm-tile-compiler hd-roads <INPUT.pbf> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
@@ -59,6 +60,7 @@ Usage:
   osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
+  osm-tile-compiler hd-roads <INPUT.pbf> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
@@ -74,6 +76,9 @@ Commands:
                    into a new PMTiles archive
   building-levels  Write the building levels of a compiled archive to a new
                    PMTiles archive: its buildings as boxes for far views
+  hd-roads         Experimental: write the roads of an extract at their true
+                   width, with their lane markings, to a new PMTiles archive
+                   of z16 vector tiles
   fetch-sources    Download, or verify, the supplemental datasets into DIR:
                    lake_centerline.shp.zip, natural_earth_vector.sqlite.zip and
                    water-polygons-split-3857.zip
@@ -313,6 +318,13 @@ struct BuildingLevelsArgs {
 }
 
 #[derive(Debug)]
+struct HdRoadsArgs {
+    input: PathBuf,
+    output: PathBuf,
+    threads: Option<usize>,
+}
+
+#[derive(Debug)]
 struct StyleArgs {
     archive: String,
     glyphs: Option<String>,
@@ -325,6 +337,7 @@ enum Command {
     Version,
     Compile(Box<CompileArgs>),
     BuildingLevels(BuildingLevelsArgs),
+    HdRoads(HdRoadsArgs),
     FetchSources(PathBuf),
     Style(StyleArgs),
     Inspect { archive: PathBuf, json: bool },
@@ -369,6 +382,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         }
         Command::Compile(args) => compile(*args),
         Command::BuildingLevels(args) => building_levels(args),
+        Command::HdRoads(args) => hd_roads(args),
         Command::FetchSources(directory) => fetch_sources(&directory),
         Command::Style(args) => {
             print!("{}", style(args));
@@ -403,6 +417,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("--version" | "-V") => Ok(Command::Version),
         Some("compile") => parse_compile(rest),
         Some("building-levels") => parse_building_levels(rest),
+        Some("hd-roads") => parse_hd_roads(rest),
         Some("fetch-sources") => parse_fetch_sources(rest),
         Some("style") => parse_style(rest),
         Some(name @ ("inspect" | "verify")) => parse_archive_command(name, rest),
@@ -775,6 +790,42 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
             extra.display()
         )),
         _ => Err("building-levels needs an input and an output archive".into()),
+    }
+}
+
+fn parse_hd_roads(args: &[OsString]) -> Result<Command, String> {
+    let mut paths = Vec::new();
+    let mut threads = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(flag) = option(arg) else {
+            paths.push(PathBuf::from(arg));
+            continue;
+        };
+        match flag.as_str() {
+            "--help" | "-h" => return Ok(Command::Help),
+            "--threads" => {
+                let count: usize = number(value(&mut args, &flag)?, &flag)?;
+                if count == 0 {
+                    return Err("--threads must be at least 1".into());
+                }
+                threads = Some(count);
+            }
+            _ => return Err(format!("unknown hd-roads option '{flag}'")),
+        }
+    }
+    let mut paths = paths.into_iter();
+    match (paths.next(), paths.next(), paths.next()) {
+        (Some(input), Some(output), None) => Ok(Command::HdRoads(HdRoadsArgs {
+            input,
+            output,
+            threads,
+        })),
+        (_, _, Some(extra)) => Err(format!(
+            "unexpected argument '{}': hd-roads takes an extract and an archive",
+            extra.display()
+        )),
+        _ => Err("hd-roads needs an input PBF and an output archive".into()),
     }
 }
 
@@ -1156,6 +1207,57 @@ fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
                 error => error.to_string(),
             })?;
     report_levels(&mut status, &args.output, &report);
+    Ok(())
+}
+
+fn hd_roads(args: HdRoadsArgs) -> Result<(), String> {
+    let mut status = Status::new();
+    let threads = args
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    status.line(&format!(
+        "Writing the roads of {} into {} ({threads} threads)",
+        args.input.display(),
+        args.output.display()
+    ));
+    let mut temp = args.output.clone().into_os_string();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    let _cooperating = interrupt::cooperate();
+    let marker = claim_scratch(&temp, &mut status)?;
+    let _scratch_on_exit = interrupt::remove_on_exit(temp.clone());
+    let report = write_hd_roads(
+        &args.input,
+        &args.output,
+        &temp,
+        threads,
+        interrupt::requested,
+    );
+    let cleanup = release_scratch(&temp, marker);
+    let report = report.map_err(|error| match error {
+        CompileError::Cancelled => format!("cancelled; {} was not written", args.output.display()),
+        error => error.to_string(),
+    })?;
+    cleanup?;
+    status.line(&format!(
+        "Wrote {} in {:.1} s, {:.1} of them reading: {} ways ({} incomplete left out), \
+         {} junctions, {} cross-sections",
+        args.output.display(),
+        report.seconds,
+        report.read_seconds,
+        report.ways,
+        report.incomplete_ways,
+        report.junctions,
+        report.profiles
+    ));
+    status.line(&format!(
+        "  {} tiles, {} surfaces, {} markings, {} raw, {} gzipped",
+        report.tiles,
+        report.surfaces,
+        report.markings,
+        megabytes(report.raw_bytes),
+        megabytes(report.gz_bytes)
+    ));
     Ok(())
 }
 

@@ -37,6 +37,10 @@ fn help_and_version_print_to_stdout() {
             stdout.contains("building-levels <INPUT.pmtiles>"),
             "{args:?}: {stdout}"
         );
+        assert!(
+            stdout.contains("hd-roads <INPUT.pbf>"),
+            "{args:?}: {stdout}"
+        );
         assert!(stdout.contains("fetch-sources <DIR>"), "{args:?}: {stdout}");
         assert!(stdout.contains("style <ARCHIVE_URL>"), "{args:?}: {stdout}");
         assert!(stdout.contains("update <INPUT.pbf>"), "{args:?}: {stdout}");
@@ -129,6 +133,13 @@ fn usage_errors_exit_with_2() {
         (
             &["building-levels", "a", "b", "--frob"],
             "unknown building-levels option '--frob'",
+        ),
+        (&["hd-roads"], "needs an input PBF and an output archive"),
+        (&["hd-roads", "a", "b", "c"], "unexpected argument 'c'"),
+        (&["hd-roads", "a", "b", "--threads", "0"], "at least 1"),
+        (
+            &["hd-roads", "a", "b", "--frob"],
+            "unknown hd-roads option '--frob'",
         ),
         (&["fetch-sources"], "fetch-sources needs a directory"),
         (&["fetch-sources", "a", "b"], "unexpected argument 'b'"),

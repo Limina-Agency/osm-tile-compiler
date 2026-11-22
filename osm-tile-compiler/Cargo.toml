@@ -12,7 +12,7 @@ categories = ["science::geo", "command-line-utilities"]
 # These tests read ../fixtures/monaco.osm.pbf (and area_download.rs the
 # recorded Geofabrik index beside it), which live outside this crate.
 # The unit-test fixtures in tests/fixtures/ stay (1.3 MB).
-exclude = ["tests/monaco.rs", "tests/cli.rs", "tests/antimeridian.rs", "tests/embedding.rs", "tests/area_only.rs", "tests/area_download.rs", "tests/common/"]
+exclude = ["tests/monaco.rs", "tests/cli.rs", "tests/antimeridian.rs", "tests/embedding.rs", "tests/area_only.rs", "tests/area_download.rs", "tests/hd_roads.rs", "tests/common/"]
 
 
 [lints]

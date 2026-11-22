@@ -89,6 +89,7 @@ mod extracts;
 #[doc(hidden)]
 pub mod fuzzing;
 mod generalization;
+mod hd_roads;
 mod omt;
 mod profiling;
 mod request;
@@ -113,6 +114,9 @@ pub use control::{CompileError, CompileProgress, CompileStage};
 pub use extracts::{
     Extract, ExtractEvent, GEOFABRIK_INDEX_URL, fetch_extract, fetch_extract_from, find_extract,
     parse_index,
+};
+pub use hd_roads::{
+    HD_ROADS_FORMAT, HD_ROADS_VERSION, HdRoadsReport, hd_roads_path, write_hd_roads,
 };
 pub use omt::{
     CompileResult, LANGUAGES as OMT_LANGUAGES, LAYERS as OMT_LAYERS, OMT_SCHEMA_VERSION,
