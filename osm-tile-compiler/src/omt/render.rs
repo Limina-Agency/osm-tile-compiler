@@ -1,5 +1,8 @@
 //! Schema-neutral rendering for the OpenMapTiles profile.
-use super::{store::AttrValue, types::Feature};
+use super::{
+    store::{AttrMap, AttrValue},
+    types::Feature,
+};
 use crate::{
     compile_area::Region,
     coordinate_groups::*,
@@ -9,7 +12,7 @@ use crate::{
 };
 use pmtiles::{TileCoord, TileId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
 
 // Pinned TiledGeometry.NEIGHBOR_BUFFER_EPS, in 256-pixel tile units. Points
 // just beyond a nominal buffer edge are still sliced into the neighboring tile.
@@ -20,9 +23,9 @@ pub(super) struct Record {
     pub tile_id: u64,
     pub zoom: u8,
     pub id: u64,
-    pub layer: String,
+    pub layer: Cow<'static, str>,
     pub geometry: TileGeometry,
-    pub attrs: BTreeMap<String, AttrValue>,
+    pub attrs: AttrMap,
     pub sort_key: i64,
     pub grid_size: f64,
     pub grid_cell: Option<(i32, i32)>,
@@ -30,7 +33,7 @@ pub(super) struct Record {
     pub rank: bool,
 }
 
-fn attrs(feature: &Feature, z: u8) -> BTreeMap<String, AttrValue> {
+fn attrs(feature: &Feature, z: u8) -> AttrMap {
     feature
         .attrs
         .iter()
@@ -50,7 +53,7 @@ fn attrs(feature: &Feature, z: u8) -> BTreeMap<String, AttrValue> {
                 }
                 _ => return None,
             };
-            Some((k.clone(), value))
+            Some((Cow::Owned(k.clone()), value))
         })
         .collect()
 }
@@ -1227,7 +1230,7 @@ pub(super) fn emit_with_record_sink(
                         tile_id: TileId::from(coord).value(),
                         zoom: z,
                         id: feature.id,
-                        layer: feature.layer.clone(),
+                        layer: Cow::Owned(feature.layer.clone()),
                         geometry,
                         attrs: attributes.clone(),
                         sort_key: feature.sort_key,
@@ -1249,6 +1252,7 @@ pub(super) fn emit_with_record_sink(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     // The tile-local column of `groups` for the column of `rect`.
     fn column_of(groups: &[WorldRingGroup], rect: WorldRect, x: i32) -> Vec<ColumnGroup> {
         let bounds = groups

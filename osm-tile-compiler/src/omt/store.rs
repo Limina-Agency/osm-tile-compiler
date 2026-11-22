@@ -16,8 +16,8 @@ use fast_mvt::{MvtLayerBuilder, MvtValueRef};
 use geo::algorithm::buffer::{BufferStyle, LineJoin};
 use geo::coordinate_position::CoordPos;
 use geo::dimensions::Dimensions;
-use geo::{Area, BoundingRect, Buffer, Distance, Euclidean, Relate, unary_union};
-use geo_types::{Coord, LineString, MultiPolygon, Polygon};
+use geo::{Area, BoundingRect, Buffer, Distance, Euclidean, Intersects, Relate, unary_union};
+use geo_types::{Coord, LineString, MultiPolygon, Polygon, Rect};
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
 use std::collections::binary_heap::PeekMut;
@@ -36,6 +36,124 @@ pub(super) const MERGE_FAN_IN: usize = 128;
 /// Blocks of each run the final merge's decoders keep decoded ahead of the
 /// merge, counting one being decoded.
 const BLOCKS_AHEAD: usize = 2;
+
+/// An attribute name: the profile's names are static, so records decoded at
+/// encode time borrow them instead of allocating a string per attribute.
+pub(super) type AttrKey = std::borrow::Cow<'static, str>;
+
+/// A record's attributes, sorted by name: a `BTreeMap`'s order and lookups
+/// over one vector, which a decoded record fills with a single allocation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct AttrMap(Vec<(AttrKey, AttrValue)>);
+
+impl AttrMap {
+    #[cfg(test)]
+    pub(super) fn new() -> Self {
+        Self(Vec::new())
+    }
+    fn find(&self, key: &str) -> Result<usize, usize> {
+        self.0.binary_search_by(|(k, _)| (**k).cmp(key))
+    }
+    pub(super) fn get(&self, key: &str) -> Option<&AttrValue> {
+        self.find(key).ok().map(|i| &self.0[i].1)
+    }
+    pub(super) fn contains_key(&self, key: &str) -> bool {
+        self.find(key).is_ok()
+    }
+    /// Sets `key` to `value` and returns the value it replaced.
+    pub(super) fn insert(&mut self, key: AttrKey, value: AttrValue) -> Option<AttrValue> {
+        match self.find(&key) {
+            Ok(i) => Some(std::mem::replace(&mut self.0[i].1, value)),
+            Err(i) => {
+                self.0.insert(i, (key, value));
+                None
+            }
+        }
+    }
+    pub(super) fn remove(&mut self, key: &str) -> Option<AttrValue> {
+        self.find(key).ok().map(|i| self.0.remove(i).1)
+    }
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&AttrKey, &mut AttrValue) -> bool) {
+        self.0.retain_mut(|(k, v)| keep(k, v));
+    }
+    pub(super) fn iter(&self) -> AttrIter<'_> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+    #[cfg(test)]
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+    }
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+type AttrIter<'a> = std::iter::Map<
+    std::slice::Iter<'a, (AttrKey, AttrValue)>,
+    fn(&'a (AttrKey, AttrValue)) -> (&'a AttrKey, &'a AttrValue),
+>;
+
+impl std::ops::Index<&str> for AttrMap {
+    type Output = AttrValue;
+    fn index(&self, key: &str) -> &AttrValue {
+        self.get(key).expect("no attribute of that name")
+    }
+}
+
+impl<'a> IntoIterator for &'a AttrMap {
+    type Item = (&'a AttrKey, &'a AttrValue);
+    type IntoIter = AttrIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for AttrMap {
+    type Item = (AttrKey, AttrValue);
+    type IntoIter = std::vec::IntoIter<(AttrKey, AttrValue)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl FromIterator<(AttrKey, AttrValue)> for AttrMap {
+    /// As `BTreeMap` collects: sorted by key, the last value of a repeated
+    /// key kept.
+    fn from_iter<I: IntoIterator<Item = (AttrKey, AttrValue)>>(iter: I) -> Self {
+        let mut entries: Vec<_> = iter.into_iter().collect();
+        if !entries.is_sorted_by(|a, b| a.0 < b.0) {
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut deduped: Vec<(AttrKey, AttrValue)> = Vec::with_capacity(entries.len());
+            for entry in entries {
+                match deduped.last_mut() {
+                    Some(last) if last.0 == entry.0 => *last = entry,
+                    _ => deduped.push(entry),
+                }
+            }
+            entries = deduped;
+        }
+        Self(entries)
+    }
+}
+
+impl<const N: usize> From<[(AttrKey, AttrValue); N]> for AttrMap {
+    fn from(entries: [(AttrKey, AttrValue); N]) -> Self {
+        entries.into_iter().collect()
+    }
+}
+
+impl Serialize for AttrMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for AttrMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        BTreeMap::<AttrKey, AttrValue>::deserialize(deserializer)
+            .map(|map| map.into_iter().collect())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) enum AttrValue {
@@ -123,8 +241,8 @@ pub(super) struct Seq {
 /// counts only when it precedes every explicit `rank` attribute.
 #[derive(Default)]
 pub(super) struct MetadataSummary {
-    fields: BTreeMap<String, BTreeMap<String, FieldSummary>>,
-    zooms: BTreeMap<String, (u8, u8)>,
+    fields: BTreeMap<AttrKey, BTreeMap<AttrKey, FieldSummary>>,
+    zooms: BTreeMap<AttrKey, (u8, u8)>,
 }
 #[derive(Default)]
 struct FieldSummary {
@@ -195,7 +313,7 @@ impl MetadataSummary {
         for (layer, (min, max)) in self.zooms {
             store
                 .zooms
-                .entry(layer)
+                .entry(layer.into_owned())
                 .and_modify(|range| {
                     range.0 = range.0.min(min);
                     range.1 = range.1.max(max);
@@ -203,7 +321,7 @@ impl MetadataSummary {
                 .or_insert((min, max));
         }
         for (layer, fields) in self.fields {
-            let target = store.fields.entry(layer).or_default();
+            let target = store.fields.entry(layer.into_owned()).or_default();
             for (key, field) in fields {
                 let mut kind = field.explicit;
                 if field
@@ -214,7 +332,7 @@ impl MetadataSummary {
                 }
                 if let Some(kind) = kind {
                     target
-                        .entry(key)
+                        .entry(key.into_owned())
                         .and_modify(|old| {
                             if old != kind {
                                 *old = "String".into();
@@ -259,6 +377,12 @@ impl Layer {
         match self {
             Self::Known(id) => LAYER_NAMES[usize::from(*id)],
             Self::Other(name) => name,
+        }
+    }
+    fn into_name(self) -> AttrKey {
+        match self {
+            Self::Known(id) => AttrKey::Borrowed(LAYER_NAMES[usize::from(id)]),
+            Self::Other(name) => AttrKey::Owned(name.into_string()),
         }
     }
 }
@@ -324,7 +448,7 @@ impl EncodedRecord {
         decode_payload(
             &self.payload,
             self.key.tile_id,
-            self.key.layer.name(),
+            self.key.layer.into_name(),
             self.key.sort_key,
             self.key.id,
         )
@@ -1260,7 +1384,7 @@ fn encode_tile(
     gzip_level: u32,
     control: &Control,
 ) -> Result<Option<EncodedTile>, String> {
-    let mut layers: BTreeMap<String, Vec<Record>> = BTreeMap::new();
+    let mut layers: BTreeMap<AttrKey, Vec<Record>> = BTreeMap::new();
     for record in records {
         layers.entry(record.layer.clone()).or_default().push(record);
     }
@@ -1286,7 +1410,7 @@ fn encode_tile(
         timings
             .protobuf_gzip
             .measure(|| tile.extend_from_slice(&layer.encode()));
-        sizes.push((name, (tile.len() - start) as u64));
+        sizes.push((name.into_owned(), (tile.len() - start) as u64));
     }
     if sizes.is_empty() {
         return Ok(None);
@@ -1389,7 +1513,7 @@ fn point_density(records: Vec<Record>) -> Vec<Record> {
             if record.grid_limit > 0 && record.grid_cell.is_some() && count > record.grid_limit {
                 continue;
             }
-            if (record.rank || matches!(record.layer.as_str(), "place" | "mountain_peak"))
+            if (record.rank || matches!(&*record.layer, "place" | "mountain_peak"))
                 && !record.attrs.contains_key("rank")
             {
                 record.attrs.insert(
@@ -1454,7 +1578,7 @@ fn merge_geometries_controlled(
             false
         };
         let merge = match &record.geometry {
-            TileGeometry::Polygon(_) => match record.layer.as_str() {
+            TileGeometry::Polygon(_) => match &*record.layer {
                 "water" | "building" => true,
                 "landcover" => cover_merge,
                 "landuse" => {
@@ -1465,7 +1589,7 @@ fn merge_geometries_controlled(
             },
             TileGeometry::Line { .. } => {
                 matches!(
-                    record.layer.as_str(),
+                    &*record.layer,
                     "transportation" | "transportation_name" | "boundary"
                 ) || (record.layer == "waterway" && (6..=11).contains(&record.zoom))
             }
@@ -1530,6 +1654,14 @@ fn merge_geometries_controlled(
                         min_hole_area,
                         distance,
                     } => {
+                        #[cfg(feature = "benchmark-profiling")]
+                        merge_dump::record(
+                            &first.layer,
+                            first.zoom,
+                            first.tile_id,
+                            distance,
+                            &originals,
+                        );
                         let mut result = Vec::new();
                         let mut cluster_ids = Vec::new();
                         for (cluster_id, (members, merged, jts)) in
@@ -1596,7 +1728,7 @@ fn merge_geometries_controlled(
                 // Transportation, its name layer, and waterway use the same graph with their
                 // zoom-dependent loop, stub, and final length thresholds.
                 let full_graph = matches!(
-                    first.layer.as_str(),
+                    &*first.layer,
                     "boundary" | "transportation" | "transportation_name" | "waterway"
                 );
                 if !full_graph {
@@ -1900,7 +2032,15 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
             {
                 *distance_tests += 1;
             }
-            if Euclidean.distance(&geometries[i], &geometries[j]) <= distance {
+            #[cfg(test)]
+            let near = if merge_replay::GEO_PROXIMITY.with(std::cell::Cell::get) {
+                Euclidean.distance(&geometries[i], &geometries[j]) <= distance
+            } else {
+                within_distance(&geometries[i], &geometries[j], distance)
+            };
+            #[cfg(not(test))]
+            let near = within_distance(&geometries[i], &geometries[j], distance);
+            if near {
                 parent[right] = left;
             }
         }
@@ -1922,6 +2062,11 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
         let (members, cluster): (Vec<_>, Vec<_>) = indexed.into_iter().unzip();
         if cluster.len() == 1 {
             result.push((members, cluster.into_iter().next().unwrap(), false));
+            continue;
+        }
+        #[cfg(test)]
+        if merge_replay::COLLECT_ONLY.with(std::cell::Cell::get) {
+            result.push((members, MultiPolygon(vec![]), false));
             continue;
         }
         let merged = if distance > 0. {
@@ -1953,6 +2098,171 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
     result
 }
 
+/// Products of vertex counts up to which the proximity test compares every
+/// vertex with every segment; above it, it sweeps over vertices sorted by x.
+const DIRECT_SCAN_PAIRS: usize = 64 * 64;
+
+/// Whether `Euclidean.distance(a, b) <= distance`, as `merge_nearby` asks it,
+/// with an early exit at the first vertex and segment within the distance.
+/// geo's distance is the minimum of the same `line_segment_distance` values
+/// over the same rings (through R-trees of segments that it builds for every
+/// pair, or a sorted projection), so the answers could differ only where two
+/// segments tie for a vertex's nearest within rounding of `distance`. Polygons
+/// with holes whose boxes overlap still go to geo, which picks their rings by
+/// a containment test.
+fn within_distance(a: &MultiPolygon<f64>, b: &MultiPolygon<f64>, distance: f64) -> bool {
+    // geo folds the minimum over every pair of member polygons.
+    a.0.iter()
+        .any(|p| b.0.iter().any(|q| polygons_within(p, q, distance)))
+}
+
+fn polygons_within(p: &Polygon<f64>, q: &Polygon<f64>, distance: f64) -> bool {
+    let (pe, qe) = (p.exterior(), q.exterior());
+    if pe.0.is_empty() || qe.0.is_empty() {
+        // geo answers 0 for an empty polygon.
+        return true;
+    }
+    let (rp, rq) = (ring_rect(pe), ring_rect(qe));
+    let x_separated = rp.max().x < rq.min().x || rq.max().x < rp.min().x;
+    let y_separated = rp.max().y < rq.min().y || rq.max().y < rp.min().y;
+    if (x_separated || y_separated) && pe.0.len() >= 4 && qe.0.len() >= 4 {
+        // Disjoint boxes cannot intersect; geo measures between the exteriors.
+        return rings_within(pe, qe, distance);
+    }
+    if !p.interiors().is_empty() || !q.interiors().is_empty() {
+        return Euclidean.distance(p, q) <= distance;
+    }
+    // geo: 0 if they intersect, else the distance between the exteriors.
+    rings_within(pe, qe, distance) || exteriors_intersect(p, q)
+}
+
+fn ring_rect(ring: &LineString<f64>) -> Rect<f64> {
+    let first = ring.0[0];
+    let (mut min, mut max) = (first, first);
+    for c in &ring.0[1..] {
+        min.x = min.x.min(c.x);
+        min.y = min.y.min(c.y);
+        max.x = max.x.max(c.x);
+        max.y = max.y.max(c.y);
+    }
+    Rect::new(min, max)
+}
+
+/// Whether some vertex of either ring lies within `distance` of a segment of
+/// the other, by geo's `line_segment_distance`.
+fn rings_within(a: &LineString<f64>, b: &LineString<f64>, distance: f64) -> bool {
+    vertices_within(&a.0, &b.0, distance) || vertices_within(&b.0, &a.0, distance)
+}
+
+fn vertices_within(points: &[Coord<f64>], ring: &[Coord<f64>], distance: f64) -> bool {
+    // A vertex farther than this from a segment's box along one axis cannot
+    // be within `distance` of it; the margin covers line_segment_distance's
+    // rounding.
+    let reach = distance + 1e-6 * (1. + distance);
+    let reach_box = |start: Coord<f64>, end: Coord<f64>| {
+        (
+            start.x.min(end.x) - reach,
+            start.x.max(end.x) + reach,
+            start.y.min(end.y) - reach,
+            start.y.max(end.y) + reach,
+        )
+    };
+    if points.len() * ring.len() <= DIRECT_SCAN_PAIRS {
+        for segment in ring.windows(2) {
+            let (start, end) = (segment[0], segment[1]);
+            let (min_x, max_x, min_y, max_y) = reach_box(start, end);
+            for &point in points {
+                if point.x < min_x || point.x > max_x || point.y < min_y || point.y > max_y {
+                    continue;
+                }
+                if line_segment_distance(point, start, end) <= distance {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    let mut sorted = points.to_vec();
+    sorted.sort_unstable_by(|a, b| a.x.total_cmp(&b.x));
+    for segment in ring.windows(2) {
+        let (start, end) = (segment[0], segment[1]);
+        let (min_x, max_x, min_y, max_y) = reach_box(start, end);
+        let first = sorted.partition_point(|p| p.x < min_x);
+        for &point in &sorted[first..] {
+            if point.x > max_x {
+                break;
+            }
+            if point.y < min_y || point.y > max_y {
+                continue;
+            }
+            if line_segment_distance(point, start, end) <= distance {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// geo's `Polygon::intersects` for polygons without holes whose boxes
+/// overlap: a vertex of either inside or on the other, or crossing exterior
+/// segments, by the same robust predicates; large rings are swept by x
+/// instead of compared pair by pair.
+fn exteriors_intersect(p: &Polygon<f64>, q: &Polygon<f64>) -> bool {
+    let (pe, qe) = (&p.exterior().0, &q.exterior().0);
+    if q.intersects(&pe[0]) || p.intersects(&qe[0]) {
+        return true;
+    }
+    let boxes_meet = |a: &[Coord<f64>], b: &[Coord<f64>]| {
+        a[0].x.min(a[1].x) <= b[0].x.max(b[1].x)
+            && b[0].x.min(b[1].x) <= a[0].x.max(a[1].x)
+            && a[0].y.min(a[1].y) <= b[0].y.max(b[1].y)
+            && b[0].y.min(b[1].y) <= a[0].y.max(a[1].y)
+    };
+    let cross = |a: &[Coord<f64>], b: &[Coord<f64>]| {
+        boxes_meet(a, b) && geo::Line::new(a[0], a[1]).intersects(&geo::Line::new(b[0], b[1]))
+    };
+    if pe.len() * qe.len() <= DIRECT_SCAN_PAIRS {
+        return pe.windows(2).any(|a| qe.windows(2).any(|b| cross(a, b)));
+    }
+    let mut segments: Vec<&[Coord<f64>]> = qe.windows(2).collect();
+    segments.sort_unstable_by(|a, b| a[0].x.min(a[1].x).total_cmp(&b[0].x.min(b[1].x)));
+    let widest = segments
+        .iter()
+        .map(|s| (s[0].x - s[1].x).abs())
+        .fold(0_f64, f64::max);
+    pe.windows(2).any(|a| {
+        let (low, high) = (a[0].x.min(a[1].x), a[0].x.max(a[1].x));
+        // Segments starting further left than this end before `low`; the
+        // margin covers rounding of the subtraction.
+        let from = low - widest - (1. + 1e-9 * low.abs());
+        let first = segments.partition_point(|s| s[0].x.min(s[1].x) < from);
+        segments[first..]
+            .iter()
+            .take_while(|s| s[0].x.min(s[1].x) <= high)
+            .any(|b| cross(a, b))
+    })
+}
+
+/// geo-types' `private_utils::line_segment_distance` for f64, with the same
+/// floating-point operations.
+fn line_segment_distance(point: Coord<f64>, start: Coord<f64>, end: Coord<f64>) -> f64 {
+    if start == end {
+        return (start.x - point.x).hypot(start.y - point.y);
+    }
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let d_squared = dx * dx + dy * dy;
+    let r = ((point.x - start.x) * dx + (point.y - start.y) * dy) / d_squared;
+    if r <= 0. {
+        return (start.x - point.x).hypot(start.y - point.y);
+    }
+    if r >= 1. {
+        return (end.x - point.x).hypot(end.y - point.y);
+    }
+    let s = ((start.y - point.y) * dx - (start.x - point.x) * dy) / d_squared;
+    s.abs() * dx.hypot(dy)
+}
+
 fn overlay_buffer_union_unbuffer(
     cluster: &[MultiPolygon<f64>],
     distance: f64,
@@ -1979,11 +2289,7 @@ fn overlay_buffer_union_unbuffer(
     merged
 }
 
-fn line_merge_policy(
-    layer: &str,
-    zoom: u8,
-    attrs: &BTreeMap<String, AttrValue>,
-) -> Option<(f64, f64)> {
+fn line_merge_policy(layer: &str, zoom: u8, attrs: &AttrMap) -> Option<(f64, f64)> {
     let pixels = |meters: f64| meters / 40_075_016.685_578_49 * 256. * 2_f64.powi(i32::from(zoom));
     match layer {
         "waterway" if (6..=11).contains(&zoom) => Some((
@@ -3169,7 +3475,7 @@ mod tests {
         ]);
         for name in names {
             let mut r = record(17);
-            r.layer = name.clone();
+            r.layer = name.clone().into();
             r.tile_id = 42;
             r.sort_key = -9;
             let encoded = EncodedRecord::encode(
@@ -3215,7 +3521,7 @@ mod tests {
             );
         }
         let mut long = record(17);
-        long.layer = "z".repeat(MAX_LAYER_BYTES + 1);
+        long.layer = "z".repeat(MAX_LAYER_BYTES + 1).into();
         assert!(EncodedRecord::encode(&long, seq(0)).is_err());
     }
     #[test]
@@ -3228,7 +3534,7 @@ mod tests {
             for b in &names {
                 let key = |name: &str| {
                     let mut r = record(17);
-                    r.layer = name.into();
+                    r.layer = name.to_owned().into();
                     SortKey::of(&r, seq(0))
                 };
                 assert_eq!(key(a).cmp(&key(b)), a.cmp(b), "{a} vs {b}");
@@ -3305,13 +3611,13 @@ mod tests {
             assert_eq!(actual, expected);
         }
         assert_eq!(
-            line_merge_policy("transportation", 8, &BTreeMap::new())
+            line_merge_policy("transportation", 8, &AttrMap::new())
                 .unwrap()
                 .0,
             0.
         );
         assert!(
-            line_merge_policy("transportation", 7, &BTreeMap::new())
+            line_merge_policy("transportation", 7, &AttrMap::new())
                 .unwrap()
                 .0
                 > 0.
@@ -3376,11 +3682,11 @@ mod tests {
             let mut zooms: BTreeMap<String, (u8, u8)> = BTreeMap::new();
             for record in records {
                 let z = zooms
-                    .entry(record.layer.clone())
+                    .entry(record.layer.to_string())
                     .or_insert((record.zoom, record.zoom));
                 z.0 = z.0.min(record.zoom);
                 z.1 = z.1.max(record.zoom);
-                let fields = fields.entry(record.layer.clone()).or_default();
+                let fields = fields.entry(record.layer.to_string()).or_default();
                 for (key, value) in &record.attrs {
                     if !key.starts_with('_') {
                         let kind = match value {
@@ -3389,7 +3695,7 @@ mod tests {
                             _ => "Number",
                         };
                         fields
-                            .entry(key.clone())
+                            .entry(key.to_string())
                             .and_modify(|old| {
                                 if old != kind {
                                     *old = "String".into();
@@ -3979,7 +4285,7 @@ mod tests {
             id,
             layer: "poi".into(),
             geometry: TileGeometry::Point(vec![TilePoint::new(20, 20)]),
-            attrs: BTreeMap::new(),
+            attrs: AttrMap::new(),
             sort_key: 0,
             grid_size: 64.,
             grid_cell: Some((0, 0)),
@@ -3989,7 +4295,7 @@ mod tests {
     }
     fn polygon_record(layer: &str, zoom: u8, id: u64, x: i32) -> Record {
         let mut r = record(id);
-        r.layer = layer.into();
+        r.layer = layer.to_owned().into();
         r.zoom = zoom;
         r.grid_size = 0.;
         r.grid_cell = None;
@@ -4310,14 +4616,14 @@ mod tests {
         simplify_merged_lines(&mut paths, 1.6);
         assert_eq!(paths, vec![vec![p(0, 0), p(4, 0)]]);
         assert_eq!(
-            line_merge_policy("boundary", 8, &BTreeMap::new()),
+            line_merge_policy("boundary", 8, &AttrMap::new()),
             Some((1. / 16., 4.))
         );
     }
 
     #[test]
     fn transportation_name_length_threshold_matches_pinned_profile() {
-        let mut attrs = BTreeMap::new();
+        let mut attrs = AttrMap::new();
         attrs.insert("name".into(), AttrValue::String("A😀".into()));
         assert_eq!(
             line_merge_policy("transportation_name", 12, &attrs),
@@ -4418,5 +4724,260 @@ mod tests {
         });
         let path = std::env::var("OSM_TILE_COMPILER_BUILDING_STAGES").unwrap();
         std::fs::write(path, serde_json::to_vec_pretty(&output).unwrap()).unwrap();
+    }
+}
+
+/// With the `benchmark-profiling` feature and `OTC_MERGE_DUMP=<path>`, every
+/// dissolve group is appended to that file as one JSON line, for the offline
+/// merge benchmark (`merge_replay` below).
+#[cfg(feature = "benchmark-profiling")]
+pub(super) mod merge_dump {
+    use crate::tile_geometry::TileRingGroup;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    static FILE: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+
+    pub(in crate::omt) fn record(
+        layer: &str,
+        zoom: u8,
+        tile_id: u64,
+        distance: f64,
+        members: &[Vec<TileRingGroup>],
+    ) {
+        let Some(file) = FILE.get_or_init(|| {
+            std::env::var_os("OTC_MERGE_DUMP").map(|p| {
+                Mutex::new(std::io::BufWriter::new(
+                    std::fs::File::create(p).expect("merge dump file"),
+                ))
+            })
+        }) else {
+            return;
+        };
+        let geoms: Vec<Vec<Vec<Vec<[i32; 2]>>>> = members
+            .iter()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .map(|g| {
+                        std::iter::once(&g.exterior)
+                            .chain(g.holes.iter())
+                            .map(|r| r.iter().map(|p| [p.x, p.y]).collect())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let line = serde_json::json!({
+            "layer": layer, "zoom": zoom, "tile": tile_id, "distance": distance, "geoms": geoms
+        });
+        let mut f = file.lock().unwrap();
+        writeln!(f, "{line}").unwrap();
+        f.flush().unwrap();
+    }
+}
+
+/// Offline replay of dissolve groups dumped with `OTC_MERGE_DUMP`:
+/// `OTC_BENCH_GROUPS=<file> [OTC_BENCH_LAYER=building] cargo test --release
+/// --lib merge_replay -- --ignored --nocapture`.
+#[cfg(test)]
+mod merge_replay {
+    use super::*;
+    use std::time::Instant;
+
+    // The binary's allocator, so that replay timings match a compile's.
+    #[cfg(feature = "mimalloc")]
+    #[global_allocator]
+    static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+    #[derive(Deserialize)]
+    struct Group {
+        layer: String,
+        distance: f64,
+        geoms: Vec<Vec<Vec<Vec<[i32; 2]>>>>,
+    }
+
+    fn to_geo(member: &[Vec<Vec<[i32; 2]>>]) -> MultiPolygon<f64> {
+        let line = |r: &Vec<[i32; 2]>| {
+            LineString(
+                r.iter()
+                    .map(|p| Coord {
+                        x: f64::from(p[0]),
+                        y: f64::from(p[1]),
+                    })
+                    .collect(),
+            )
+        };
+        MultiPolygon(
+            member
+                .iter()
+                .map(|rings| Polygon::new(line(&rings[0]), rings[1..].iter().map(line).collect()))
+                .collect(),
+        )
+    }
+
+    fn groups() -> Option<Vec<(f64, Vec<MultiPolygon<f64>>)>> {
+        let path = std::env::var("OTC_BENCH_GROUPS").ok()?;
+        let only = std::env::var("OTC_BENCH_LAYER").ok();
+        let text = fs::read_to_string(path).unwrap();
+        Some(
+            text.lines()
+                .map(|line| serde_json::from_str::<Group>(line).unwrap())
+                .filter(|g| only.as_ref().is_none_or(|l| *l == g.layer))
+                .map(|g| {
+                    (
+                        g.distance * 16.,
+                        g.geoms.iter().map(|m| to_geo(m)).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Every pair of members whose boxes come within the distance gets the
+    /// same answer from `within_distance` as from geo's distance.
+    #[test]
+    #[ignore]
+    fn merge_replay_proximity_matches_geo() {
+        let Some(groups) = groups() else { return };
+        let (mut pairs, mut differ) = (0usize, 0usize);
+        let (mut geo_secs, mut ours_secs) = (0., 0.);
+        for (distance, geoms) in &groups {
+            let bounds: Vec<_> = geoms.iter().map(|g| g.bounding_rect()).collect();
+            for i in 0..geoms.len() {
+                for j in i + 1..geoms.len() {
+                    let (Some(a), Some(b)) = (bounds[i], bounds[j]) else {
+                        continue;
+                    };
+                    if b.min().x > a.max().x + distance
+                        || a.min().x > b.max().x + distance
+                        || b.min().y > a.max().y + distance
+                        || b.max().y < a.min().y - distance
+                    {
+                        continue;
+                    }
+                    pairs += 1;
+                    let started = Instant::now();
+                    let reference = Euclidean.distance(&geoms[i], &geoms[j]) <= *distance;
+                    geo_secs += started.elapsed().as_secs_f64();
+                    let started = Instant::now();
+                    let ours = within_distance(&geoms[i], &geoms[j], *distance);
+                    ours_secs += started.elapsed().as_secs_f64();
+                    if ours != reference {
+                        differ += 1;
+                        if differ <= 5 {
+                            println!("differs (geo {reference}): {:?} {:?}", geoms[i], geoms[j]);
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "pairs {pairs}, differing {differ}, geo {geo_secs:.2}s, within_distance {ours_secs:.2}s"
+        );
+        assert_eq!(differ, 0);
+    }
+
+    thread_local! {
+        /// Makes `merge_nearby` ask geo's distance, as before `within_distance`.
+        pub(super) static GEO_PROXIMITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Times the full dissolve (proximity, buffer, union, unbuffer, snap)
+    /// over the dumped groups on one thread, with each proximity test.
+    #[test]
+    #[ignore]
+    fn merge_replay_timing() {
+        let Some(groups) = groups() else { return };
+        let variants: &[bool] = if std::env::var_os("OTC_BENCH_GEO").is_some() {
+            &[true, false]
+        } else {
+            &[false]
+        };
+        for &geo in variants {
+            GEO_PROXIMITY.with(|g| g.set(geo));
+            replay_dissolve(
+                &groups,
+                if geo {
+                    "geo proximity"
+                } else {
+                    "within_distance"
+                },
+            );
+        }
+        GEO_PROXIMITY.with(|g| g.set(false));
+    }
+
+    fn replay_dissolve(groups: &[(f64, Vec<MultiPolygon<f64>>)], label: &str) {
+        use std::hash::{Hash, Hasher};
+        // A digest of every merged cluster's coordinates, in order, so that two
+        // builds can be compared bit for bit.
+        let mut digest = std::collections::hash_map::DefaultHasher::new();
+        let hash = |digest: &mut std::collections::hash_map::DefaultHasher,
+                    g: &MultiPolygon<f64>| {
+            for p in &g.0 {
+                for ring in std::iter::once(p.exterior()).chain(p.interiors()) {
+                    ring.0.len().hash(digest);
+                    for c in &ring.0 {
+                        (c.x.to_bits(), c.y.to_bits()).hash(digest);
+                    }
+                }
+            }
+        };
+        let only_small = std::env::var_os("OTC_BENCH_SMALL").is_some();
+        let mut total = 0.;
+        for (distance, geoms) in groups.iter().cloned() {
+            let geoms = if only_small {
+                // Clusters of at most five members, each run on its own.
+                let mut out = Vec::new();
+                for (members, ..) in merge_nearby_collect(&geoms, distance) {
+                    if (2..=5).contains(&members.len()) {
+                        out.push(members.iter().map(|&i| geoms[i].clone()).collect());
+                    }
+                }
+                out
+            } else {
+                vec![geoms]
+            };
+            for geoms in geoms {
+                let started = Instant::now();
+                let clusters = merge_nearby(geoms, distance);
+                let mut snapped = Vec::new();
+                for (members, merged, jts) in &clusters {
+                    if members.len() > 1 && *jts {
+                        snapped.push(super::super::jts_buffer::snap_and_fix(merged));
+                    }
+                }
+                total += started.elapsed().as_secs_f64();
+                for (members, merged, jts) in &clusters {
+                    members.hash(&mut digest);
+                    jts.hash(&mut digest);
+                    hash(&mut digest, merged);
+                }
+                for s in snapped.iter().flatten() {
+                    hash(&mut digest, s);
+                }
+            }
+        }
+        println!(
+            "{label}: dissolve total {total:.2}s, digest {:016x}",
+            digest.finish()
+        );
+    }
+
+    /// The proximity clusters' members, without merging them.
+    fn merge_nearby_collect(
+        geoms: &[MultiPolygon<f64>],
+        distance: f64,
+    ) -> Vec<(Vec<usize>, MultiPolygon<f64>, bool)> {
+        COLLECT_ONLY.with(|c| c.set(true));
+        let result = merge_nearby(geoms.to_vec(), distance);
+        COLLECT_ONLY.with(|c| c.set(false));
+        result
+    }
+
+    thread_local! {
+        /// Makes `merge_nearby` return each cluster's members unmerged.
+        pub(super) static COLLECT_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }
