@@ -13,12 +13,28 @@
 //!   `dashed`, `level`, `layer`, and `confidence` (0 the class's usual lanes,
 //!   1 tagged lanes, 2 tagged lanes and width). They stop short of junctions.
 //!
+//! One layer more, in z14 tiles of 65536 units:
+//!
+//! - `structure`: what a bridge's heights are worked out from (they need
+//!   terrain, so they are not here). Each group of bridges that join or cross
+//!   is whole in one tile, the first's, and may reach out of it. Lines are the
+//!   bridges' pieces: `group`, `piece` (its number in the group), `way`,
+//!   `layer`, `class`, `width` and `centre` (metres, of the surface across the
+//!   line), `paved`, `lines` (`<metres>:<kind>[-]`, painted lines, `-` dashed),
+//!   `node0` and `node1` (pieces join where these are equal), `anchor0` and
+//!   `anchor1` (whether it meets the ground there), and `approach` (a road on
+//!   the ground leading up to a bridge, to be raised to it if need be). Points are where a piece
+//!   passes over something: `group`, `over` and `at` (metres along), `kind`
+//!   (`road`, `path`, `rail`, `water` or `bridge`), `clearance` and `half`
+//!   (metres), and of a bridge of the group `under` and `under_at`.
+//!
 //! Traffic keeps right. Tiles are worked out one by one from the roads that
 //! reach them, in order, so the bytes do not depend on the number of threads.
 
 mod geometry;
 mod network;
 mod profile;
+mod structures;
 
 use crate::control::{CompileError, Control};
 use crate::omt::PartialArchive;
@@ -37,6 +53,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use structures::{Group, Kind, Obstacle};
 
 /// The `format` of an HD roads archive's metadata.
 pub const HD_ROADS_FORMAT: &str = "hd-roads";
@@ -73,6 +90,10 @@ pub struct HdRoadsReport {
     pub tiles: u64,
     pub surfaces: u64,
     pub markings: u64,
+    /// Bridges that join or cross, as one; their pieces, and what they cross.
+    pub groups: u64,
+    pub pieces: u64,
+    pub crossings: u64,
     /// Bytes of the tiles before gzip.
     pub raw_bytes: u64,
     pub gz_bytes: u64,
@@ -124,9 +145,10 @@ fn write(
     control: &Control,
 ) -> Result<HdRoadsReport, String> {
     let start = Instant::now();
-    let (ways, incomplete_ways) = read_ways(pbf, temp, threads, control)?;
+    let (ways, obstacles, incomplete_ways) = read_ways(pbf, temp, threads, control)?;
     let read_seconds = start.elapsed().as_secs_f64();
     let network = network::build(&ways);
+    let groups = structures::build(&ways, &obstacles);
     let tiles = tile_contents(&ways, &network);
     let encoded = tiles
         .par_iter()
@@ -152,6 +174,14 @@ fn write(
         report.gz_bytes += tile.bytes.len() as u64;
         written.push((tile.id, tile.bytes));
     }
+    for (id, raw, bytes) in structure_tiles(&ways, &groups)? {
+        report.raw_bytes += raw;
+        report.gz_bytes += bytes.len() as u64;
+        written.push((id, bytes));
+    }
+    report.groups = groups.len() as u64;
+    report.pieces = groups.iter().map(|g| g.pieces.len() as u64).sum();
+    report.crossings = groups.iter().map(|g| g.crossings.len() as u64).sum();
     report.tiles = written.len() as u64;
     written.sort_unstable_by_key(|tile| tile.0);
     write_archive(output, &ways, &written)?;
@@ -168,7 +198,27 @@ fn distinct_profiles(ways: &[Way]) -> u64 {
 
 // Reading.
 
-struct Roads(Vec<(i64, Vec<i64>, Profile)>);
+#[derive(Default)]
+struct Roads {
+    roads: Vec<(i64, Vec<i64>, Profile)>,
+    obstacles: Vec<(i64, Vec<i64>, Kind)>,
+}
+
+/// What a way that is no road of the archive is to a bridge over it.
+fn obstacle<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Kind> {
+    if get("tunnel").is_some_and(|v| v != "no") || get("bridge").is_some_and(|v| v != "no") {
+        return None;
+    }
+    match (get("railway"), get("waterway"), get("highway")) {
+        (Some("rail" | "tram" | "light_rail" | "subway" | "narrow_gauge"), ..) => Some(Kind::Rail),
+        (_, Some("river" | "canal"), _) => Some(Kind::River),
+        (_, Some("stream" | "ditch" | "drain"), _) => Some(Kind::Stream),
+        (_, _, Some("footway" | "path" | "pedestrian" | "track" | "bridleway" | "steps")) => {
+            Some(Kind::Path)
+        }
+        _ => None,
+    }
+}
 
 impl Pass2Sink for Roads {
     fn on_relation_batch(&mut self, _: RelationBatch) -> Result<(), String> {
@@ -181,25 +231,29 @@ impl Pass2Sink for Roads {
 
     fn on_way_batch(&mut self, batch: WayBatch) -> Result<(), String> {
         for way in batch.ways {
+            let mut nodes = way.node_ids;
+            nodes.dedup();
+            if nodes.len() < 2 {
+                continue;
+            }
             if let Some(profile) = profile(|key| way.tags.get(key)) {
-                let mut nodes = way.node_ids;
-                nodes.dedup();
-                if nodes.len() > 1 {
-                    self.0.push((way.way_id, nodes, profile));
-                }
+                self.roads.push((way.way_id, nodes, profile));
+            } else if let Some(kind) = obstacle(|key| way.tags.get(key)) {
+                self.obstacles.push((way.way_id, nodes, kind));
             }
         }
         Ok(())
     }
 }
 
-/// The extract's roads by id, and how many lack a node.
+/// The extract's roads by id, what lies near its bridges, and how many roads
+/// lack a node.
 fn read_ways(
     pbf: &Path,
     temp: &Path,
     threads: usize,
     control: &Control,
-) -> Result<(Vec<Way>, u64), String> {
+) -> Result<(Vec<Way>, Vec<Obstacle>, u64), String> {
     let profile = IngestBuildProfile::DesktopFull;
     let index = prepare_ingest_index_with_options(
         pbf,
@@ -210,7 +264,7 @@ fn read_ways(
         || control.is_cancelled(),
     )?;
     control.check()?;
-    let mut roads = Roads(Vec::new());
+    let mut roads = Roads::default();
     run_pass2_with_options(
         pbf,
         profile,
@@ -218,33 +272,63 @@ fn read_ways(
             .worker_threads(threads)
             .skip_nodes()
             .skip_relations()
-            .keep_ways(|tags| tags.contains_key("highway")),
+            .keep_ways(|tags| {
+                ["highway", "railway", "waterway"]
+                    .iter()
+                    .any(|key| tags.contains_key(key))
+            }),
         &mut roads,
         |_| {},
         || control.is_cancelled(),
     )?;
     control.check()?;
-    let mut roads = roads.0;
+    let Roads {
+        mut roads,
+        mut obstacles,
+    } = roads;
     roads.sort_by_key(|road| road.0);
     roads.dedup_by_key(|road| road.0);
     let mut nodes = index.node_store.cursor();
     let mut ways = Vec::with_capacity(roads.len());
     let mut incomplete = 0;
-    for (_, ids, profile) in roads {
-        let located: Option<Vec<(f64, f64)>> = ids.iter().map(|&id| nodes.get(id)).collect();
-        let Some(located) = located else {
-            incomplete += 1;
-            continue;
-        };
+    let mut locate = |ids: &[i64]| -> Option<(Vec<Point>, f64)> {
+        let located: Vec<(f64, f64)> =
+            ids.iter().map(|&id| nodes.get(id)).collect::<Option<_>>()?;
         let latitude = located.iter().map(|p| p.0).sum::<f64>() / located.len() as f64;
-        ways.push(Way {
-            nodes: ids,
-            points: located.iter().map(|&(lat, lng)| world(lat, lng)).collect(),
-            profile,
-            scale: WORLD / (EQUATOR_M * latitude.to_radians().cos().max(0.05)),
-        });
+        let scale = WORLD / (EQUATOR_M * latitude.to_radians().cos().max(0.05));
+        Some((
+            located.iter().map(|&(lat, lng)| world(lat, lng)).collect(),
+            scale,
+        ))
+    };
+    for (id, nodes, profile) in roads {
+        match locate(&nodes) {
+            Some((points, scale)) => ways.push(Way {
+                id,
+                nodes,
+                points,
+                profile,
+                scale,
+            }),
+            None => incomplete += 1,
+        }
     }
-    Ok((ways, incomplete))
+    obstacles.sort_by_key(|o| o.0);
+    obstacles.dedup_by_key(|o| o.0);
+    let near = structures::bridge_cells(&ways);
+    let obstacles = obstacles
+        .into_iter()
+        .filter_map(|(_, nodes, kind)| {
+            let (points, _) = locate(&nodes)?;
+            let reaches = structures::cells(&points).any(|(_, cell)| near.contains(&cell));
+            reaches.then_some(Obstacle {
+                nodes,
+                points,
+                kind,
+            })
+        })
+        .collect();
+    Ok((ways, obstacles, incomplete))
 }
 
 fn world(lat: f64, lng: f64) -> Point {
@@ -480,6 +564,113 @@ fn encode(
         })
 }
 
+// Structures.
+
+/// The zoom of the tiles structures are in, and its units across a tile.
+const STRUCTURE_ZOOM: u8 = 14;
+const STRUCTURE_EXTENT: u32 = 65_536;
+
+fn class_name(class: Class) -> &'static str {
+    match class {
+        Class::Motorway => "motorway",
+        Class::Trunk => "trunk",
+        Class::Primary => "primary",
+        Class::Secondary => "secondary",
+        Class::Tertiary => "tertiary",
+        Class::Minor => "minor",
+        Class::LivingStreet => "living_street",
+        Class::Service => "service",
+        Class::Cycleway => "cycleway",
+        Class::Sidewalk => "sidewalk",
+    }
+}
+
+/// The groups' tiles: id, bytes before gzip, and gzipped.
+fn structure_tiles(ways: &[Way], groups: &[Group]) -> Result<Vec<(u64, u64, Vec<u8>)>, String> {
+    let across = EXTENT * f64::from(1_u32 << (ZOOM - STRUCTURE_ZOOM));
+    let mut tiles: BTreeMap<(u32, u32), Vec<usize>> = BTreeMap::new();
+    for (i, group) in groups.iter().enumerate() {
+        let p = group.pieces[0].points[0];
+        let tile = ((p[0] / across) as u32, (p[1] / across) as u32);
+        tiles.entry(tile).or_default().push(i);
+    }
+    let failed = |e: fast_mvt::MvtError| format!("Failed to encode a tile of structures: {e}");
+    let extent = fast_mvt::MvtExtent::new(STRUCTURE_EXTENT).expect("an extent is not 0");
+    let mut out = Vec::with_capacity(tiles.len());
+    for ((x, y), members) in tiles {
+        let origin = [f64::from(x) * across, f64::from(y) * across];
+        let coord = |p: &Point| {
+            let unit =
+                |v: f64, o: f64| ((v - o) / across * f64::from(STRUCTURE_EXTENT)).round() as i32;
+            MvtCoord {
+                x: unit(p[0], origin[0]),
+                y: unit(p[1], origin[1]),
+            }
+        };
+        let mut layer = MvtLayerBuilder::new("structure").map_err(failed)?;
+        layer.extent(extent);
+        for (number, &index) in members.iter().enumerate() {
+            let group = &groups[index];
+            for (i, piece) in group.pieces.iter().enumerate() {
+                let way = &ways[piece.way as usize];
+                let p = &way.profile;
+                let (_, level) = level_name(p.level);
+                let lines: Vec<String> = p
+                    .lines
+                    .iter()
+                    .map(|(at, line)| {
+                        let dashed = if line.dashed() { "-" } else { "" };
+                        format!("{at:.2}:{}{dashed}", line.kind())
+                    })
+                    .collect();
+                let mut f = layer.feature_of(MvtGeomType::LineString);
+                f.tag_uint("group", number as u64).map_err(failed)?;
+                f.tag_uint("piece", i as u64).map_err(failed)?;
+                f.tag_sint("way", way.id).map_err(failed)?;
+                f.tag_sint("layer", i64::from(level)).map_err(failed)?;
+                f.tag_string("class", class_name(p.class)).map_err(failed)?;
+                f.tag_double("width", p.width).map_err(failed)?;
+                f.tag_double("centre", p.centre).map_err(failed)?;
+                f.tag_bool("paved", p.paved).map_err(failed)?;
+                f.tag_string("lines", lines.join(",")).map_err(failed)?;
+                f.tag_sint("node0", piece.nodes[0]).map_err(failed)?;
+                f.tag_sint("node1", piece.nodes[1]).map_err(failed)?;
+                f.tag_bool("anchor0", piece.anchor[0]).map_err(failed)?;
+                f.tag_bool("anchor1", piece.anchor[1]).map_err(failed)?;
+                f.tag_bool("approach", piece.approach).map_err(failed)?;
+                f.line(piece.points.iter().map(coord)).map_err(failed)?;
+                layer = f.end();
+            }
+            for crossing in &group.crossings {
+                let mut f = layer.feature_of(MvtGeomType::Point);
+                f.tag_uint("group", number as u64).map_err(failed)?;
+                f.tag_uint("over", u64::from(crossing.over))
+                    .map_err(failed)?;
+                f.tag_double("at", crossing.at).map_err(failed)?;
+                f.tag_string("kind", crossing.kind).map_err(failed)?;
+                f.tag_double("clearance", crossing.clearance)
+                    .map_err(failed)?;
+                f.tag_double("half", crossing.half).map_err(failed)?;
+                if let Some((under, at)) = crossing.under {
+                    f.tag_uint("under", u64::from(under)).map_err(failed)?;
+                    f.tag_double("under_at", at).map_err(failed)?;
+                }
+                f.points([coord(&crossing.point)]).map_err(failed)?;
+                layer = f.end();
+            }
+        }
+        let raw = layer.encode();
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
+        let bytes = encoder
+            .write_all(&raw)
+            .and_then(|()| encoder.finish())
+            .map_err(|e| format!("Failed to gzip a tile: {e}"))?;
+        let coord = TileCoord::new(STRUCTURE_ZOOM, x, y).map_err(|e| e.to_string())?;
+        out.push((TileId::from(coord).value(), raw.len() as u64, bytes));
+    }
+    Ok(out)
+}
+
 // The archive.
 
 fn metadata() -> String {
@@ -493,6 +684,7 @@ fn metadata() -> String {
              "fields": {"kind": text, "level": text, "layer": "Number", "paved": "Boolean"}},
             {"id": "marking", "minzoom": ZOOM, "maxzoom": ZOOM,
              "fields": {"kind": text, "dashed": "Boolean", "level": text, "layer": "Number", "confidence": "Number"}},
+            {"id": "structure", "minzoom": STRUCTURE_ZOOM, "maxzoom": STRUCTURE_ZOOM, "fields": {}},
         ],
     })
     .to_string()
@@ -523,7 +715,7 @@ fn write_archive(output: &Path, ways: &[Way], tiles: &[(u64, Vec<u8>)]) -> Resul
     let partial = PartialArchive::create(output)?;
     let mut writer = PmTilesWriter::new(TileType::Mvt)
         .precompressed(Compression::Gzip)
-        .min_zoom(ZOOM)
+        .min_zoom(STRUCTURE_ZOOM)
         .max_zoom(ZOOM)
         .bounds(west, south, east, north)
         .center((west + east) / 2.0, (south + north) / 2.0)

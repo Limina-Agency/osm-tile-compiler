@@ -8,6 +8,7 @@ use rustc_hash::FxHashMap;
 pub(super) type Point = [f64; 2];
 
 pub(super) struct Way {
+    pub id: i64,
     pub nodes: Vec<i64>,
     pub points: Vec<Point>,
     pub profile: Profile,
@@ -346,6 +347,7 @@ mod tests {
     /// A way of `nodes` at metre positions (a unit a metre).
     fn way(tags: &[(&str, &'static str)], nodes: &[(i64, f64, f64)]) -> Way {
         Way {
+            id: nodes[0].0,
             nodes: nodes.iter().map(|n| n.0).collect(),
             points: nodes.iter().map(|n| [n.1, n.2]).collect(),
             profile: profile(|k| tags.iter().find(|t| t.0 == k).map(|t| t.1)).unwrap(),

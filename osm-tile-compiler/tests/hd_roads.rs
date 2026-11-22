@@ -119,6 +119,61 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
             }
         }
     }
+    // z14 holds the structures, whole groups in one tile
+    let n = f64::from(1_u32 << 14);
+    let x = |lon: f64| ((lon + 180.0) / 360.0 * n) as u32;
+    let y =
+        |lat: f64| ((1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n) as u32;
+    let (mut pieces, mut crossings, mut groups) = (0, 0, 0);
+    for tx in x(header.min_longitude) - 1..=x(header.max_longitude) + 1 {
+        for ty in y(header.max_latitude) - 1..=y(header.min_latitude) + 1 {
+            let coord = TileCoord::new(14, tx, ty).unwrap();
+            let Some(bytes) = reader.get_tile(coord).await.unwrap() else {
+                continue;
+            };
+            tiles += 1;
+            let mut raw = Vec::new();
+            GzDecoder::new(&bytes[..]).read_to_end(&mut raw).unwrap();
+            let tile = MvtReaderRef::new(&raw).unwrap();
+            // the pieces of each group, and the pieces its crossings name
+            let mut seen: BTreeMap<u64, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
+            for layer in tile.layers() {
+                assert_eq!((layer.name(), layer.extent()), ("structure", 65_536));
+                for feature in layer.features() {
+                    let properties: BTreeMap<_, _> =
+                        feature.properties_vec().unwrap().into_iter().collect();
+                    let uint = |key: &str| match properties.get(key) {
+                        Some(MvtValueRef::UInt(v)) => Some(*v),
+                        _ => None,
+                    };
+                    let group = seen.entry(uint("group").unwrap()).or_default();
+                    match feature.geometry().unwrap() {
+                        Geometry::LineString(_) => {
+                            pieces += 1;
+                            group.0.push(uint("piece").unwrap());
+                        }
+                        Geometry::Point(_) => {
+                            crossings += 1;
+                            group.1.extend(uint("over"));
+                            group.1.extend(uint("under"));
+                        }
+                        other => panic!("a structure that is {other:?}"),
+                    }
+                }
+            }
+            groups += seen.len() as u64;
+            for (numbers, named) in seen.values() {
+                let count = numbers.len() as u64;
+                assert!(numbers.iter().copied().eq(0..count));
+                assert!(named.iter().all(|n| *n < count));
+            }
+        }
+    }
+    assert!(pieces > 10 && crossings > 5, "{pieces} {crossings}");
+    assert_eq!(
+        (groups, pieces, crossings),
+        (report.groups, report.pieces, report.crossings)
+    );
     assert_eq!(
         (tiles, surfaces, markings),
         (report.tiles, report.surfaces, report.markings)
