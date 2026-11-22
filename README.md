@@ -3,7 +3,9 @@
 Turns an OpenStreetMap extract (`.osm.pbf`) into a vector basemap in the
 [OpenMapTiles](https://openmaptiles.org/) schema, written as one
 [PMTiles](https://docs.protomaps.com/pmtiles/) file you can serve from any
-static host or open on a device. It is a Rust port of the OpenMapTiles
+static host or open on a device, or as one
+[MBTiles](https://github.com/mapbox/mbtiles-spec) database for tile servers
+and apps that read those. It is a Rust port of the OpenMapTiles
 profile that [Planetiler](https://github.com/onthegomap/planetiler) runs,
 built for regional extracts on ordinary laptops, and inside apps.
 
@@ -70,7 +72,7 @@ A compile runs in stages, each reported as progress:
 4. **Tiles** (`write_tiles`). Each tile's features are sorted and, where the
    profile merges them (buildings, landuse, roads), merged, then encoded with
    [fast-mvt](https://crates.io/crates/fast-mvt), and written to the
-   PMTiles archive.
+   PMTiles archive or MBTiles database.
 5. **Building levels** (`building_levels`, only when asked for). A second,
    smaller archive holds the buildings as boxes, for renderers that draw
    distant buildings that way.
@@ -217,6 +219,17 @@ the attribution must keep crediting OpenMapTiles and OpenStreetMap.
 threads (every core by default), and `--temp-dir` the scratch space
 (`<output>.tmp` by default, removed afterwards, also when Ctrl-C stops
 the compile; it then exits with status 130).
+
+### MBTiles
+
+An `--output` ending in `.mbtiles` is written as an MBTiles 1.3 database
+instead of PMTiles; `--format mbtiles` or `--format pmtiles` chooses
+regardless of the name. The tiles are the same bytes as in the PMTiles
+archive (gzip-compressed MVT, `format` `pbf`), and the metadata the same
+fields, with `vector_layers` in the `json` row. As in Planetiler's compact
+MBTiles, `tiles` is a view over `map` and `images`, so that identical small
+tiles (open sea, solid land) are stored once. Building levels, `--delta-from`,
+`inspect`, `verify`, `diff` and `apply` work on PMTiles only.
 
 ## Building levels
 
