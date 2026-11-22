@@ -200,7 +200,10 @@ impl Pipeline {
             Ok(()) => Ok(()),
             // Only time the main thread when it actually has to wait.
             Err(TrySendError::Full(work)) => {
-                self.blocked.measure(|| sender.send(work)).map_err(drop)
+                crate::stage_profile::time(crate::stage_profile::Counter::RenderQueueFull, || {
+                    self.blocked.measure(|| sender.send(work))
+                })
+                .map_err(drop)
             }
             Err(TrySendError::Disconnected(_)) => Err(()),
         };
@@ -481,7 +484,10 @@ fn work(
             // spilled.
             return Err((u64::MAX, crate::control::CANCELLED.into()));
         }
-        if let Err(failure) = busy.measure(|| worker.handle(work)) {
+        let handled = crate::stage_profile::time(crate::stage_profile::Counter::RenderBusy, || {
+            busy.measure(|| worker.handle(work))
+        });
+        if let Err(failure) = handled {
             shared.failed.store(true, Ordering::Relaxed);
             shared.progress.notify_all();
             return Err(failure);

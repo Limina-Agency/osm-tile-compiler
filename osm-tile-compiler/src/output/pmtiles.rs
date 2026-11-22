@@ -1,4 +1,6 @@
-use crate::{ArchiveCenter, CompileBounds};
+//! The PMTiles archive writer.
+
+use super::{ArchiveSpec, TileWriter};
 use pmtiles::{Compression, PmTilesStreamWriter, PmTilesWriter, TileCoord, TileId, TileType};
 use std::fs::File;
 
@@ -9,34 +11,30 @@ pub struct PmtilesArchiveWriter<'a> {
 }
 
 impl<'a> PmtilesArchiveWriter<'a> {
-    pub fn create(
-        file: &'a File,
-        bounds: &CompileBounds,
-        center: ArchiveCenter,
-        metadata_json: &str,
-        min_zoom: u8,
-        max_zoom: u8,
-    ) -> Result<Self, String> {
+    pub fn create(file: &'a File, spec: &ArchiveSpec) -> Result<Self, String> {
+        let center = spec.center;
         // The bytes arriving here are already gzip-compressed by the tile
         // encoder (`omt::store`). `precompressed` stores them verbatim
         // and declares `Compression::Gzip` in the header, which is a promise about the
         // stored bytes rather than the writer's Mvt default.
         // Bounds crossing the antimeridian are declared as every longitude.
-        let bounds = bounds.archive_bounds();
+        let bounds = spec.bounds.archive_bounds();
         let writer = PmTilesWriter::new(TileType::Mvt)
             .precompressed(Compression::Gzip)
-            .min_zoom(min_zoom)
-            .max_zoom(max_zoom)
+            .min_zoom(spec.min_zoom)
+            .max_zoom(spec.max_zoom)
             .bounds(bounds.west, bounds.south, bounds.east, bounds.north)
             .center(center.longitude, center.latitude)
             .center_zoom(center.zoom)
-            .metadata(metadata_json)
+            .metadata(spec.metadata_json)
             .create(file)
             .map_err(|error| format!("Failed to initialize PMTiles writer: {}", error))?;
         Ok(Self { writer })
     }
+}
 
-    pub fn write_tile(&mut self, tile_id: u64, bytes: &[u8]) -> Result<(), String> {
+impl TileWriter for PmtilesArchiveWriter<'_> {
+    fn write_tile(&mut self, tile_id: u64, bytes: &[u8]) -> Result<(), String> {
         let coord = TileCoord::from(
             TileId::new(tile_id)
                 .map_err(|error| format!("Invalid tile id {}: {}", tile_id, error))?,
@@ -46,7 +44,7 @@ impl<'a> PmtilesArchiveWriter<'a> {
             .map_err(|error| format!("Failed to append tile {:?}: {}", coord, error))
     }
 
-    pub fn finalize(self) -> Result<(), String> {
+    fn finalize(self: Box<Self>) -> Result<(), String> {
         self.writer
             .finalize()
             .map_err(|error| format!("Failed to finalize PMTiles archive: {}", error))
@@ -56,6 +54,7 @@ impl<'a> PmtilesArchiveWriter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CompileBounds;
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -78,19 +77,18 @@ mod tests {
 
         {
             let file = File::create(&archive_path).unwrap();
-            let mut archive = PmtilesArchiveWriter::create(
-                &file,
-                &bounds,
-                crate::ArchiveCenter {
+            let spec = ArchiveSpec {
+                bounds: &bounds,
+                center: crate::ArchiveCenter {
                     longitude: 0.0,
                     latitude: 0.0,
                     zoom: 0,
                 },
-                "{}",
-                0,
-                0,
-            )
-            .unwrap();
+                metadata_json: "{}",
+                min_zoom: 0,
+                max_zoom: 0,
+            };
+            let mut archive = Box::new(PmtilesArchiveWriter::create(&file, &spec).unwrap());
             // tile_id 0 == z0/0/0.
             archive.write_tile(0, &gzipped_tile).unwrap();
             archive.finalize().unwrap();

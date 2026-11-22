@@ -1,5 +1,5 @@
 //! Compiles an OpenStreetMap `.osm.pbf` into an OpenMapTiles-schema basemap,
-//! written as a single PMTiles archive. Its profile is a native Rust port of the
+//! written as a single PMTiles or MBTiles archive. Its profile is a native Rust port of the
 //! OpenMapTiles 3.16 profile as pinned by Planetiler 0.10.2, checked against
 //! Planetiler's output: [`CompileResult::parity_verified`] is `true` for the
 //! compiles the parity measurement covers (see `docs/parity.md`). An
@@ -79,7 +79,6 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 pub mod archive;
 mod basemap;
 mod building_levels;
-mod chunk_store;
 mod compile_area;
 mod compile_bounds;
 mod control;
@@ -91,9 +90,11 @@ pub mod fuzzing;
 mod generalization;
 mod memory;
 mod omt;
+mod output;
 mod profiling;
 mod request;
 mod sources;
+pub mod stage_profile;
 mod tile_geometry;
 mod tile_slicer;
 mod tile_stats;
@@ -116,9 +117,11 @@ pub use extracts::{
     parse_index,
 };
 pub use omt::{
-    CompileResult, LANGUAGES as OMT_LANGUAGES, LAYERS as OMT_LAYERS, OMT_SCHEMA_VERSION,
-    PROFILE_REVISION as OMT_PROFILE_REVISION,
+    CompileResult, LANGUAGES as OMT_LANGUAGES, LAYERS as OMT_LAYERS, MergeCacheOptions,
+    MergeCacheStats, OMT_SCHEMA_VERSION, PROFILE_REVISION as OMT_PROFILE_REVISION,
+    merge_cache_path,
 };
+pub use output::OutputFormat;
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
 pub use tile_stats::{LayerStats, TILE_WARNING_BYTES, TileSize, TileStats, ZoomStats};

@@ -11,7 +11,7 @@
 use crate::job::{JobError, Progress, Work};
 use osm_tile_compiler::{
     ArchiveCenter, Area, AreaPolygon, BasemapRequest, CompileBounds, CompileError, LayerSelection,
-    ReadScope, SourcesPolicy, SupplementalDataset, ZoomRange, compile_basemap,
+    OutputFormat, ReadScope, SourcesPolicy, SupplementalDataset, ZoomRange, compile_basemap,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -150,6 +150,8 @@ struct AreaJson {
 struct CompileBasemapJson {
     input_pbf: PathBuf,
     output: PathBuf,
+    /// "pmtiles" or "mbtiles" [default: by the output's extension].
+    format: Option<String>,
     sources: PathBuf,
     temp_dir: PathBuf,
     sources_policy: Option<SourcesPolicyJson>,
@@ -173,6 +175,13 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
     let json: CompileBasemapJson = serde_json::from_value(request)
         .map_err(|e| JobError::invalid_request(format!("Invalid compile_basemap request: {e}")))?;
     let mut request = BasemapRequest::new(json.input_pbf, json.output, json.sources, json.temp_dir);
+    if let Some(id) = json.format {
+        request.format = Some(OutputFormat::from_id(&id).ok_or_else(|| {
+            JobError::invalid_request(format!(
+                "Unknown output format '{id}': it is pmtiles or mbtiles"
+            ))
+        })?);
+    }
     if let Some(policy) = json.sources_policy {
         request.sources_policy = match policy {
             SourcesPolicyJson::UsePresent => SourcesPolicy::UsePresent,
@@ -250,6 +259,7 @@ fn compile_basemap_work(request: Value) -> Result<Work, JobError> {
         // The worker's manifest, plus where each output went.
         let mut result = output.manifest();
         result["archive"] = json!(output.archive);
+        result["archiveFormat"] = json!(output.format.id());
         result["buildingLevels"] = json!(output.building_levels.as_ref().map(|(path, _)| path));
         result["bounds"] = json!({
             "north": output.bounds.north,

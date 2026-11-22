@@ -79,6 +79,88 @@ every thread count saw the same machine; 16 threads is all the cores.
 - A small area-only compile still uses more memory and scratch than the
   whole of Małopolskie: the cost scales with the extract read, not the area.
 
+## Stage profile
+
+`compile --profile <FILE.json>` (and `building-levels --profile`) measures
+each stage of a compile, prints a table on stderr and writes the report as
+JSON. Library users call `stage_profile::start` and `stage_profile::finish`.
+The archive is the same byte for byte with or without it, and the cost is
+within run-to-run noise (Berlin at 4 threads, three runs each: 15.24 s
+without, 15.27 s with).
+
+For each stage it reports:
+
+- `wall_seconds`, and `cpu_seconds` for the whole process. `busy_threads` is
+  CPU / wall, the threads busy on average; `efficiency` is that over the
+  threads given.
+- `driver_busy`: the CPU / wall of the thread that runs the stage. Near 100%
+  the driver is the bottleneck however many workers there are.
+- On Linux, `thread_groups`: CPU per group of threads (`omt-render`,
+  `omt-encode`, `compile-pool`, `driver`, and `unnamed` for the threads the
+  driver starts: the PBF reader and decoders, the intermediate merge), and the
+  stage's peak RSS, sampled every 50 ms. Elsewhere these are left out; on
+  Windows the CPU times are too.
+- `counters`: work timed inside the stage, summed over threads:
+  `render_busy`, `render_queue_full_wait` (the driver waiting for a render
+  worker), `spill_sort_write`, `encode_tile` and `archive_write`.
+
+The stages run one after another: `read_sources`, `index_osm` (pass 1),
+`ways` (pass 2), `relations`, `render_drain`, `intermediate_merge`,
+`final_merge` (the merge, encode and write of `write_tiles`),
+`finalize_archive`, then `building_levels.scan`, `.levels` and `.write`.
+
+### First profiles, 1 to 4 threads
+
+Measured on 2026-11-21 on a 4-core cloud VM (Intel Xeon @ 2.10 GHz, 4
+hardware threads, 16 GiB, Linux), `--building-levels`, the real supplemental
+datasets, from `main` at `54d4d6a` plus the profiler. One run each; every
+thread count wrote the same archive. Stages under 0.3 s at 1 thread are left
+out (`read_sources` 0.2 s; `relations`, `render_drain`, the intermediate
+merge, finalizing and the building levels' scan and write together under
+0.3 s). The reports are in the project files under `stage-profile/`.
+
+| Region | Stage | 1 thread | 2 | 4 | 1→4 | Busy at 4 | Driver at 4 |
+|---|---|---|---|---|---|---|---|
+| Berlin | total | 52.7 s | 26.5 s | 15.2 s | 3.5× | | |
+| | `index_osm` | 1.0 s | 0.6 s | 0.4 s | 2.5× | 2.59 | 41% |
+| | `ways` | 24.9 s | 12.4 s | 6.7 s | 3.7× | 3.88 | 3% |
+| | `final_merge` | 24.6 s | 12.2 s | 7.3 s | 3.4× | 3.93 | 37% |
+| | `building_levels.levels` | 2.0 s | 1.0 s | 0.5 s | 3.6× | 3.53 | 99% |
+| Pomorskie | total | 71.0 s | 37.2 s | 23.3 s | 3.0× | | |
+| | `index_osm` | 1.1 s | 0.7 s | 0.5 s | 2.4× | 3.32 | 28% |
+| | `ways` | 36.5 s | 18.9 s | 10.8 s | 3.4× | 3.91 | 1% |
+| | `final_merge` | 29.2 s | 15.1 s | 10.4 s | 2.8× | 3.56 | 44% |
+| | `building_levels.levels` | 3.7 s | 2.0 s | 1.1 s | 3.2× | 3.59 | 100% |
+| Małopolskie | total | 128.8 s | 64.8 s | 36.0 s | 3.6× | | |
+| | `index_osm` | 2.0 s | 1.1 s | 0.7 s | 2.7× | 3.28 | 28% |
+| | `ways` | 69.7 s | 34.7 s | 18.2 s | 3.8× | 3.92 | 1% |
+| | `final_merge` | 51.4 s | 25.7 s | 15.3 s | 3.4× | 3.76 | 44% |
+| | `building_levels.levels` | 5.1 s | 2.9 s | 1.3 s | 3.8× | 3.94 | 98% |
+
+Peak RSS at 1, 2 and 4 threads: Berlin 246, 295 and 394 MiB; Pomorskie 243,
+300 and 387 MiB; Małopolskie 371, 418 and 501 MiB.
+
+What they show:
+
+- `ways` is bound by the render workers: they are busy 3.7 of 4 threads,
+  the driver waits on a full render queue for nearly the whole stage, and
+  the PBF decoders use about 0.2 of a thread. Pass 2 starting as many
+  decoders as render workers costs little CPU.
+- `final_merge` has a serial floor: the driver merges the runs and feeds the
+  encoders on one thread, 6.8 s of CPU on Małopolskie (4.5 s on Pomorskie,
+  2.7 s on Berlin) at any thread count. At 4 threads it is busy 44% of the
+  stage; with about 51 s of encoding on Małopolskie it saturates near 8
+  encoders, so the stage cannot drop under about 7 s however many threads
+  it gets. That is what the parallel final merge removes.
+- `relations` takes under 0.15 s on all three regions; its tail matters
+  only for extracts with large relations, such as Poland.
+- The building levels scale 3.2–3.8× to 4 threads, and their scan and write
+  take under 0.05 s here; Poland's flat 2→16 thread time needs a profile
+  on Poland itself.
+- What fitting cannot show here: the 2–8 thread loss and SMT on the 8-core
+  laptop. A 4-core VM scales almost linearly; the same command on the
+  baseline laptop at 2, 8 and 16 threads is the next profile.
+
 ## Memory
 
 Peak resident memory of a whole process (`ru_maxrss`), from two runs each

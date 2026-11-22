@@ -15,6 +15,7 @@ mod jts_intersection;
 mod labels;
 mod land;
 mod line_merge;
+mod merge_cache;
 mod pipeline;
 mod polygon_validity;
 mod record_codec;
@@ -32,12 +33,13 @@ mod water;
 
 use crate::compile_area::{Region, TileCoverage};
 use crate::control::{CompileStage, Control};
+use crate::output::PartialArchive;
 use crate::sources::SupplementalDataset;
 use crate::{ArchiveCenter, CompileArea, CompileBounds, archive::ArchiveOptions};
+pub use merge_cache::{MergeCacheOptions, MergeCacheStats, merge_cache_path};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::{sync::Arc, time::Duration, time::Instant};
+use std::path::PathBuf;
+use std::{sync::Arc, time::Instant};
 
 pub use labels::LANGUAGES;
 pub(crate) use selection::{resolve_languages, select_layers};
@@ -114,6 +116,10 @@ pub(crate) struct OpenMapTilesRequest {
     /// The memory the tile sort may hold [default: half of what is available
     /// when rendering starts]; see [`crate::BasemapRequest::sort_memory`].
     pub sort_memory: Option<u64>,
+    /// The archive format to write.
+    pub format: crate::OutputFormat,
+    /// The merge cache to write and reuse.
+    pub merge_cache: merge_cache::MergeCacheOptions,
 }
 /// Whether a compile with these options is one the parity measurement covers
 /// (docs/parity.md): Planetiler's default languages, every supplemental
@@ -163,6 +169,9 @@ pub struct CompileResult {
     /// compile was asked to leave out, as the archive's metadata lists them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omitted_sources: Vec<String>,
+    /// What the merge cache did, when the compile used one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_cache: Option<MergeCacheStats>,
 }
 
 /// The profile's state. Supplements fill it serially; afterwards workers only
@@ -225,122 +234,6 @@ impl Profile {
         self.water.finish(deferred);
         self.labels.finish(deferred);
         self.transport.finish(deferred);
-    }
-}
-
-/// The archive while it is written: `<output>.<pid>.partial`, locked until it
-/// is moved into place. Concurrent compiles to one output never share it, and
-/// a later compile can tell one a killed compile left (unlocked) from one
-/// being written. Dropped before `persist` succeeds, it is removed.
-pub(crate) struct PartialArchive {
-    path: PathBuf,
-    file: Option<File>,
-    finished: bool,
-}
-
-impl PartialArchive {
-    pub(crate) fn create(output: &Path) -> Result<Self, String> {
-        remove_abandoned_partials(output);
-        let mut name = output.as_os_str().to_owned();
-        name.push(format!(".{}.partial", std::process::id()));
-        let path = PathBuf::from(name);
-        let file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
-        file.try_lock()
-            .map_err(|e| format!("Failed to lock {}: {e}", path.display()))?;
-        Ok(Self {
-            path,
-            file: Some(file),
-            finished: false,
-        })
-    }
-
-    pub(crate) fn file(&self) -> &File {
-        self.file
-            .as_ref()
-            .expect("the archive is open until persist")
-    }
-
-    /// Moves the finished archive to `output`. If that fails, it is left
-    /// where it is and the error names it.
-    pub(crate) fn persist(mut self, output: &Path) -> Result<(), String> {
-        if output.exists() {
-            return Err(format!(
-                "refusing to replace existing archive {}",
-                output.display()
-            ));
-        }
-        self.finished = true;
-        // Unix renames the file while it is still locked.
-        let mut moved = std::fs::rename(&self.path, output);
-        if moved.is_err() {
-            // Windows cannot rename an open file, and virus scanners briefly
-            // hold new ones.
-            drop(self.file.take());
-            for attempt in 0..10 {
-                moved = std::fs::rename(&self.path, output);
-                if !moved
-                    .as_ref()
-                    .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
-                {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100 << attempt.min(4)));
-            }
-        }
-        moved.map_err(|e| {
-            format!(
-                "Failed to move the finished archive {} to {}: {e}",
-                self.path.display(),
-                output.display()
-            )
-        })
-    }
-}
-
-impl Drop for PartialArchive {
-    fn drop(&mut self) {
-        if !self.finished {
-            drop(self.file.take());
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Removes the `<output>.<pid>.partial` files that no compile holds locked:
-/// those left by killed compiles.
-fn remove_abandoned_partials(output: &Path) {
-    let Some(name) = output.file_name().and_then(|name| name.to_str()) else {
-        return;
-    };
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let pid = file_name
-            .to_str()
-            .and_then(|file| file.strip_prefix(name))
-            .and_then(|rest| rest.strip_prefix('.'))
-            .and_then(|rest| rest.strip_suffix(".partial"));
-        if !pid.is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(file) = File::options().write(true).open(&path) else {
-            continue;
-        };
-        if file.try_lock().is_ok() {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-        }
     }
 }
 
@@ -495,10 +388,18 @@ pub(crate) fn compile(
         Ok(())
     };
     let mut warnings = Vec::new();
+    // Opened first, so that an index that cannot be used fails at once.
+    let mut cache = merge_cache::MergeCache::open(
+        &request.merge_cache,
+        &request.temp_dir,
+        request.archive.gzip_level,
+        &mut warnings,
+    )?;
     let omitted = |dataset| request.omit_sources.contains(&dataset);
     let message = "Reading supplemental sources";
     progress(message);
     control.stage(CompileStage::ReadSources, message)?;
+    let sources_stage = crate::stage_profile::Stage::start("read_sources");
     supplements::read_sources(
         &request.sources,
         &request.temp_dir,
@@ -514,6 +415,7 @@ pub(crate) fn compile(
         &mut process,
         &mut warnings,
     )?;
+    drop(sources_stage);
     let supplement_seconds = start.elapsed().as_secs_f64();
     control.stage(CompileStage::IndexOsm, "Indexing the OSM extract")?;
     let osm_start = Instant::now();
@@ -539,6 +441,7 @@ pub(crate) fn compile(
     }
     let osm_seconds = osm_start.elapsed().as_secs_f64();
     control.check()?;
+    let drain_stage = crate::stage_profile::Stage::start("render_drain");
     let mut deferred = Vec::new();
     profile.finish(&mut deferred);
     profile_features += deferred.len() as u64;
@@ -548,14 +451,15 @@ pub(crate) fn compile(
     sources_processed += totals.sources;
     profile_features += totals.features;
     drop(pipeline);
+    drop(drain_stage);
     let finish_start = Instant::now();
-    let message = "Sorting, encoding and writing PMTiles";
-    progress(message);
-    control.stage(CompileStage::WriteTiles, message)?;
+    let message = format!("Sorting, encoding and writing {}", request.format.name());
+    progress(&message);
+    control.stage(CompileStage::WriteTiles, &message)?;
     // The archive is written beside the output and moved into place, so a
     // failed or interrupted compile never leaves a partial archive at the
     // output path, where it would block the next attempt.
-    let partial = PartialArchive::create(&request.output)?;
+    let partial = PartialArchive::create(&request.output, request.format)?;
     let omitted_sources = SupplementalDataset::ALL
         .into_iter()
         .filter(|dataset| omitted(*dataset))
@@ -570,9 +474,40 @@ pub(crate) fn compile(
         layers: &selection.layers(),
         omitted_sources: &omitted_sources,
     };
-    let tile_stats = store.finish(partial.file(), &header, request.threads, control)?;
+    let tile_stats =
+        store.finish_cached(&partial, &header, request.threads, control, cache.as_mut())?;
     control.check()?;
     partial.persist(&request.output)?;
+    let merge_cache = match cache {
+        Some(mut cache) => {
+            let mut index_bytes = 0;
+            if let Some(writer) = cache.writer.take() {
+                // Written beside the archive, then moved over any index an
+                // earlier archive of this name left.
+                let path = merge_cache_path(&request.output);
+                let mut partial = path.as_os_str().to_owned();
+                partial.push(format!(".{}.partial", std::process::id()));
+                let partial = PathBuf::from(partial);
+                let written = writer
+                    .finish(&partial, request.archive.gzip_level, &request.output)
+                    .and_then(|bytes| {
+                        let _ = std::fs::remove_file(&path);
+                        std::fs::rename(&partial, &path)
+                            .map(|()| bytes)
+                            .map_err(|e| format!("Failed to write {}: {e}", path.display()))
+                    });
+                match written {
+                    Ok(bytes) => index_bytes = bytes,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&partial);
+                        warnings.push(format!("the merge cache was not written: {error}"));
+                    }
+                }
+            }
+            Some(cache.counters.stats(index_bytes))
+        }
+        None => None,
+    };
     warnings.extend(tile_stats.warning());
     Ok(CompileResult {
         schema: format!("OpenMapTiles {OMT_SCHEMA_VERSION} (native experimental port)"),
@@ -588,5 +523,6 @@ pub(crate) fn compile(
         warnings,
         tile_stats,
         omitted_sources: omitted_sources.into_iter().map(String::from).collect(),
+        merge_cache,
     })
 }
