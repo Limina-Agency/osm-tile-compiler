@@ -47,7 +47,7 @@ impl CompileArea {
 
     /// An area of `polygons`, in degrees. There must be at least one, and
     /// every ring needs three distinct points within latitude ±90 and
-    /// longitude ±540: a ring crossing the antimeridian may run on past
+    /// longitude ±540, not all on one line: a ring crossing the antimeridian may run on past
     /// ±180, by less than one turn, as long as its polygon spans at most 360
     /// degrees of longitude.
     pub fn from_polygons(polygons: MultiPolygon<f64>) -> Result<Self, CompileError> {
@@ -157,7 +157,8 @@ impl CompileArea {
     }
 
     /// Checks that there is at least one polygon and that every ring has three
-    /// distinct points within latitude ±90 and longitude ±540: a ring crossing
+    /// distinct points within latitude ±90 and longitude ±540, not all on one
+    /// line: a ring crossing
     /// the antimeridian may run on past ±180, by less than one turn, as long
     /// as its polygon spans at most 360 degrees of longitude.
     fn check_polygons(polygons: MultiPolygon<f64>) -> Result<Self, String> {
@@ -175,6 +176,12 @@ impl CompileArea {
                     return Err(format!(
                         "coordinate {} {} is not a longitude and latitude",
                         c.x, c.y
+                    ));
+                }
+                if encloses_no_area(ring) {
+                    return Err(format!(
+                        "a ring encloses no area: its points, from {} {}, lie on one line",
+                        ring.0[0].x, ring.0[0].y
                     ));
                 }
             }
@@ -248,6 +255,26 @@ impl CompileArea {
             (longitude, p.y())
         })
     }
+}
+
+/// Whether a closed ring's points all lie on one line, so that it bounds
+/// nothing. Such a ring is no area to limit a compile to, and geo's
+/// algorithms assume it away: with a hole beside it, `interior_point` trips
+/// a consistency assertion in geo's relate (found by the `polygon_geojson`
+/// fuzz target). The shoelace sum is taken relative to the first point,
+/// which keeps it exact for points on a line of constant longitude or
+/// latitude.
+fn encloses_no_area(ring: &LineString<f64>) -> bool {
+    let origin = ring.0[0];
+    let twice_area: f64 = ring
+        .0
+        .windows(2)
+        .map(|pair| {
+            let (a, b) = (pair[0] - origin, pair[1] - origin);
+            a.x * b.y - b.x * a.y
+        })
+        .sum();
+    twice_area == 0.0
 }
 
 /// The tiles a compile writes: those within its bounds and, when it is
@@ -537,6 +564,7 @@ END
                 "lies in no polygon",
             ),
             ("name\narea\n0 0\n1 0\nEND\nEND\n", "three distinct points"),
+            ("name\narea\n0 0\n1 0\n2 0\nEND\nEND\n", "encloses no area"),
             ("name\narea\n0 0\n600 0\n1 1\nEND\nEND\n", "not a longitude"),
             (
                 "name\narea\n-100 0\n300 0\n1 1\nEND\nEND\n",
@@ -593,6 +621,28 @@ END
             let error = CompileArea::from_geojson(text).unwrap_err();
             assert!(error.message().starts_with("invalid GeoJSON"), "{error}");
         }
+    }
+
+    /// Found by the polygon_geojson fuzz target: an outer ring whose points
+    /// all lie on the meridian 7.40, with a hole beside it, made geo's
+    /// `interior_point` panic on a consistency assertion. A ring that
+    /// encloses nothing, outer or hole, is now an error.
+    #[test]
+    fn rings_that_enclose_no_area_are_errors() {
+        for text in [
+            r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[7.40,43.7276],[7.40,43.76],[7.40,43.72]],[[7.40,43.73],[7.42,49.73],[7.23,43.74],[6.41,43.33]]]}}]}"#,
+            r#"{"type":"Polygon","coordinates":[[[0,0],[1,1],[2,2],[0,0]]]}"#,
+            r#"{"type":"Polygon","coordinates":[[[0,0],[4,0],[4,4],[0,4],[0,0]],[[1,1],[2,1],[3,1],[1,1]]]}"#,
+        ] {
+            let error = CompileArea::from_geojson(text).unwrap_err();
+            assert!(
+                error.message().contains("a ring encloses no area"),
+                "{text}: {error}"
+            );
+        }
+        // Collinear runs within a ring that does enclose an area are fine.
+        let square = r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[2,0],[2,2],[0,2],[0,0]]]}"#;
+        CompileArea::from_geojson(square).unwrap();
     }
 
     /// Every tile whose square, or one of its copies a world's width east or
