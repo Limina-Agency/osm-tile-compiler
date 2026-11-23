@@ -319,6 +319,19 @@ fn update(
         writing_program: Some(concat!("osm-tile-compiler ", env!("CARGO_PKG_VERSION")).to_string()),
         ..ApplyOptions::default()
     };
+    // A change file downloaded with its state file beside it (`123.osc.gz`
+    // and `123.state.txt`, as Osmosis names them) says when its data ends.
+    // The newest such time moves the header's timestamp, so the archive
+    // compiled from the output says how current it is. The sequence number
+    // and server are left as they were: a state file doesn't name its server.
+    let base_timestamp = base.header().replication_timestamp;
+    options.replication_timestamp = request
+        .change_files
+        .iter()
+        .filter_map(|file| local_state(file))
+        .map(|state| state.timestamp)
+        .max()
+        .filter(|timestamp| base_timestamp.is_none_or(|base| *timestamp > base));
     let mut applied = None;
     if let Some((url, first, last)) = &plan {
         for sequence in *first..=*last {
@@ -406,6 +419,18 @@ pub(crate) fn fetch_state(
     let text = download(agent, &state_url, 1 << 16)?;
     parse_state(&String::from_utf8_lossy(&text))
         .map_err(|message| CompileError::Download(format!("{state_url}: {message}")))
+}
+
+/// The state file beside a change file, `NAME.state.txt` for `NAME.osc` or
+/// `NAME.osc.gz`, when there is one and it reads.
+fn local_state(change_file: &std::path::Path) -> Option<ReplicationState> {
+    let name = change_file.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".osc.gz")
+        .or_else(|| name.strip_suffix(".osc"))?;
+    let text =
+        std::fs::read_to_string(change_file.with_file_name(format!("{stem}.state.txt"))).ok()?;
+    parse_state(&text).ok()
 }
 
 /// A diff's or state's URL: the sequence number zero-padded to nine digits
@@ -547,6 +572,19 @@ mod tests {
         assert_eq!(parse_timestamp("2000-03-01T00:00:00Z"), Some(951_868_800));
         assert_eq!(parse_timestamp("2026-11-18T21:21:02Z"), Some(1_795_036_862));
         assert_eq!(parse_timestamp("2026-13-18T21:21:02Z"), None);
+    }
+
+    #[test]
+    fn a_change_files_state_file_is_found_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = "sequenceNumber=124347\ntimestamp=2026-11-19T10\\:00\\:00Z\n";
+        std::fs::write(dir.path().join("124347.state.txt"), state).unwrap();
+        for name in ["124347.osc.gz", "124347.osc"] {
+            let found = local_state(&dir.path().join(name)).unwrap();
+            assert_eq!(found.timestamp, 1_795_082_400);
+        }
+        assert_eq!(local_state(&dir.path().join("124348.osc.gz")), None);
+        assert_eq!(local_state(&dir.path().join("124347.pbf")), None);
     }
 
     #[test]

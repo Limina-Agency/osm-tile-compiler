@@ -239,7 +239,13 @@ struct Archive {
 async fn read_archive(path: &Path) -> Archive {
     let reader = AsyncPmTilesReader::new_with_path(path).await.unwrap();
     let header = header_record(reader.get_header());
-    let metadata: Value = serde_json::from_str(&reader.get_metadata().await.unwrap()).unwrap();
+    let mut metadata: Value = serde_json::from_str(&reader.get_metadata().await.unwrap()).unwrap();
+    // The generator names the crate's version, which changes with every
+    // release; the record holds a placeholder for exactly that value.
+    let generator = concat!("osm-tile-compiler ", env!("CARGO_PKG_VERSION"));
+    if metadata["generator"] == generator {
+        metadata["generator"] = json!("osm-tile-compiler <version>");
+    }
     let header_bounds = reader.get_header();
     let bounds = (
         header_bounds.min_longitude,

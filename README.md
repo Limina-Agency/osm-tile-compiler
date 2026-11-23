@@ -215,6 +215,12 @@ gives these sentences for an app to show.
 
 `--name`, `--description` and `--attribution` set the archive's metadata;
 the attribution must keep crediting OpenMapTiles and OpenStreetMap.
+The metadata also says what made the archive and how current its data is,
+so an app can show "map data as of" and pick the newest of several
+archives: `generator` (`osm-tile-compiler 0.3.0`), and from the extract's
+header `osm_data_timestamp` (RFC 3339, UTC), `osm_replication_sequence` and
+`osm_replication_url`. Those three are left out when the header doesn't give
+them. `inspect` prints them, and `CompileResult::osm_data` has the same.
 `--gzip-level` trades compile time for size, `--threads` sets the worker
 threads (every core by default), and `--temp-dir` the scratch space
 (`<output>.tmp` by default, removed afterwards, also when Ctrl-C stops
@@ -276,7 +282,11 @@ server's URL, or `header` for the server the PBF's header names (Geofabrik
 extracts name their `-updates` server). Where to start comes from the
 header's sequence number on its own server, otherwise from its timestamp, and
 the updated file's header records where it ended, so the next `update`
-continues from there.
+continues from there. Change files given on the command line move the
+header's timestamp too when each has its state file beside it
+(`124347.osc.gz` and `124347.state.txt`, as Osmosis names them); the sequence
+number and server stay as they were, since a state file doesn't name its
+server.
 
 Only the PBF blocks a change touches are decoded and written again; the rest
 are copied as they are. On a 4-core cloud VM, bringing Małopolskie forward by

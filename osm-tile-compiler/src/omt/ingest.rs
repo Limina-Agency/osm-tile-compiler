@@ -14,7 +14,7 @@ use geo::coordinate_position::CoordPos;
 use geo::{Area, BoundingRect, Contains, CoordinatePosition};
 use geo_types::{Coord, Geometry, LineString, MultiPolygon, Point, Polygon, Rect};
 use osm_pbf_ingest::IngestStage;
-use osm_pbf_ingest::blob_index::ObjectKind;
+use osm_pbf_ingest::blob_index::{ObjectKind, PbfFileHeader};
 use osm_pbf_ingest::node_store::DecimicroBox;
 use osm_pbf_ingest::{
     IngestBuildProfile, NodeBatch, NodeTags, NormalizedNode, NormalizedRelation, Pass2Options,
@@ -290,7 +290,7 @@ pub fn read_osm(
     area: Option<InputArea>,
     progress: &mut dyn FnMut(&str),
     warnings: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<Option<PbfFileHeader>, String> {
     // The block counts, for the fractions: pass 1 reads the blocks holding
     // nodes or relations, and pass 2 hands on each block's tagged nodes and
     // its ways as one batch, the ways taking most of the time.
@@ -307,6 +307,8 @@ pub fn read_osm(
     // The index cannot tell which blocks hold ways without decoding them, so
     // pass 2 counts them as all blocks but those its nodes came in.
     let all_blobs = blobs.as_ref().map_or(1, |index| index.len()).max(1) as f64;
+    // The header says how current the data is, for the archive's metadata.
+    let header = blobs.as_ref().map(|index| index.header().clone());
     let mut node_batches = 0.0;
     drop(blobs);
     control.set_total(pass1_blobs);
@@ -453,7 +455,7 @@ pub fn read_osm(
              from the extract, {missing_relations} relations whose rings could not be assembled"
         ));
     }
-    Ok(())
+    Ok(header)
 }
 
 /// The directory under the scratch directory where `osm_pbf_ingest` keeps a

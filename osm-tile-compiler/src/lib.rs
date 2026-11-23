@@ -118,7 +118,7 @@ pub use extracts::{
 };
 pub use omt::{
     CompileResult, LANGUAGES as OMT_LANGUAGES, LAYERS as OMT_LAYERS, MergeCacheOptions,
-    MergeCacheStats, OMT_SCHEMA_VERSION, PROFILE_REVISION as OMT_PROFILE_REVISION,
+    MergeCacheStats, OMT_SCHEMA_VERSION, OsmDataInfo, PROFILE_REVISION as OMT_PROFILE_REVISION,
     merge_cache_path,
 };
 pub use output::OutputFormat;

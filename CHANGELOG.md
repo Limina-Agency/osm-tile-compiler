@@ -4,6 +4,19 @@
 
 ### Added
 
+- The archive metadata records what made the archive and how current its
+  OSM data is: `generator` (`osm-tile-compiler` and its version), and from
+  the extract's header `osm_data_timestamp` (RFC 3339, UTC),
+  `osm_replication_sequence` and `osm_replication_url`, each left out when
+  the header doesn't give it. `inspect` and the compile's summary line print
+  them, and `CompileResult::osm_data` (`OsmDataInfo`) carries them, so the
+  manifest's `result` does too. The Monaco fingerprint changes for these
+  keys only; every tile is the same.
+- `update` with change files on the command line takes the newest timestamp
+  from the state files beside them (`124347.osc.gz` and
+  `124347.state.txt`), so an extract brought forward from downloaded diffs
+  says how current it is. Before, its header kept the base extract's time.
+
 - Experimental merge cache for recompiles after an update: `compile
   --merge-cache` writes `<NAME>.merge-cache` beside the archive, and
   `--reuse-from OLD.pmtiles` takes every tile layer whose input records are

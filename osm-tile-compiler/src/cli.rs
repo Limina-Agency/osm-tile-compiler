@@ -1516,6 +1516,9 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         result.profile_features,
         result.total_seconds
     ));
+    if let Some(time) = result.osm_data.timestamp_rfc3339() {
+        status.line(&format!("OSM data as of {time}"));
+    }
     if let Some(largest) = result.tile_stats.largest.first() {
         status.line(&format!(
             "Largest tile: {} at {}",
@@ -1788,6 +1791,27 @@ fn describe(path: &Path, report: &ArchiveReport) -> String {
         metadata["name"].as_str().unwrap_or("no name"),
         metadata["version"].as_str().unwrap_or("no version"),
     );
+    if let Some(generator) = metadata["generator"].as_str() {
+        let _ = writeln!(text, "Generator: {generator}");
+    }
+    match metadata["osm_data_timestamp"].as_str() {
+        Some(time) => {
+            let mut line = format!("OSM data as of {time}");
+            if let Some(sequence) = metadata["osm_replication_sequence"].as_i64() {
+                let _ = write!(line, ", sequence {sequence}");
+            }
+            if let Some(url) = metadata["osm_replication_url"].as_str() {
+                let _ = write!(line, " of {url}");
+            }
+            let _ = writeln!(text, "{line}");
+        }
+        None => {
+            let _ = writeln!(
+                text,
+                "OSM data: date unknown (the extract's header gives none)"
+            );
+        }
+    }
     let _ = writeln!(
         text,
         "\nzoom    tiles       total      p50      p90      p99      max"
