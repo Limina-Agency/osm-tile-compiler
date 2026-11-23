@@ -62,8 +62,8 @@
 //!
 //! Besides compiling, the crate fetches the inputs ([`fetch_sources`],
 //! [`fetch_extract`]), writes building levels for an archive
-//! ([`write_building_levels`]), and inspects, diffs and patches archives
-//! ([`archive`]).
+//! ([`write_building_levels`]), and inspects, cuts, diffs and patches
+//! archives ([`archive`]).
 
 /// The message a panic was raised with, for errors that report a caught
 /// panic. Shared with the binary.

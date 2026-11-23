@@ -4,6 +4,10 @@
 
 ### Added
 
+- `extract` cuts an area out of an existing PMTiles archive into a new one:
+  the tiles within `--bounds`, `--polygon` and `--min-zoom`/`--max-zoom`,
+  copied byte for byte, at the positions a compile limited to the same area
+  writes. From Rust, `archive::extract` with an `ExtractRequest`.
 - Experimental merge cache for recompiles after an update: `compile
   --merge-cache` writes `<NAME>.merge-cache` beside the archive, and
   `--reuse-from OLD.pmtiles` takes every tile layer whose input records are

@@ -1,5 +1,5 @@
 //! The human command line: `compile`, `building-levels`, `fetch-sources`,
-//! `style`, `inspect`, `verify`, `diff`, `apply`, `update`, `help`,
+//! `style`, `inspect`, `verify`, `extract`, `diff`, `apply`, `update`, `help`,
 //! `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
 //! the version, `--json`). Usage errors exit with 2, failures with 1, and
@@ -45,6 +45,7 @@ Usage:
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
+  osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
@@ -63,6 +64,7 @@ Usage:
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
+  osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
@@ -84,6 +86,9 @@ Commands:
                    zoom and the largest tiles, and any problems 'verify' finds
   verify           Check a PMTiles archive's layout and every tile's MVT
                    encoding; exits with 1 if anything is wrong
+  extract          Cut an area out of a PMTiles archive into a new one: the
+                   tiles within a box, a polygon and zooms, copied byte for
+                   byte
   diff             Experimental: write a delta that turns OLD.pmtiles into
                    NEW.pmtiles, carrying only the parts OLD doesn't hold
   apply            Experimental: rebuild NEW.pmtiles from OLD.pmtiles and a
@@ -171,6 +176,19 @@ Compile options:
                         --merge-cache, instead of merging and encoding it
                         again; the archive is the same as without it. Implies
                         --merge-cache
+
+Extract options:
+  --output <FILE>       Archive to write; must not exist yet
+  --bounds <W S E N>    Keep the tiles that meet this box, in degrees; W > E
+                        crosses the antimeridian [default: the archive's]
+  --polygon <FILE>      Keep the tiles that meet a polygon, read from GeoJSON
+                        or an Osmosis .poly file
+  --min-zoom <N>        Lowest zoom to keep [default: the archive's]
+  --max-zoom <N>        Highest zoom to keep [default: the archive's]
+  --json                Print the extract report as JSON on stdout
+  The tiles kept are those a compile limited to the same box or polygon
+  writes. Tiles are not cut: features in kept tiles keep their full
+  geometry, as in the source.
 
 Diff and apply options:
   --output <FILE>       File to write; must not exist yet
@@ -352,9 +370,21 @@ enum Command {
     Style(StyleArgs),
     Inspect { archive: PathBuf, json: bool },
     Verify { archive: PathBuf, json: bool },
+    Extract(Box<ExtractArgs>),
     Diff(DeltaArgs),
     Apply(DeltaArgs),
     Update(Box<UpdateArgs>),
+}
+
+#[derive(Debug)]
+struct ExtractArgs {
+    input: PathBuf,
+    output: PathBuf,
+    bounds: Option<CompileBounds>,
+    polygon: Option<PathBuf>,
+    min_zoom: Option<u8>,
+    max_zoom: Option<u8>,
+    json: bool,
 }
 
 /// `diff` and `apply`: the old archive, then the new archive (`diff`) or the
@@ -399,6 +429,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         }
         Command::Inspect { archive, json } => inspect(&archive, json),
         Command::Verify { archive, json } => verify(&archive, json),
+        Command::Extract(args) => extract(*args),
         Command::Diff(args) => diff(args),
         Command::Apply(args) => apply(args),
         Command::Update(args) => update(*args),
@@ -429,6 +460,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("fetch-sources") => parse_fetch_sources(rest),
         Some("style") => parse_style(rest),
         Some(name @ ("inspect" | "verify")) => parse_archive_command(name, rest),
+        Some("extract") => parse_extract(rest),
         Some(name @ ("diff" | "apply")) => parse_delta_command(name, rest),
         Some("update") => parse_update(rest),
         _ => Err(format!("unknown command '{}'", first.to_string_lossy())),
@@ -896,6 +928,57 @@ fn parse_archive_command(name: &str, args: &[OsString]) -> Result<Command, Strin
     } else {
         Command::Verify { archive, json }
     })
+}
+
+fn parse_extract(args: &[OsString]) -> Result<Command, String> {
+    let mut input = None;
+    let mut output = None;
+    let mut bounds = None;
+    let mut polygon = None;
+    let (mut min_zoom, mut max_zoom) = (None, None);
+    let mut json = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(flag) = option(arg) else {
+            if input.is_some() {
+                return Err(format!(
+                    "unexpected argument '{}': extract takes one archive",
+                    arg.to_string_lossy()
+                ));
+            }
+            input = Some(PathBuf::from(arg));
+            continue;
+        };
+        match flag.as_str() {
+            "--help" | "-h" => return Ok(Command::Help),
+            "--output" | "-o" => output = Some(PathBuf::from(value(&mut args, "--output")?)),
+            "--bounds" => bounds = Some(parse_bounds(&mut args, &flag)?),
+            "--polygon" => polygon = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--min-zoom" => min_zoom = Some(number(value(&mut args, &flag)?, &flag)?),
+            "--max-zoom" => max_zoom = Some(number(value(&mut args, &flag)?, &flag)?),
+            "--json" => json = true,
+            _ => return Err(format!("unknown extract option '{flag}'")),
+        }
+    }
+    if let (Some(min), Some(max)) = (min_zoom, max_zoom)
+        && min > max
+    {
+        return Err(format!(
+            "--min-zoom must not exceed --max-zoom, got {min} and {max}"
+        ));
+    }
+    if bounds.is_none() && polygon.is_none() && min_zoom.is_none() && max_zoom.is_none() {
+        return Err("extract needs --bounds, --polygon, --min-zoom or --max-zoom".into());
+    }
+    Ok(Command::Extract(Box::new(ExtractArgs {
+        input: input.ok_or("extract needs an archive")?,
+        output: output.ok_or("extract needs --output")?,
+        bounds,
+        polygon,
+        min_zoom,
+        max_zoom,
+        json,
+    })))
 }
 
 fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String> {
@@ -1686,6 +1769,46 @@ fn verify(path: &Path, json: bool) -> Result<(), String> {
             String::new()
         }
     ))
+}
+
+fn extract(args: ExtractArgs) -> Result<(), String> {
+    let _cooperating = interrupt::cooperate();
+    let mut request = archive::ExtractRequest::new(&args.input, &args.output);
+    request.bounds = args.bounds;
+    if let Some(polygon) = &args.polygon {
+        request.polygon = Some(osm_tile_compiler::CompileArea::read(polygon)?);
+    }
+    if args.min_zoom.is_some() || args.max_zoom.is_some() {
+        let max = args.max_zoom.unwrap_or(ZoomRange::MAX_ZOOM);
+        let min = args.min_zoom.unwrap_or(0).min(max);
+        request.zoom = Some(ZoomRange::new(min, max).map_err(|_| {
+            format!(
+                "zooms must satisfy 0 <= --min-zoom <= --max-zoom <= {}, got {min} and {max}",
+                ZoomRange::MAX_ZOOM
+            )
+        })?);
+    }
+    let started = Instant::now();
+    let report = archive::extract(&request, interrupt::requested)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        let [west, south, east, north] = report.bounds;
+        eprintln!(
+            "Wrote {}: {}, {} of {} tiles, zooms {}-{}, bounds {west} {south} {east} {north}, in {:.1} s",
+            args.output.display(),
+            megabytes(report.bytes),
+            report.tiles,
+            report.source_tiles,
+            report.zooms[0],
+            report.zooms[1],
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
 }
 
 fn delta_summary(manifest: &DeltaManifest, delta_bytes: u64) -> String {

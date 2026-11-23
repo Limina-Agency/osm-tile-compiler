@@ -229,7 +229,7 @@ archive (gzip-compressed MVT, `format` `pbf`), and the metadata the same
 fields, with `vector_layers` in the `json` row. As in Planetiler's compact
 MBTiles, `tiles` is a view over `map` and `images`, so that identical small
 tiles (open sea, solid land) are stored once. Building levels, `--delta-from`,
-`inspect`, `verify`, `diff` and `apply` work on PMTiles only.
+`inspect`, `verify`, `extract`, `diff` and `apply` work on PMTiles only.
 
 ## Building levels
 
@@ -255,6 +255,25 @@ Both read any PMTiles v3 archive. `verify` checks the layout (sections,
 directories, entry order, clustering, the header's counts) and decodes every
 tile, checking its MVT encoding and that its layers are declared in the
 metadata. Tiles over 1 MiB compressed produce a warning at compile time.
+
+## Cutting an area out of an archive
+
+```sh
+# The Tatras from a Małopolskie (or Poland) archive
+osm-tile-compiler extract malopolskie.pmtiles --output tatras.pmtiles --bounds 19.70 49.15 20.25 49.35
+# A search area drawn as a polygon, without the street-level zoom
+osm-tile-compiler extract poland.pmtiles --output search.pmtiles --polygon area.geojson --max-zoom 13
+```
+
+`extract` writes a new archive holding the tiles of an existing one within
+a box (`--bounds`), a polygon (`--polygon`, GeoJSON or `.poly`) and zooms
+(`--min-zoom`, `--max-zoom`), copied byte for byte: nothing is decoded or
+encoded again, so a small area takes well under a second from a country
+archive. The tiles kept are the ones a compile limited to the same box or
+polygon writes, and they are not cut: features keep their full geometry, as
+in the source. The header and metadata get the new bounds, center and zooms;
+everything else in the metadata is kept. It reads any PMTiles v3 archive.
+From Rust, `archive::extract` takes an `ExtractRequest`.
 
 ## Keeping an extract fresh (experimental)
 
