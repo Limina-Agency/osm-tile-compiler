@@ -32,7 +32,7 @@ pub(crate) struct Stand {
     /// 1 wood or forest, 2 scrub, 3 orchard, 4 swamp, 5 grass (meadow, grassland), 6 heath, 7 field
     /// (farmland).
     pub cover: u8,
-    /// As a tree's.
+    /// As a tree's; a field's the way its rows run (`field_way`).
     pub kind: u8,
     pub genus: u8,
     /// Metres.
@@ -183,6 +183,25 @@ pub(crate) fn cell_m2(y: u32) -> f64 {
     (f64::from(CELL) / units(1.0, (y as i32) * TILE + TILE / 2)).powi(2)
 }
 
+/// The way a field's rows run, as its edges do the most: 16 ways over half a turn from east
+/// towards north, as `way * 16` (0 to 240).
+fn field_way(pieces: &[Arc<[[i32; 2]]>]) -> u8 {
+    let mut along = [0f64; 16];
+    for piece in pieces {
+        for w in piece.windows(2) {
+            // y runs south
+            let (dx, dy) = (f64::from(w[1][0] - w[0][0]), -f64::from(w[1][1] - w[0][1]));
+            let length = dx.hypot(dy);
+            if length > 0.0 {
+                let way = dy.atan2(dx).rem_euclid(std::f64::consts::PI) / std::f64::consts::PI;
+                along[(way * 16.0).round() as usize % 16] += length;
+            }
+        }
+    }
+    let most = (0..16).max_by(|&a, &b| along[a].total_cmp(&along[b])).unwrap_or(0);
+    most as u8 * 16
+}
+
 /// An area's or a line's pieces.
 struct Feature {
     what: What,
@@ -191,7 +210,12 @@ struct Feature {
 }
 
 impl Feature {
-    fn new(what: What, pieces: Vec<Arc<[[i32; 2]]>>) -> Self {
+    fn new(mut what: What, pieces: Vec<Arc<[[i32; 2]]>>) -> Self {
+        if let What::Stand(s) = &mut what
+            && s.cover == 7
+        {
+            s.kind = field_way(&pieces);
+        }
         let mut bounds = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
         for p in pieces.iter().flat_map(|p| p.iter()) {
             bounds = [
@@ -754,6 +778,18 @@ mod tests {
             None
         );
         assert_eq!(told(&[("highway", "proposed")], false), None);
+    }
+
+    #[test]
+    fn a_fields_rows_run_along_its_longest_edges() {
+        // 200 by 40 units, its long sides running east; then turned a quarter (north)
+        let east: Arc<[[i32; 2]]> = Arc::from([[0, 0], [200, 0], [200, 40], [0, 40], [0, 0]]);
+        assert_eq!(field_way(&[east]), 0);
+        let north: Arc<[[i32; 2]]> = Arc::from([[0, 0], [40, 0], [40, -200], [0, -200], [0, 0]]);
+        assert_eq!(field_way(&[north]), 8 * 16);
+        // north-east: y runs south
+        let diagonal: Arc<[[i32; 2]]> = Arc::from([[0, 0], [100, -100], [110, -90], [10, 10], [0, 0]]);
+        assert_eq!(field_way(&[diagonal]), 4 * 16);
     }
 
     #[test]
