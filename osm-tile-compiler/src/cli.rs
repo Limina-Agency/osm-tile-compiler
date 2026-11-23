@@ -1240,25 +1240,37 @@ fn hd_roads(args: HdRoadsArgs) -> Result<(), String> {
     })?;
     cleanup?;
     status.line(&format!(
-        "Wrote {} in {:.1} s, {:.1} of them reading: {} ways ({} incomplete left out), \
-         {} junctions, {} cross-sections",
+        "Wrote {} in {:.1} s, {:.1} of them reading: {} ways and {} paths ({} incomplete left out), \
+         {} junctions ({} of more nodes than one), {} cross-sections",
         args.output.display(),
         report.seconds,
         report.read_seconds,
         report.ways,
+        report.paths,
         report.incomplete_ways,
         report.junctions,
+        report.clusters,
         report.profiles
     ));
     status.line(&format!(
-        "  {} tiles, {} surfaces, {} markings ({} crossings, stops and arrows, {} areas), \
-         {} barriers, {} bridge groups ({} pieces, {} crossings), {} raw, {} gzipped",
+        "  {} tiles, {} surfaces, {} markings ({} crossings, stops, arrows and other \
+         paint, {} areas, of them {} crossings' islands and {} carriageways), \
+         {} turning circles, {} tracks, {} barriers, {} fences, {} things, {} pitches ({} with lines), \
+         {} bridge groups ({} pieces, {} crossings), {} raw, {} gzipped",
         report.tiles,
         report.surfaces,
         report.markings,
         report.details,
         report.areas,
+        report.refuges,
+        report.carriageways,
+        report.turning_circles,
+        report.tracks,
         report.barriers,
+        report.fences,
+        report.things,
+        report.pitches,
+        report.lined,
         report.groups,
         report.pieces,
         report.crossings,

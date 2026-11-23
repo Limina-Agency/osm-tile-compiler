@@ -2,7 +2,14 @@
 //! markings stop. Positions are world units: z16 tiles of 4096 units, so the
 //! plane of every tile at once.
 
+use super::details::Detail;
+use super::geometry;
+use super::junctions;
+use super::lanes::{self, Changes, Dashes, Drawn, Section, Shapes, shapes};
+use super::merges::{self, Merge};
 use super::profile::{Class, Level, Profile};
+use super::structures::Piece;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(super) type Point = [f64; 2];
@@ -24,10 +31,13 @@ pub(super) struct Edge {
     pub points: std::ops::Range<usize>,
     /// Metres at its start and its end that hold no markings.
     pub cut: [f64; 2],
+    /// Whether it lies within a junction, between two of its nodes.
+    pub inner: bool,
 }
 
 /// What a node adds to the ribbons that meet at it: the ground a rounded
-/// corner takes in, or the wedge outside a bend.
+/// corner takes in, or a step from one road's edge to another's, the wedge outside
+/// a bend, or what lies between roads that part.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Patch {
     pub ring: Vec<Point>,
@@ -43,28 +53,175 @@ pub(super) struct Network {
     /// The edges of a way joined where nothing keeps their markings apart: past
     /// driveways, a road's markings go on.
     pub runs: Vec<Edge>,
-    /// The nodes of `junctions`.
+    /// Where three or more arms of motor roads meet, driveways too.
     pub junction_nodes: FxHashSet<i64>,
-    /// Where three or more arms of motor roads meet.
+    /// Those of roads, by which junction they are of.
+    pub junction_of: FxHashMap<i64, u32>,
+    /// How many of these there are, and how many are of more nodes than one.
     pub junctions: u64,
+    pub clusters: u64,
     pub patches: Vec<Patch>,
+    /// How the ways' cross-sections change along them.
+    pub shapes: Shapes,
+    /// What is painted where roads part and merge.
+    pub paint: Vec<Detail>,
+    /// Metres along its way that each run begins.
+    pub run_from: Vec<f64>,
+    pub dashes: Dashes,
 }
 
-struct Arm {
-    edge: u32,
-    end: usize,
+impl Network {
+    /// The cross-section of a run `s` metres along it.
+    pub(super) fn at(&self, ways: &[Way], run: usize, s: f64) -> Section {
+        let way = self.runs[run].way;
+        self.shapes.at(ways, way, self.run_from[run] + s)
+    }
+
+    /// The line at an edge of a run's lanes, without `trim` metres at its ends.
+    pub(super) fn line(
+        &self,
+        ways: &[Way],
+        run: usize,
+        edge: usize,
+        trim: [f64; 2],
+    ) -> Option<Drawn> {
+        let from = self.run_from[run];
+        self.shapes.line(ways, &self.runs[run], from, edge, trim)
+    }
+
+    /// How a piece differs from its way's profile: a bridge's, or of a road that
+    /// leads up to one its first way's part.
+    pub(super) fn piece(&self, ways: &[Way], piece: &Piece) -> Changes {
+        let way = &ways[piece.way as usize];
+        let along = geometry::lengths(&way.points, way.scale, 0.0);
+        let place = |node: i64, p: Point| {
+            let mut found = way.nodes.iter().zip(&way.points).zip(&along);
+            found
+                .find(|((n, q), _)| **n == node && **q == p)
+                .map(|f| *f.1)
+        };
+        let ends = [0, piece.points.len() - 1];
+        let length = geometry::lengths(&piece.points, way.scale, 0.0);
+        let length = length[length.len() - 1];
+        let [start, end] = [0, 1].map(|e: usize| place(piece.nodes[e], piece.points[ends[e]]));
+        let whole = along[along.len() - 1];
+        // the part of it that is the way's
+        let span = match (start, end) {
+            (Some(a), Some(b)) => [a, b],
+            (Some(a), None) => [a, whole],
+            (None, Some(b)) => [0.0, b],
+            (None, None) => [0.0, whole],
+        };
+        let mut tapers = self.shapes.ends(ways, piece.way, span);
+        // where it goes on as another way its own end is not the way's
+        for (taper, at) in tapers.iter_mut().zip([start, end]) {
+            if at.is_none() {
+                *taper = None;
+            }
+        }
+        let gone = |line: &(f64, _)| {
+            let edge = lanes::edge(&way.profile, line.0);
+            let (at, back) = match (start, end) {
+                (Some(at), _) => (at, 0.0),
+                (_, Some(at)) => (at, length),
+                _ => return 0.0,
+            };
+            let period = way.profile.rules.pattern()[1];
+            (self.gone(ways, piece.way, edge, at) - back).rem_euclid(period)
+        };
+        let gone: Vec<f64> = way.profile.lines.iter().map(gone).collect();
+        let any = way.profile.lines.iter().zip(&gone);
+        let any = any.fold(false, |any, (l, g)| any || (l.1.dashed() && *g >= 0.05));
+        let mut bare = self.shapes.bare(ways, piece.way, span);
+        for (bare, at) in bare.iter_mut().zip([start, end]) {
+            if at.is_none() {
+                *bare = None;
+            }
+        }
+        Changes {
+            tapers,
+            gone: any.then_some(gone),
+            bare,
+        }
+    }
+
+    /// The metres of a dash's period gone `s` metres along a way, as if its
+    /// dashes were laid along it.
+    fn gone(&self, ways: &[Way], way: u32, edge: usize, s: f64) -> f64 {
+        let runs = self.runs.partition_point(|r| r.way < way);
+        let of = (runs..self.runs.len()).take_while(|&i| self.runs[i].way == way);
+        let Some(run) = of
+            .take_while(|&i| i == runs || self.run_from[i] <= s)
+            .last()
+        else {
+            return 0.0;
+        };
+        let trim = [s - self.run_from[run], 0.0];
+        let (line, at) = match self.line(ways, run, edge, trim) {
+            Some(line) => {
+                let first = line.lengths[0];
+                (line, first)
+            }
+            // at its very end
+            None => match self.line(ways, run, edge, [0.0; 2]) {
+                Some(line) => {
+                    let whole = line.whole;
+                    (line, whole)
+                }
+                None => return 0.0,
+            },
+        };
+        let dash = ways[way as usize].profile.rules.pattern();
+        self.dashes.gone(run as u32, edge, line.whole, at, dash)
+    }
+
+    /// The ground beside a run's surface, right of it (`side` 1) or left (-1), out
+    /// to `out` metres right of its edge.
+    pub(super) fn beside(
+        &self,
+        ways: &[Way],
+        run: usize,
+        trim: [f64; 2],
+        side: f64,
+        out: f64,
+    ) -> Vec<Vec<Vec<Point>>> {
+        let Edge { way, points, .. } = &self.runs[run];
+        let w = &ways[*way as usize];
+        let Some(points) = geometry::trim(
+            &w.points[points.clone()],
+            trim.map(|metres| metres * w.scale),
+        ) else {
+            return Vec::new();
+        };
+        let lengths = geometry::lengths(&points, w.scale, self.run_from[run] + trim[0]);
+        let (points, lengths) = geometry::stations(&points, &lengths, &self.shapes.steps(*way));
+        let surface = |k: usize| {
+            let surface = self.shapes.at(ways, *way, lengths[k]).surface;
+            surface[usize::from(side > 0.0)]
+        };
+        let [near, far] = [0.0, out]
+            .map(|by| geometry::displaced(&points, |k| (surface(k) + by) * w.scale, [None; 2]));
+        geometry::between(&near, &far)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct Arm {
+    pub edge: u32,
+    pub end: usize,
     /// Away from the junction, a unit vector.
-    out: Point,
+    pub out: Point,
     /// Metres from the way's line to its surface's edge, left and right of `out`.
-    half: [f64; 2],
-    /// Metres it runs straight.
-    straight: f64,
-    class: Class,
-    level: Level,
-    paved: bool,
+    pub half: [f64; 2],
+    pub class: Class,
+    pub level: Level,
+    pub paved: bool,
+    pub roundabout: bool,
+    /// How many lanes it has, if traffic goes but one way.
+    pub one_way: Option<u32>,
 }
 
-/// Metres a corner is rounded by, and markings kept back from it.
+/// Metres markings are kept back from where an arm's edges clear its neighbours'.
 pub(super) const CORNER: f64 = 3.0;
 /// The most a junction keeps markings back, metres: past it the arms run side
 /// by side and their edges never clear each other.
@@ -73,7 +230,13 @@ const MAX_CUT: f64 = 30.0;
 const ARM_LENGTH: f64 = 12.0;
 
 /// The ways must be in an order of their own (by id), which fixes the edges'.
+#[cfg(test)]
 pub(super) fn build(ways: &[Way]) -> Network {
+    build_at(ways, &|_| false)
+}
+
+/// `signals`, whether there are some at a node.
+pub(super) fn build_at(ways: &[Way], signals: &(impl Fn(i64) -> bool + Sync)) -> Network {
     // arms at each node: an end is one, a point within a way two
     let mut uses: FxHashMap<i64, u32> = FxHashMap::default();
     for way in ways.iter().filter(|w| w.profile.class.is_motor()) {
@@ -82,7 +245,19 @@ pub(super) fn build(ways: &[Way]) -> Network {
             *uses.entry(node).or_default() += if i == 0 || i == last { 1 } else { 2 };
         }
     }
-    let mut network = Network::default();
+    let mut shapes = shapes(ways);
+    let laid = merges::lay(ways, &mut shapes);
+    let merges: FxHashMap<i64, Merge> = (shapes.merges.iter())
+        .filter(|m| m.kept.is_some())
+        .map(|m| (m.node, m.clone()))
+        .collect();
+    let parts: FxHashSet<i64> = shapes.merges.iter().map(|m| m.node).collect();
+    let mut network = Network {
+        shapes,
+        patches: laid.patches,
+        paint: laid.paint,
+        ..Default::default()
+    };
     let mut edges: Vec<Edge> = Vec::new();
     let mut arms: FxHashMap<i64, Vec<Arm>> = FxHashMap::default();
     let mut order = Vec::new();
@@ -100,8 +275,21 @@ pub(super) fn build(ways: &[Way]) -> Network {
             let points = from..to + 1;
             for (end, node) in [(0, way.nodes[from]), (1, way.nodes[to])] {
                 if uses[&node] >= 2 {
-                    let arm = arm(way, edge, end, &points);
                     let at = if end == 0 { from } else { to };
+                    let section = network.shapes.tapered(index as u32).map(|shape| {
+                        // at a junction as its mouth has it
+                        let s = if at == 0 {
+                            network.shapes.mouth(index as u32, 0)
+                        } else if at == last {
+                            shape.length - network.shapes.mouth(index as u32, 1)
+                        } else {
+                            let before = geometry::lengths(&way.points[..=at], way.scale, 0.0);
+                            before[at]
+                        };
+                        network.shapes.at(ways, index as u32, s).surface
+                    });
+                    let surface = section.unwrap_or(way.profile.surface());
+                    let arm = arm(way, surface, edge, end, &points);
                     let list = arms.entry(node).or_default();
                     if list.is_empty() {
                         order.push((node, way.points[at], way.scale));
@@ -113,24 +301,47 @@ pub(super) fn build(ways: &[Way]) -> Network {
                 way: index as u32,
                 points,
                 cut: [0.0; 2],
+                inner: false,
             });
             from = to;
         }
     }
-    for (node, at, scale) in order {
-        let arms = &arms[&node];
-        network.patches.extend(wedges(arms, at, scale));
-        if uses[&node] < 3 {
-            continue;
-        }
-        for (edge, end, cut) in cuts(arms) {
+    // each node's patches, and its arms' cuts
+    type Met = (Vec<Patch>, Vec<(u32, usize, f64)>);
+    let met: Vec<Met> = (order.par_iter())
+        .map(|&(node, at, scale)| {
+            let arms = &arms[&node];
+            let merge = merges.get(&node);
+            let mut patches = match merge {
+                Some(merge) => parted(ways, &edges, arms, merge, at, scale),
+                None => wedges(arms, at, scale),
+            };
+            if uses[&node] < 3 {
+                return (patches, Vec::new());
+            }
+            let shapes = &network.shapes;
+            let fills = junctions::fills(ways, shapes, &edges, arms, (at, scale), merge.is_some());
+            patches.extend(fills);
+            (patches, cuts(arms, merge.is_some(), signals(node)))
+        })
+        .collect();
+    for ((node, ..), (patches, cuts)) in order.iter().zip(met) {
+        network.patches.extend(patches);
+        for (edge, end, cut) in cuts {
             edges[edge as usize].cut[end] = cut;
         }
-        network.junctions += 1;
-        network.junction_nodes.insert(node);
-        network.patches.extend(corners(arms, at, scale));
+        if uses[node] >= 3 {
+            network.junction_nodes.insert(*node);
+        }
     }
+    let one = junctions::cluster(ways, &mut edges, &arms, &order, &parts);
+    network.patches.extend(one.patches);
+    network.junctions = one.junctions;
+    network.clusters = one.clusters;
+    network.junction_of = one.of;
     network.runs = runs(&edges);
+    network.run_from = run_from(ways, &network.runs);
+    network.dashes = Dashes::new(ways, &network.runs, &network.run_from, &network.shapes);
     #[cfg(test)]
     {
         network.edges = edges;
@@ -146,7 +357,8 @@ fn runs(edges: &[Edge]) -> Vec<Edge> {
                 if run.way == edge.way
                     && run.points.end == edge.points.start + 1
                     && run.cut[1] == 0.0
-                    && edge.cut[0] == 0.0 =>
+                    && edge.cut[0] == 0.0
+                    && !(run.inner || edge.inner) =>
             {
                 run.points.end = edge.points.end;
                 run.cut[1] = edge.cut[1];
@@ -157,26 +369,37 @@ fn runs(edges: &[Edge]) -> Vec<Edge> {
     out
 }
 
-fn arm(way: &Way, edge: u32, end: usize, points: &std::ops::Range<usize>) -> Arm {
+/// Metres along its way that each run begins.
+fn run_from(ways: &[Way], runs: &[Edge]) -> Vec<f64> {
+    let mut out: Vec<f64> = Vec::with_capacity(runs.len());
+    for (i, run) in runs.iter().enumerate() {
+        let way = &ways[run.way as usize];
+        let (mut from, mut after) = (0, 0.0);
+        if let Some(last) = i.checked_sub(1).filter(|&k| runs[k].way == run.way) {
+            (from, after) = (runs[last].points.start, out[last]);
+        }
+        let between = &way.points[from..=run.points.start];
+        let lengths = geometry::lengths(between, way.scale, after);
+        out.push(lengths[lengths.len() - 1]);
+    }
+    out
+}
+
+fn arm(
+    way: &Way,
+    surface: [f64; 2],
+    edge: u32,
+    end: usize,
+    points: &std::ops::Range<usize>,
+) -> Arm {
     let run = &way.points[points.clone()];
     let outward: Vec<Point> = if end == 0 {
         run.to_vec()
     } else {
         run.iter().rev().copied().collect()
     };
-    let start = outward[0];
-    let far = outward
-        .iter()
-        .find(|p| distance(start, **p) >= ARM_LENGTH * way.scale)
-        .or(outward.last())
-        .copied()
-        .unwrap_or(start);
-    let length = distance(start, far).max(f64::MIN_POSITIVE);
-    let out = [(far[0] - start[0]) / length, (far[1] - start[1]) / length];
-    let (left, right) = (
-        way.profile.width / 2.0 - way.profile.centre,
-        way.profile.width / 2.0 + way.profile.centre,
-    );
+    let out = leaving(&outward, way.scale);
+    let (left, right) = (-surface[0], surface[1]);
     Arm {
         edge,
         end,
@@ -186,17 +409,55 @@ fn arm(way: &Way, edge: u32, end: usize, points: &std::ops::Range<usize>) -> Arm
         } else {
             [right.max(0.0), left.max(0.0)]
         },
-        straight: straight(&outward, out, way.scale),
         class: way.profile.class,
         level: way.profile.level,
         paved: way.profile.paved,
+        roundabout: way.profile.roundabout,
+        one_way: (way.profile.lanes.as_ref())
+            .filter(|l| l.along != l.against)
+            .map(|l| l.forward + l.backward),
+    }
+}
+
+/// The direction a line leaves its first point in.
+pub(super) fn leaving(outward: &[Point], scale: f64) -> Point {
+    let start = outward[0];
+    let far = outward
+        .iter()
+        .find(|p| distance(start, **p) >= ARM_LENGTH * scale)
+        .or(outward.last())
+        .copied()
+        .unwrap_or(start);
+    let length = distance(start, far).max(f64::MIN_POSITIVE);
+    [(far[0] - start[0]) / length, (far[1] - start[1]) / length]
+}
+
+/// Metres along an arm (which way it leaves, and its halves) that it takes to
+/// clear another.
+pub(super) fn clear((out, half): (Point, [f64; 2]), (other, theirs): (Point, [f64; 2])) -> f64 {
+    // World y grows southwards, so a positive cross is clockwise: right.
+    let cross = out[0] * other[1] - out[1] * other[0];
+    let dot = out[0] * other[0] + out[1] * other[1];
+    let (own, facing) = if cross > 0.0 {
+        (half[1], theirs[0])
+    } else {
+        (half[0], theirs[1])
+    };
+    if cross.abs() > 1e-6 {
+        (own * dot + facing) / cross.abs()
+    } else if dot > 0.0 {
+        MAX_CUT
+    } else {
+        0.0
     }
 }
 
 /// How far each arm's markings stop from the node: where its edges clear its
 /// neighbours', and the corner's rounding. A driveway does not break the
-/// markings of the road it opens onto.
-fn cuts(arms: &[Arm]) -> Vec<(u32, usize, f64)> {
+/// markings of the road it opens onto, nor, where there are no `signals`, a small
+/// road those of a one-way road it joins; and those of roads that part (`merged`)
+/// go on.
+fn cuts(arms: &[Arm], merged: bool, signals: bool) -> Vec<(u32, usize, f64)> {
     let mut cuts = Vec::with_capacity(arms.len());
     for (i, arm) in arms.iter().enumerate() {
         let others: Vec<&Arm> = arms
@@ -207,28 +468,14 @@ fn cuts(arms: &[Arm]) -> Vec<(u32, usize, f64)> {
             })
             .map(|(_, other)| other)
             .collect();
-        if others.len() < 2 {
+        let goes_on = merged && arm.class != Class::Service;
+        if others.len() < 2 || goes_on || (!signals && passes(arm, &others)) {
             cuts.push((arm.edge, arm.end, 0.0));
             continue;
         }
         let mut cut = 0.0_f64;
         for other in others {
-            // World y grows southwards, so a positive cross is clockwise: right.
-            let cross = arm.out[0] * other.out[1] - arm.out[1] * other.out[0];
-            let dot = arm.out[0] * other.out[0] + arm.out[1] * other.out[1];
-            let (own, facing) = if cross > 0.0 {
-                (arm.half[1], other.half[0])
-            } else {
-                (arm.half[0], other.half[1])
-            };
-            let clear = if cross.abs() > 1e-6 {
-                (own * dot + facing) / cross.abs()
-            } else if dot > 0.0 {
-                MAX_CUT
-            } else {
-                0.0
-            };
-            cut = cut.max(clear);
+            cut = cut.max(clear((arm.out, arm.half), (other.out, other.half)));
         }
         let cut = if cut > 0.0 { cut + CORNER } else { 0.0 };
         cuts.push((arm.edge, arm.end, cut.min(MAX_CUT)));
@@ -236,31 +483,125 @@ fn cuts(arms: &[Arm]) -> Vec<(u32, usize, f64)> {
     cuts
 }
 
-/// Metres `points` keep within half a metre of the line `out` from the first.
-fn straight(points: &[Point], out: Point, scale: f64) -> f64 {
-    let start = points[0];
-    let mut reach = 0.0;
-    for p in points {
-        let (dx, dy) = (p[0] - start[0], p[1] - start[1]);
-        let along = dx * out[0] + dy * out[1];
-        if (dx * out[1] - dy * out[0]).abs() > 0.5 * scale || along < reach {
-            break;
-        }
-        reach = along;
-    }
-    reach / scale
+/// Whether an arm is of a one-way road that goes on past a small one at its side.
+fn passes(arm: &Arm, others: &[&Arm]) -> bool {
+    let [a, b] = others else { return false };
+    let on = |o: &Arm| {
+        let ahead = arm.out[0] * o.out[0] + arm.out[1] * o.out[1] < -0.9;
+        ahead && (o.class, o.level, o.one_way) == (arm.class, arm.level, arm.one_way)
+    };
+    let small = |o: &Arm| matches!(o.class, Class::Minor | Class::LivingStreet);
+    arm.one_way.is_some()
+        && !arm.roundabout
+        && arm.class <= Class::Tertiary
+        && ((on(a) && small(b)) || (on(b) && small(a)))
 }
 
 const DISC_SEGMENTS: u32 = 16;
 
-/// A disc where arms of one level meet at a bend, as wide as the second widest
-/// of them: it fills the wedge outside the bend and stands out past no road
-/// that goes on.
+/// The wedge outside a bend where two roads follow each other, as far out as
+/// both are there: what a mitre takes in, or an arc of a sharper one.
+fn bend(a: &Arm, b: &Arm, at: Point, scale: f64) -> Option<Patch> {
+    let ahead = [-a.out[0], -a.out[1]];
+    let cross = ahead[0] * b.out[1] - ahead[1] * b.out[0];
+    let dot = ahead[0] * b.out[0] + ahead[1] * b.out[1];
+    // turning right, the wedge is on the left
+    let (side, half) = if cross > 0.0 {
+        (1.0, a.half[1].min(b.half[0]))
+    } else {
+        (-1.0, a.half[0].min(b.half[1]))
+    };
+    if half <= 0.0 {
+        return None;
+    }
+    let off = |d: Point| [d[1] * side, -d[0] * side];
+    let (from, to) = (off(ahead), off(b.out));
+    let place = |d: Point, by: f64| [at[0] + d[0] * by * scale, at[1] + d[1] * by * scale];
+    let mut ring = vec![at, place(from, half)];
+    if dot > 0.5 {
+        let sum = [from[0] + to[0], from[1] + to[1]];
+        let reach = 2.0 / (sum[0] * sum[0] + sum[1] * sum[1]);
+        ring.push(place(sum, reach * half));
+    } else {
+        let (start, turn) = (from[1].atan2(from[0]), cross.atan2(dot));
+        ring.extend((1..WEDGE_SEGMENTS).map(|k| {
+            let (s, c) = (start + turn * f64::from(k) / f64::from(WEDGE_SEGMENTS)).sin_cos();
+            place([c, s], half)
+        }));
+    }
+    ring.push(place(to, half));
+    // wound as the ribbons are
+    if side < 0.0 {
+        ring.reverse();
+    }
+    Some(Patch {
+        ring,
+        level: a.level,
+        paved: a.paved,
+    })
+}
+
+const WEDGE_SEGMENTS: u32 = 8;
+
+/// The wedges outside the bends from a road that parts to each of its arms, out
+/// to its edges and to where the arms meet.
+fn parted(
+    ways: &[Way],
+    edges: &[Edge],
+    arms: &[Arm],
+    merge: &Merge,
+    at: Point,
+    scale: f64,
+) -> Vec<Patch> {
+    // as they leave the node: their ends are square to that
+    let [wide, left, right] = merge.ends.map(|(way, end)| {
+        let arm = arms
+            .iter()
+            .find(|a| (edges[a.edge as usize].way, a.end) == (way, end))?;
+        let points = &ways[way as usize].points;
+        let last = points.len() - 1;
+        let inner = points[if end == 0 { 1 } else { last - 1 }];
+        let length = distance(inner, at).max(f64::MIN_POSITIVE);
+        Some(Arm {
+            out: [(inner[0] - at[0]) / length, (inner[1] - at[1]) / length],
+            ..arm.clone()
+        })
+    });
+    let wedge = |arm: Option<Arm>| {
+        let (a, b) = (wide.as_ref()?, arm?);
+        let alike = (a.level, a.paved) == (b.level, b.paved);
+        let opposite = a.out[0] * b.out[0] + a.out[1] * b.out[1] < -0.99999;
+        (alike && !opposite)
+            .then(|| bend(a, &b, at, scale))
+            .flatten()
+    };
+    [wedge(left), wedge(right)].into_iter().flatten().collect()
+}
+
+/// Where but two roads meet, the wedge outside their bend. Else, where the arms are
+/// not of one kind and on the ground (there junctions are filled), of each a disc
+/// as wide as the second widest of them: it fills the wedge outside a bend and
+/// stands out past no road that goes on.
 fn wedges(arms: &[Arm], at: Point, scale: f64) -> Vec<Patch> {
+    let roads: Vec<&Arm> = arms.iter().filter(|a| a.class != Class::Service).collect();
+    let two = match (&roads[..], arms) {
+        ([a, b], _) => Some((*a, *b)),
+        (_, [a, b]) => Some((a, b)),
+        _ => None,
+    };
+    if let Some((a, b)) = two {
+        let alike = (a.level, a.paved) == (b.level, b.paved);
+        let opposite = a.out[0] * b.out[0] + a.out[1] * b.out[1] < -0.99999;
+        let found = (alike && !opposite).then(|| bend(a, b, at, scale));
+        return found.flatten().into_iter().collect();
+    }
     let mut kinds: Vec<(Level, bool)> = arms.iter().map(|a| (a.level, a.paved)).collect();
     kinds.sort_unstable();
     kinds.dedup();
     let mut patches = Vec::new();
+    if let [(Level::Ground, _)] = kinds[..] {
+        return patches;
+    }
     for (level, paved) in kinds {
         let mut alike: Vec<&Arm> = arms
             .iter()
@@ -284,88 +625,6 @@ fn wedges(arms: &[Arm], at: Point, scale: f64) -> Vec<Patch> {
         patches.push(Patch { ring, level, paved });
     }
     patches
-}
-
-/// Angles between two arms, radians, outside which their corner is not rounded:
-/// side by side they have none, and nearly in line it is none to speak of.
-const CORNER_ANGLES: std::ops::RangeInclusive<f64> = 0.45..=2.8;
-/// The furthest from its point a rounded corner may begin, metres.
-const MAX_TANGENT: f64 = 12.0;
-const CORNER_SEGMENTS: u32 = 5;
-
-/// The rounded corners between each arm and the next one clockwise, where both
-/// are on the ground and alike.
-fn corners(arms: &[Arm], at: Point, scale: f64) -> Vec<Patch> {
-    let angle = |arm: &Arm| arm.out[1].atan2(arm.out[0]);
-    let mut order: Vec<&Arm> = arms.iter().filter(|a| a.level == Level::Ground).collect();
-    order.sort_by(|a, b| angle(a).total_cmp(&angle(b)).then(a.edge.cmp(&b.edge)));
-    let mut corners = Vec::new();
-    if order.len() < 2 {
-        return corners;
-    }
-    for (i, a) in order.iter().enumerate() {
-        let b = order[(i + 1) % order.len()];
-        if a.paved != b.paved {
-            continue;
-        }
-        let between = (angle(b) - angle(a)).rem_euclid(std::f64::consts::TAU);
-        if !CORNER_ANGLES.contains(&between) {
-            continue;
-        }
-        let small = a.class == Class::Service || b.class == Class::Service;
-        let radius = if small { CORNER / 2.0 } else { CORNER };
-        // World y grows southwards, so clockwise is to the right: a's right
-        // edge faces b's left.
-        let (sin, cos) = between.sin_cos();
-        let (ha, hb) = (a.half[1], b.half[0]);
-        let (sa, sb) = ((hb + ha * cos) / sin, (ha + hb * cos) / sin);
-        let tangent = radius / (between / 2.0).tan();
-        if tangent > MAX_TANGENT || sa + tangent > a.straight || sb + tangent > b.straight {
-            continue;
-        }
-        let point = |along: &Arm, s: f64, side: Point, h: f64| {
-            [
-                at[0] + (along.out[0] * s + side[0] * h) * scale,
-                at[1] + (along.out[1] * s + side[1] * h) * scale,
-            ]
-        };
-        let right = [-a.out[1], a.out[0]];
-        let left = [b.out[1], -b.out[0]];
-        let (from, to) = (
-            point(a, sa + tangent, right, ha),
-            point(b, sb + tangent, left, hb),
-        );
-        // the arc's centre lies on the bisector, its radius off both edges
-        let centre = [
-            from[0] + right[0] * radius * scale,
-            from[1] + right[1] * radius * scale,
-        ];
-        let mut ring = vec![at, from];
-        let start = (from[1] - centre[1]).atan2(from[0] - centre[0]);
-        let turn = {
-            let end = (to[1] - centre[1]).atan2(to[0] - centre[0]);
-            let turn = (end - start).rem_euclid(std::f64::consts::TAU);
-            if turn > std::f64::consts::PI {
-                turn - std::f64::consts::TAU
-            } else {
-                turn
-            }
-        };
-        for k in 1..CORNER_SEGMENTS {
-            let (s, c) = (start + turn * f64::from(k) / f64::from(CORNER_SEGMENTS)).sin_cos();
-            ring.push([
-                centre[0] + c * radius * scale,
-                centre[1] + s * radius * scale,
-            ]);
-        }
-        ring.push(to);
-        corners.push(Patch {
-            ring,
-            level: Level::Ground,
-            paved: a.paved,
-        });
-    }
-    corners
 }
 
 pub(super) fn distance(a: Point, b: Point) -> f64 {
@@ -482,21 +741,20 @@ mod tests {
         // two corners: none along the straight side
         assert_eq!(n.patches.len(), 2);
         for corner in &n.patches {
-            let [from, to] = [corner.ring[1], corner.ring[corner.ring.len() - 1]];
-            // the edges are 3.5 m off each line, the arc begins 3 m further out
-            let ends = [from, to].map(|p| [p[0].abs(), p[1].abs()]);
-            assert!(
-                ends.iter().any(|p| distance(*p, [6.5, 3.5]) < 1e-9),
-                "{ends:?}"
-            );
-            assert!(
-                ends.iter().any(|p| distance(*p, [3.5, 6.5]) < 1e-9),
-                "{ends:?}"
-            );
-            for p in &corner.ring[1..] {
-                // within the corner's square, outside the arc's circle
-                assert!(p[1] >= 3.5 - 1e-9 && p[0].abs() >= 3.5 - 1e-9);
-                assert!(distance([p[0].abs(), p[1]], [6.5, 6.5]) > 3.0 - 1e-9);
+            // the edges are 3.5 m off each line, the arc begins 6 m further out
+            for end in [[9.5, 3.5], [3.5, 9.5]] {
+                let mut points = corner.ring.iter();
+                assert!(
+                    points.any(|p| distance([p[0].abs(), p[1]], end) < 1e-6),
+                    "{corner:?}"
+                );
+            }
+            for p in &corner.ring {
+                // within the corner's square, or a little under the arms, and outside the
+                // arc's circle
+                assert!(p[1] >= 3.5 - 0.31 && p[0].abs() >= 3.5 - 0.31);
+                let beside = p[1] < 3.4 || p[0].abs() < 3.4;
+                assert!(beside || distance([p[0].abs(), p[1]], [9.5, 9.5]) > 6.0 - 0.01);
             }
         }
         // wound as the ribbons are, so that the union adds it: with each arm's
@@ -508,12 +766,14 @@ mod tests {
         }
         let surface = super::super::geometry::union(&shapes);
         assert_eq!((surface.len(), surface[0].len()), (1, 1));
-        // a short arm has no room for one
+        // a short arm has room for less
         let short = [
             way(PRIMARY, &[(1, -100.0, 0.0), (2, 0.0, 0.0), (3, 100.0, 0.0)]),
             way(PRIMARY, &[(2, 0.0, 0.0), (5, 0.0, 5.0)]),
         ];
-        assert!(build(&short).patches.is_empty());
+        let reach = build(&short).patches;
+        let far = reach.iter().flat_map(|p| &p.ring).map(|p| p[1]);
+        assert!((3.6..5.1).contains(&far.fold(0.0, f64::max)));
     }
 
     #[test]
@@ -528,18 +788,28 @@ mod tests {
             way(PRIMARY, &[(1, 0.0, 0.0), (2, 50.0, 0.0)]),
             way(wide, &[(2, 50.0, 0.0), (3, 80.0, 30.0)]),
         ];
-        let patches = build(&bent).patches;
-        assert_eq!(patches.len(), 1);
-        // as wide as the narrower road
-        assert!((distance(patches[0].ring[0], [50.0, 0.0]) - 3.5).abs() < 1e-9);
+        let n = build(&bent);
+        assert_eq!(n.patches.len(), 1);
+        // turning right the wedge is on the left, out to where the edges would
+        // meet, and fills the bend with no hole
+        let ring = &n.patches[0].ring;
+        assert!(ring.iter().any(|p| distance(*p, [50.0, -3.5]) < 1e-9));
+        let reach = 3.5 / (std::f64::consts::PI / 8.0).cos();
+        let far = ring.iter().map(|p| distance(*p, [50.0, 0.0]));
+        assert!((far.fold(0.0, f64::max) - reach).abs() < 1e-9, "{ring:?}");
+        let mut shapes = vec![vec![ring.clone()]];
+        shapes.extend(geometry::ribbon(&bent[0].points, 7.0));
+        shapes.extend(geometry::ribbon(&bent[1].points, 7.0));
+        let surface = geometry::union(&shapes);
+        assert_eq!((surface.len(), surface[0].len()), (1, 1));
     }
 
     #[test]
-    fn a_curved_arm_gets_no_corner() {
+    fn a_curved_arm_is_rounded_along_its_edges() {
         let curve: Vec<(i64, f64, f64)> = (0..10)
             .map(|k| {
-                let a = f64::from(k) * 0.3;
-                (10 + i64::from(k), 6.0 * a.sin(), 6.0 * (1.0 - a.cos()))
+                let a = f64::from(k) * 0.15;
+                (10 + i64::from(k), 30.0 * a.sin(), 30.0 * (1.0 - a.cos()))
             })
             .collect();
         let ways = [
@@ -548,7 +818,33 @@ mod tests {
         ];
         let n = build(&ways);
         assert_eq!(n.junctions, 1);
-        let discs = DISC_SEGMENTS as usize;
-        assert!(n.patches.iter().all(|p| p.ring.len() == discs));
+        assert_eq!(n.patches.len(), 2);
+        let mut shapes: Vec<Vec<Vec<Point>>> =
+            n.patches.iter().map(|c| vec![c.ring.clone()]).collect();
+        for w in &ways {
+            shapes.extend(geometry::ribbon(&w.points, w.profile.width));
+        }
+        let surface = geometry::union(&shapes);
+        assert_eq!((surface.len(), surface[0].len()), (1, 1));
+    }
+
+    #[test]
+    fn a_small_road_leaves_a_one_way_roads_markings_alone() {
+        let one_way = &[("highway", "primary"), ("oneway", "yes"), ("lanes", "2")][..];
+        let side = |class: &'static str| {
+            let ways = [
+                way(one_way, &[(1, -100.0, 0.0), (2, 0.0, 0.0)]),
+                way(one_way, &[(2, 0.0, 0.0), (3, 100.0, 0.0)]),
+                way(&[("highway", class)], &[(2, 0.0, 0.0), (4, 0.0, 60.0)]),
+            ];
+            let n = build(&ways);
+            let signalled = build_at(&ways, &|node| node == 2);
+            assert!(signalled.edges[0].cut[1] > 5.0);
+            (n.edges[0].cut[1], n.edges[1].cut[0], n.edges[2].cut[0])
+        };
+        let small = side("residential");
+        assert!(small.0 == 0.0 && small.1 == 0.0 && small.2 > 5.0);
+        let large = side("tertiary");
+        assert!(large.0 > 5.0 && large.1 > 5.0 && large.2 > 5.0);
     }
 }

@@ -102,8 +102,19 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
                     let geometry = feature.geometry().unwrap();
                     // a crossing, a line to stop at and an arrow are whole
                     let whole = ["zebra", "dots", "crossing", "stop", "signal"].contains(kind)
-                        || ["give_way", "arrow", "arrow-head"].contains(kind);
-                    let past = if whole { 800 } else { 64 };
+                        || ["give_way", "arrow", "arrow-head", "merge", "gore"].contains(kind)
+                        || ["guide", "disc", "pitch", "runway-bar", "hump", "bicycle"]
+                            .contains(kind)
+                        || ["sharrow", "bus-text"].contains(kind);
+                    // a dashed line begins where a dash does
+                    let line = ["lane", "centre"].contains(kind);
+                    let past = if whole {
+                        800
+                    } else if line {
+                        128
+                    } else {
+                        64
+                    };
                     let reach = |v: i32| (-past..=4096 + past).contains(&v);
                     assert!(
                         geometry.coords_iter().all(|c| reach(c.x) && reach(c.y)),
@@ -122,7 +133,10 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
                         markings += 1;
                         let head = matches!(geometry, Geometry::Polygon(_));
                         assert!(head || matches!(geometry, Geometry::LineString(_)));
-                        assert_eq!(head, *kind == "arrow-head");
+                        assert_eq!(
+                            head,
+                            ["arrow-head", "disc", "runway-bar", "hump"].contains(kind)
+                        );
                     }
                 }
             }
@@ -133,7 +147,7 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
     let x = |lon: f64| ((lon + 180.0) / 360.0 * n) as u32;
     let y =
         |lat: f64| ((1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n) as u32;
-    let mut roads = 0;
+    let (mut roads, mut fences, mut things) = (0, 0, 0);
     for tx in x(header.min_longitude) - 1..=x(header.max_longitude) + 1 {
         for ty in y(header.max_latitude) - 1..=y(header.min_latitude) + 1 {
             let coord = TileCoord::new(15, tx, ty).unwrap();
@@ -145,10 +159,24 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
             GzDecoder::new(&bytes[..]).read_to_end(&mut raw).unwrap();
             let tile = MvtReaderRef::new(&raw).unwrap();
             for layer in tile.layers() {
-                assert_eq!((layer.name(), layer.extent()), ("road", 8192));
+                assert_eq!(layer.extent(), 8192);
                 for feature in layer.features() {
                     let properties: BTreeMap<_, _> =
                         feature.properties_vec().unwrap().into_iter().collect();
+                    if layer.name() != "road" {
+                        let geometry = feature.geometry().unwrap();
+                        let within = |v: i32| (0..=8192).contains(&v);
+                        assert!(geometry.coords_iter().all(|c| within(c.x) && within(c.y)));
+                        assert!(properties.contains_key("kind"));
+                        if layer.name() == "fence" {
+                            assert!(properties.contains_key("height"));
+                            fences += 1;
+                        } else {
+                            assert_eq!(layer.name(), "thing");
+                            things += 1;
+                        }
+                        continue;
+                    }
                     let Some(MvtValueRef::String(lanes)) = properties.get("lanes") else {
                         panic!("a road without lanes");
                     };
@@ -204,7 +232,34 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
                     match feature.geometry().unwrap() {
                         Geometry::LineString(_) => {
                             pieces += 1;
+                            for end in ["0", "1"] {
+                                let has = |key: &str| {
+                                    properties.contains_key(format!("{key}{end}").as_str())
+                                };
+                                let tapers = has("taper");
+                                assert!(has("width") == tapers && has("centre") == tapers);
+                                let name = format!("bare{end}");
+                                let lines = properties.get("lines");
+                                if let (
+                                    Some(MvtValueRef::String(bare)),
+                                    Some(MvtValueRef::String(lines)),
+                                ) = (properties.get(name.as_str()), lines)
+                                {
+                                    let count = |s: &str| s.split(',').count();
+                                    assert_eq!(count(bare), count(lines));
+                                }
+                            }
                             group.0.push(uint("piece").unwrap());
+                            if let Some(MvtValueRef::String(gaps)) = properties.get("gaps") {
+                                let mut last = -1.0;
+                                for gap in gaps.split(',') {
+                                    let (from, to) = gap.split_once('-').unwrap();
+                                    let (from, to): (f64, f64) =
+                                        (from.parse().unwrap(), to.parse().unwrap());
+                                    assert!(from > last && to > from, "{gaps}");
+                                    last = to;
+                                }
+                            }
                         }
                         Geometry::Point(_) => {
                             crossings += 1;
@@ -228,6 +283,8 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
     }
     assert!(pieces > 10 && crossings > 5, "{pieces} {crossings}");
     assert!(roads > report.ways / 3 && portals > 5, "{roads} {portals}");
+    assert!(fences > 50 && things > 200, "{fences} {things}");
+    assert_eq!((fences, things), (report.fences, report.things));
     assert_eq!(
         (groups, pieces, crossings, barriers),
         (
@@ -244,6 +301,10 @@ async fn every_polygon_is_valid_and_every_marking_is_within_its_tile() {
     for kind in [
         "surface road",
         "surface sidewalk",
+        "surface footway",
+        "surface steps",
+        "surface pedestrian",
+        "marking step",
         "marking lane",
         "marking centre",
         "marking zebra",

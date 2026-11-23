@@ -1,8 +1,16 @@
 //! What is painted on a road besides its lanes' lines: crossings, the lines
-//! traffic stops at, and arrows. Only what the tags say is there.
+//! traffic stops at, and arrows. Only what the tags say is there, and of what
+//! would lie on one another only the first of crossings, lines traffic stops
+//! at, gores, arrows, merges' lines (`merges.rs`), guides (`junctions.rs`) and
+//! lanes' (`paint.rs`).
 
+use super::country::{GiveWay, Rules, Signalled};
+use super::furniture::{Area, AreaKind, ring};
+use super::junctions;
+use super::lanes::Section;
 use super::network::{Network, Point, Way, distance};
-use super::profile::{Class, Turn};
+use super::paint::{Block, Taken};
+use super::profile::{Class, Lanes, Turn};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,10 +21,29 @@ pub(super) enum Kind {
     /// Two lines across the road.
     Lines,
     Stop,
-    /// Where traffic stops at a signal.
+    /// Where traffic stops at a signal, and where that is a line of bars.
     Signal,
+    SignalDashed,
     GiveWay,
+    /// Where traffic gives way, as triangles: the line across is not painted.
+    Triangles,
     Arrow,
+    /// A chevron between roads that part.
+    Gore,
+    /// A bar of the line between them, and of one between directions.
+    Merge,
+    Centre,
+    /// A bar of the line between lanes that turn side by side.
+    Guide,
+    /// A mini roundabout's middle.
+    Disc,
+    /// What is painted in a cycle lane, and in a lane cyclists share.
+    Bicycle,
+    Sharrow,
+    /// "BUS", in a bus lane.
+    BusText,
+    /// The triangles on a hump's ramp.
+    Hump,
 }
 
 impl Kind {
@@ -26,9 +53,19 @@ impl Kind {
             Self::Dots => "dots",
             Self::Lines => "crossing",
             Self::Stop => "stop",
-            Self::Signal => "signal",
+            Self::Signal | Self::SignalDashed => "signal",
             Self::GiveWay => "give_way",
+            Self::Triangles => "give_way-tri",
             Self::Arrow => "arrow",
+            Self::Gore => "gore",
+            Self::Merge => "merge",
+            Self::Centre => "centre",
+            Self::Guide => "guide",
+            Self::Disc => "disc",
+            Self::Bicycle => "bicycle",
+            Self::Sharrow => "sharrow",
+            Self::BusText => "bus-text",
+            Self::Hump => "hump",
         }
     }
 
@@ -37,15 +74,43 @@ impl Kind {
         match self {
             Self::Zebra => ZEBRA,
             Self::Dots | Self::Stop | Self::GiveWay => 0.5,
-            Self::Signal => 0.4,
+            Self::Signal | Self::SignalDashed | Self::Gore => 0.4,
+            Self::Triangles => TRIANGLE[1],
             Self::Lines => 0.3,
             Self::Arrow => 0.25,
+            Self::Merge => 0.24,
+            Self::Centre | Self::Guide => 0.12,
+            Self::Bicycle | Self::Sharrow => 0.1,
+            Self::BusText => 0.15,
+            Self::Disc | Self::Hump => 0.0,
         }
     }
 
     /// Metres of paint and of gap along its strokes, if they are dashed.
     pub(super) fn dash(self) -> Option<(f64, f64)> {
-        matches!(self, Self::Zebra | Self::Dots | Self::GiveWay).then_some((BAR, BAR))
+        match self {
+            Self::Zebra | Self::Dots | Self::GiveWay | Self::SignalDashed => Some((BAR, BAR)),
+            Self::Triangles => Some((TRIANGLE[0], TRIANGLE[2])),
+            _ => None,
+        }
+    }
+
+    /// What gives way to what: the lower stays.
+    pub(super) fn rank(self) -> u8 {
+        match self {
+            Self::Zebra | Self::Dots | Self::Lines => 0,
+            Self::Stop | Self::Signal | Self::SignalDashed | Self::GiveWay | Self::Triangles => 1,
+            Self::Gore | Self::Disc | Self::Hump => 2,
+            Self::Arrow => 3,
+            Self::Merge | Self::Centre => 4,
+            Self::Guide => 5,
+            Self::Bicycle | Self::Sharrow | Self::BusText => 6,
+        }
+    }
+
+    /// Whether it is one of many in a row, left out where it gives way, whole.
+    pub(super) fn in_a_row(self) -> bool {
+        matches!(self, Self::Gore | Self::Merge | Self::Centre | Self::Guide)
     }
 }
 
@@ -73,6 +138,8 @@ pub(super) enum Sign {
     /// `None` if its marking is not tagged.
     Crossing(Option<Marking>),
     Line(Kind, Facing),
+    /// A mini roundabout.
+    Mini,
 }
 
 /// One painted thing, in world units.
@@ -84,9 +151,11 @@ pub(super) struct Detail {
     pub confidence: u8,
     /// Where on its way's line it is.
     pub at: Point,
+    /// What it takes of the road, gaps between its bars too.
+    pub block: Block,
     pub strokes: Vec<Vec<Point>>,
-    /// Triangles.
-    pub heads: Vec<[Point; 3]>,
+    /// Convex rings: an arrow's heads, a disc.
+    pub heads: Vec<Vec<Point>>,
 }
 
 #[derive(Default)]
@@ -95,10 +164,19 @@ pub(super) struct Details {
     /// The stretches of each of the network's runs, metres along it, that hold
     /// no lanes' lines. Its ends' cuts are not among them.
     pub gaps: Vec<Vec<[f64; 2]>>,
+    /// Where lanes' lines give way to the list.
+    pub taken: Taken,
+    /// The islands in the middle of crossings.
+    pub refuges: Vec<Area>,
 }
 
 /// Metres of a bar and of the gap between bars.
 const BAR: f64 = 0.5;
+/// Metres across a triangle where traffic gives way, from its base to its tip, and
+/// between two (P-13's and MUTCD's yield line's are near these).
+const TRIANGLE: [f64; 3] = [0.5, 0.6, 0.3];
+/// Metres either side of a double line's middle that its lines are.
+const DOUBLE: f64 = 0.45;
 /// Metres a zebra takes along the road, the dots' and lines' from row to row.
 const ZEBRA: f64 = 4.0;
 const ROWS: f64 = 2.5;
@@ -107,6 +185,12 @@ const ROWS: f64 = 2.5;
 const CLEAR: f64 = 0.6;
 const STOP_BACK: f64 = 1.5;
 const TO_JUNCTION: f64 = 12.0;
+/// Metres across a road with an island in the middle of a crossing, at the least; and
+/// left of it either side of the island, the metres this is across, and along.
+const REFUGE_ROAD: f64 = 6.0;
+const BESIDE_REFUGE: f64 = 2.5;
+const REFUGE: [f64; 2] = [1.0, 2.0];
+const REFUGE_LENGTH: f64 = 6.0;
 /// Metres past a crossing a stop may be mapped that belongs before it.
 const PAST: f64 = 10.0;
 /// Metres apart two lines are one.
@@ -119,6 +203,18 @@ const ARROW_BACK: f64 = 6.0;
 const ARROW: f64 = 5.0;
 const ARROW_EVERY: f64 = 30.0;
 const ARROWS: u32 = 3;
+/// How much longer arrows are, and further apart, on a fast road; km/h up to
+/// which one is not.
+const FAST: f64 = 1.5;
+const SLOW: f64 = 60.0;
+/// Metres an arrow keeps from its lane's edges, so that in a bend it does not
+/// take its lines.
+const ARROW_ROOM: f64 = 0.4;
+/// Metres across the narrowest lane that has one.
+const NARROWEST: f64 = 2.2;
+/// Metres on, along plain road, that something must need the lanes for a run's
+/// arrows to lead up to it.
+const AHEAD: f64 = 150.0;
 
 /// How the tags of a crossing, node or way, say it is marked.
 pub(super) fn marking<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Marking> {
@@ -154,6 +250,7 @@ pub(super) fn sign<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Sign> {
         "stop" => Kind::Stop,
         "give_way" => Kind::GiveWay,
         "traffic_signals" => Kind::Signal,
+        "mini_roundabout" => return Some(Sign::Mini),
         _ => return None,
     };
     let facing = match get("traffic_signals:direction").or_else(|| get("direction")) {
@@ -165,29 +262,99 @@ pub(super) fn sign<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Sign> {
     Some(Sign::Line(kind, facing))
 }
 
+/// Whether traffic may go faster than `SLOW` where the limit is tagged.
+pub(super) fn fast<'a>(get: impl Fn(&str) -> Option<&'a str>) -> bool {
+    let Some(limit) = get("maxspeed").map(str::trim) else {
+        return false;
+    };
+    if let Some((_, zone)) = limit.split_once(':') {
+        return matches!(zone, "rural" | "trunk" | "motorway");
+    }
+    let (number, mile) = match limit.strip_suffix("mph") {
+        Some(number) => (number, 1.609_344),
+        None => (limit.strip_suffix("km/h").unwrap_or(limit), 1.0),
+    };
+    limit == "none"
+        || number
+            .trim()
+            .parse::<f64>()
+            .is_ok_and(|v| v * mile > SLOW && v.is_finite())
+}
+
+/// Metres right of the way's line that traffic along a run (`along`) or against
+/// it takes, `s` metres along the run.
+fn span_at(walk: &Walk, s: f64, along: bool) -> [f64; 2] {
+    walk.section(s).span(lanes_of(walk.way), along)
+}
+
+/// Metres right of the way's line of the surface's edges, `s` metres along the
+/// run.
+fn surface_at(walk: &Walk, s: f64) -> [f64; 2] {
+    walk.section(s).surface
+}
+
+/// Metres right of the way's line of each lane of one direction, from its
+/// drivers' left, `s` metres along the run.
+pub(super) fn lanes_at(walk: &Walk, s: f64, along: bool) -> Vec<[f64; 2]> {
+    let lanes = lanes_of(walk.way);
+    let section = walk.section(s);
+    let of = lanes.of(along);
+    let mut out: Vec<[f64; 2]> = of
+        .map(|i| [section.lanes[i], section.lanes[i + 1]])
+        .collect();
+    if !along {
+        out.reverse();
+    }
+    out
+}
+
+fn lanes_of(way: &Way) -> &Lanes {
+    way.profile.lanes.as_ref().expect("a motor road's")
+}
+
 /// A run as it is walked: its points and the metres along it of each.
-struct Walk<'a> {
+pub(super) struct Walk<'a> {
+    ways: &'a [Way],
+    network: &'a Network,
+    index: usize,
     way: &'a Way,
     points: &'a [Point],
     along: Vec<f64>,
 }
 
 impl<'a> Walk<'a> {
-    fn new(way: &'a Way, points: std::ops::Range<usize>) -> Self {
-        let points = &way.points[points];
+    pub(super) fn new(ways: &'a [Way], network: &'a Network, index: usize) -> Self {
+        let run = &network.runs[index];
+        let way = &ways[run.way as usize];
+        let points = &way.points[run.points.clone()];
         let mut along = vec![0.0];
         for p in points.windows(2) {
             along.push(along[along.len() - 1] + distance(p[0], p[1]) / way.scale);
         }
-        Self { way, points, along }
+        Self {
+            ways,
+            network,
+            index,
+            way,
+            points,
+            along,
+        }
     }
 
-    fn length(&self) -> f64 {
+    fn section(&self, s: f64) -> Section {
+        self.network.at(self.ways, self.index, s)
+    }
+
+    pub(super) fn way(&self) -> &'a Way {
+        self.way
+    }
+
+    pub(super) fn length(&self) -> f64 {
         self.along[self.along.len() - 1]
     }
 
     /// The point `at` metres along, and the direction there.
-    fn at(&self, at: f64) -> (Point, Point) {
+    pub(super) fn at(&self, at: f64) -> (Point, Point) {
         let last = self.points.len() - 1;
         let k = self.along.partition_point(|&a| a < at).clamp(1, last);
         let (a, b) = (self.points[k - 1], self.points[k]);
@@ -202,7 +369,7 @@ impl<'a> Walk<'a> {
 
     /// The direction over a few metres about `at`: a node in a bend has none of
     /// its own.
-    fn direction(&self, at: f64, reach: f64) -> Point {
+    pub(super) fn direction(&self, at: f64, reach: f64) -> Point {
         let (a, b) = (
             self.at((at - reach).max(0.0)).0,
             self.at((at + reach).min(self.length())).0,
@@ -218,7 +385,7 @@ impl<'a> Walk<'a> {
 
 /// `x` metres right and `y` ahead of `at`, facing `direction` (y grows
 /// southwards).
-fn place(at: Point, direction: Point, scale: f64, [x, y]: [f64; 2]) -> Point {
+pub(super) fn place(at: Point, direction: Point, scale: f64, [x, y]: [f64; 2]) -> Point {
     [
         at[0] + (direction[0] * y - direction[1] * x) * scale,
         at[1] + (direction[1] * y + direction[0] * x) * scale,
@@ -234,13 +401,17 @@ struct Crossing {
 }
 
 /// `signs` by node; `crossings`, the nodes of ways that cross, with how they
-/// are marked.
+/// are marked; `islands`, those of crossings with an island; `fast`, the ids of the
+/// ways on which arrows are longer.
 pub(super) fn build(
     ways: &[Way],
     network: &Network,
     signs: &FxHashMap<i64, Sign>,
     crossings: &FxHashMap<i64, Marking>,
+    islands: &FxHashSet<i64>,
+    fast: &FxHashSet<i64>,
 ) -> Details {
+    let onward = Onward::new(ways);
     let rings: FxHashSet<i64> = ways
         .iter()
         .filter(|w| w.profile.roundabout)
@@ -249,10 +420,10 @@ pub(super) fn build(
     let mut details = Details::default();
     // a node two runs share is drawn once
     let mut drawn: FxHashSet<i64> = FxHashSet::default();
-    for run in &network.runs {
+    for (index, run) in network.runs.iter().enumerate() {
         let way = &ways[run.way as usize];
         let nodes = &way.nodes[run.points.clone()];
-        let walk = Walk::new(way, run.points.clone());
+        let walk = Walk::new(ways, network, index);
         let length = walk.length();
         let last = nodes.len() - 1;
         let Some(lanes) = &way.profile.lanes else {
@@ -275,27 +446,44 @@ pub(super) fn build(
                 Some(Sign::Line(..)) => None,
                 _ => crossings.get(node).copied(),
             };
-            let Some(Marking::Marked(kind, confidence)) = marked else {
-                continue;
-            };
             // in a junction it says not across which arm
             if (k == 0 && junction(0)) || (k == last && junction(1)) {
                 continue;
             }
             let at = walk.along[k];
-            let half = match kind {
+            let refuge = islands.contains(node).then(|| refuge(&walk, at)).flatten();
+            let Some(Marking::Marked(kind, confidence)) =
+                marked.map(|m| signalled(m, way.profile.rules))
+            else {
+                // an island is there, marked or not
+                if let Some((area, _)) = refuge {
+                    let half = REFUGE_LENGTH / 2.0 + CLEAR;
+                    gaps.push([at - half, at + half]);
+                    if drawn.insert(*node) {
+                        details.refuges.push(area);
+                    }
+                }
+                continue;
+            };
+            let mut half = match kind {
                 Kind::Zebra => ZEBRA / 2.0,
                 _ => (ROWS + kind.width()) / 2.0,
             };
+            if refuge.is_some() {
+                half = half.max(REFUGE_LENGTH / 2.0);
+            }
             // two mapped where there is room for one
             if across.iter().any(|c| (c.at - at).abs() < c.half + half) {
                 continue;
             }
             across.push(Crossing { at, half });
             if drawn.insert(*node) {
-                details
-                    .list
-                    .push(crossing(run.way, &walk, at, kind, confidence));
+                let mut crossing = crossing(run.way, &walk, at, kind, confidence);
+                if let Some((area, block)) = refuge {
+                    super::paint::trim(&mut crossing, &[block], way.scale);
+                    details.refuges.push(area);
+                }
+                details.list.push(crossing);
             }
         }
         for c in &across {
@@ -315,12 +503,17 @@ pub(super) fn build(
             let Some(&Sign::Line(kind, facing)) = signs.get(node) else {
                 continue;
             };
+            // within a junction nothing stops
+            if run.inner {
+                continue;
+            }
             let at = walk.along[k];
             let at_junction = [k == 0 && junction(0), k == last && junction(1)];
             if at_junction[0] || at_junction[1] {
-                // signals at the junction itself are every arm's
-                if kind == Kind::Signal {
-                    stops[usize::from(at_junction[0])].push((at, kind, 1));
+                // signals at the junction itself are every arm's that leads to it
+                let side = usize::from(at_junction[0]);
+                if kind == Kind::Signal && [lanes.along, lanes.against][side] {
+                    stops[side].push((at, kind, 1));
                 }
                 continue;
             }
@@ -358,6 +551,7 @@ pub(super) fn build(
             if comes
                 && !signed
                 && junction(end)
+                && !run.inner
                 && rings.contains(&node)
                 && !way.profile.roundabout
                 && way.profile.class < Class::Service
@@ -398,9 +592,15 @@ pub(super) fn build(
                 }
                 lines_at[side].push(s);
                 let place_at = flip(s);
-                details
-                    .list
-                    .push(line(run.way, &walk, place_at, side == 0, kind, confidence));
+                let (kind, rows) = looks(kind, way.profile.rules);
+                details.list.push(line(
+                    run.way,
+                    &walk,
+                    place_at,
+                    side == 0,
+                    (kind, confidence),
+                    rows,
+                ));
                 if junction(1 - side) && length - s < end_cut + NEAR_JUNCTION {
                     line_at[side] = Some(line_at[side].map_or(s, |o: f64| o.min(s)));
                     if side == 0 {
@@ -414,9 +614,15 @@ pub(super) fn build(
 
         for side in 0..2 {
             let turns = &lanes.turns[side];
-            if turns.is_empty() {
+            let last = if side == 0 {
+                run.points.end - 1
+            } else {
+                run.points.start
+            };
+            if run.inner || turns.is_empty() || !onward.needs_lanes(run.way, last, side == 0) {
                 continue;
             }
+            let size = if fast.contains(&way.id) { FAST } else { 1.0 };
             let flip = |s: f64| if side == 0 { s } else { length - s };
             let mut end = length - run.cut[1 - side];
             if let Some(stop) = line_at[side] {
@@ -432,7 +638,7 @@ pub(super) fn build(
             }
             let mut tip = end - ARROW_BACK;
             for _ in 0..ARROWS {
-                let tail = tip - ARROW;
+                let tail = tip - ARROW * size;
                 if tail < run.cut[side] + 2.0 {
                     break;
                 }
@@ -443,12 +649,12 @@ pub(super) fn build(
                     .iter()
                     .all(|l| *l < tail - CLEAR || *l > tip + CLEAR);
                 if clear {
-                    let middle = flip(tail + ARROW / 2.0);
+                    let middle = flip((tail + tip) / 2.0);
                     details
                         .list
-                        .extend(arrows(run.way, &walk, middle, side == 0, turns));
+                        .extend(arrows(run.way, &walk, middle, side == 0, size, turns));
                 }
-                tip -= ARROW_EVERY;
+                tip -= ARROW_EVERY * size;
             }
         }
         for gap in &mut gaps {
@@ -457,24 +663,179 @@ pub(super) fn build(
         gaps.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
         details.gaps.push(gaps);
     }
+    details.list.extend(network.paint.iter().cloned());
+    details.list.extend(discs(ways, signs));
+    details.list.extend(junctions::guides(ways, network, signs));
+    (details.list, details.taken) = super::paint::settle(ways, details.list);
+    for detail in &mut details.list {
+        if detail.kind == Kind::Triangles {
+            let scale = ways[detail.way as usize].scale;
+            kept_triangles(detail, scale);
+        }
+    }
     details
+}
+
+/// A crossing's marking as it looks where it is: at signals, where the marking is
+/// not tagged, the country's.
+fn signalled(marking: Marking, rules: &Rules) -> Marking {
+    match marking {
+        Marking::Marked(Kind::Zebra, 0) => Marking::Marked(
+            match rules.signalled {
+                Signalled::Zebra => Kind::Zebra,
+                Signalled::Lines => Kind::Lines,
+                Signalled::Studs => Kind::Dots,
+            },
+            0,
+        ),
+        other => other,
+    }
+}
+
+/// A line traffic stops at as it looks where it is, and metres along the road of
+/// each of its lines.
+fn looks(kind: Kind, rules: &Rules) -> (Kind, &'static [f64]) {
+    match (kind, rules.give_way) {
+        (Kind::Signal, _) if rules.signal_dashed => (Kind::SignalDashed, &[0.0]),
+        (Kind::GiveWay, GiveWay::Triangles) => (Kind::Triangles, &[0.0]),
+        (Kind::GiveWay, GiveWay::Double) => (Kind::GiveWay, &[-DOUBLE, DOUBLE]),
+        _ => (kind, &[0.0]),
+    }
+}
+
+/// The triangles of a line where traffic gives way that are left where it was
+/// cut: those whose base lies on what is left of its line.
+fn kept_triangles(detail: &mut Detail, scale: f64) {
+    let near = |p: Point| {
+        detail.strokes.iter().any(|s| {
+            let (a, b) = (s[0], s[s.len() - 1]);
+            let length = distance(a, b);
+            let along = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
+            let t = (p[0] - a[0]) * along[0] + (p[1] - a[1]) * along[1];
+            let off = ((p[0] - a[0]) * along[1] - (p[1] - a[1]) * along[0]).abs();
+            length > 0.0
+                && t > -0.05 * scale
+                && t < length + 0.05 * scale
+                && off < TRIANGLE[1] * scale
+        })
+    };
+    let heads = std::mem::take(&mut detail.heads);
+    detail.heads = heads
+        .into_iter()
+        .filter(|h| near([(h[0][0] + h[1][0]) / 2.0, (h[0][1] + h[1][1]) / 2.0]))
+        .collect();
+}
+
+/// Where motor roads meet, and so where traffic may go on.
+struct Onward<'a> {
+    ways: &'a [Way],
+    /// By node, the ways and which of their points it is.
+    at: FxHashMap<i64, Vec<(u32, u32)>>,
+}
+
+impl<'a> Onward<'a> {
+    fn new(ways: &'a [Way]) -> Self {
+        let motor = || {
+            ways.iter()
+                .enumerate()
+                .filter(|(_, w)| w.profile.lanes.is_some())
+        };
+        let mut uses: FxHashMap<i64, u32> = FxHashMap::default();
+        for (_, way) in motor() {
+            for &node in &way.nodes {
+                *uses.entry(node).or_default() += 1;
+            }
+        }
+        let mut at: FxHashMap<i64, Vec<(u32, u32)>> = FxHashMap::default();
+        for (index, way) in motor() {
+            for (k, node) in way.nodes.iter().enumerate() {
+                if uses[node] > 1 {
+                    let here = (index as u32, k as u32);
+                    at.entry(*node).or_default().push(here);
+                }
+            }
+        }
+        Self { ways, at }
+    }
+
+    /// Where traffic that comes to the point `k` of a way may go on to: ways,
+    /// their points and whether along them.
+    fn ways_on(&self, way: u32, k: usize, along: bool) -> Vec<(u32, usize, bool)> {
+        let alone = [(way, k as u32)];
+        let node = self.ways[way as usize].nodes[k];
+        let mut out = Vec::new();
+        for &(other, j) in self.at.get(&node).map_or(&alone[..], |v| &v[..]) {
+            let (road, j) = (&self.ways[other as usize], j as usize);
+            let lanes = lanes_of(road);
+            for (goes, ahead) in [
+                (lanes.along && j + 1 < road.nodes.len(), true),
+                (lanes.against && j > 0, false),
+            ] {
+                // not back where it came from
+                if goes && (other, j, ahead) != (way, k, !along) {
+                    out.push((other, j, ahead));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether what lies on from the point `k` of a way needs its lanes: where
+    /// traffic may part, or the lanes or their turns are others. Where a way
+    /// leads on alone, as one does that leaves a junction, nothing does.
+    fn needs_lanes(&self, way: u32, k: usize, along: bool) -> bool {
+        let of = |way: u32, along: bool| {
+            let lanes = lanes_of(&self.ways[way as usize]);
+            let span = lanes.span(along);
+            let count = ((span[1] - span[0]) / lanes.width).round() as u32;
+            (count, &lanes.turns[usize::from(!along)])
+        };
+        let (count, turns) = of(way, along);
+        let merge = |t: &Turn| matches!(t, Turn::MergeLeft | Turn::MergeRight);
+        if turns.iter().flatten().any(merge) {
+            return true;
+        }
+        let (mut here, mut plain) = ((way, k, along), 0.0);
+        // a step a point: a road goes round in fewer
+        for _ in 0..1000 {
+            // none, at the edge of what is known
+            let [next] = self.ways_on(here.0, here.1, here.2)[..] else {
+                return true;
+            };
+            let (lanes, theirs) = of(next.0, next.2);
+            if lanes != count || (!theirs.is_empty() && theirs != turns) {
+                return true;
+            }
+            let road = &self.ways[next.0 as usize];
+            let to = if next.2 { next.1 + 1 } else { next.1 - 1 };
+            if theirs.is_empty() {
+                plain += distance(road.points[next.1], road.points[to]) / road.scale;
+                if plain > AHEAD {
+                    return false;
+                }
+            }
+            here = (next.0, to, next.2);
+        }
+        false
+    }
 }
 
 /// A crossing square over its road: its strokes run across, so a zebra's bars
 /// lie along the road.
 fn crossing(way: u32, walk: &Walk, at: f64, kind: Kind, confidence: u8) -> Detail {
-    let p = &walk.way.profile;
+    let edges = surface_at(walk, at);
+    let (across, centre) = (edges[1] - edges[0], (edges[0] + edges[1]) / 2.0);
     let (point, direction) = (walk.at(at).0, walk.direction(at, 3.0));
     // bars at both edges, whole
     let width = match kind.dash() {
         Some((on, off)) => {
-            let bars = ((p.width + off) / (on + off) + 1e-6).floor().max(1.0);
+            let bars = ((across + off) / (on + off) + 1e-6).floor().max(1.0);
             bars * (on + off) - off
         }
-        None => p.width,
+        None => across,
     };
     let stroke = |y: f64| {
-        [p.centre - width / 2.0, p.centre + width / 2.0]
+        [centre - width / 2.0, centre + width / 2.0]
             .map(|x| place(point, direction, walk.way.scale, [x, y]))
             .to_vec()
     };
@@ -482,72 +843,215 @@ fn crossing(way: u32, walk: &Walk, at: f64, kind: Kind, confidence: u8) -> Detai
         Kind::Zebra => vec![stroke(0.0)],
         _ => vec![stroke(-ROWS / 2.0), stroke(ROWS / 2.0)],
     };
+    let half = match kind {
+        Kind::Zebra => ZEBRA / 2.0,
+        _ => (ROWS + kind.width()) / 2.0,
+    };
+    let span = [centre - width / 2.0, centre + width / 2.0];
     Detail {
         way,
         kind,
         confidence,
         at: point,
+        block: Block::new(point, direction, walk.way.scale, span, [-half, half]),
         strokes,
         heads: Vec::new(),
     }
 }
 
-/// A line across the lanes of one direction.
-fn line(way: u32, walk: &Walk, at: f64, along: bool, kind: Kind, confidence: u8) -> Detail {
+/// The island in the middle of a crossing, between the directions, where the road has
+/// the room; and what it takes of the crossing.
+fn refuge(walk: &Walk, at: f64) -> Option<(Area, Block)> {
+    let lanes = lanes_of(walk.way);
+    let edges = surface_at(walk, at);
+    let across = edges[1] - edges[0];
+    // a one-way road's is beside it
+    if across < REFUGE_ROAD || !lanes.along || !lanes.against {
+        return None;
+    }
+    // between the directions
+    let centre = span_at(walk, at, !lanes.left_hand)[0];
+    let width = (across - 2.0 * BESIDE_REFUGE).clamp(REFUGE[0], REFUGE[1]);
     let (point, direction) = (walk.at(at).0, walk.direction(at, 3.0));
-    let lanes = walk.way.profile.lanes.as_ref().expect("a motor road's");
-    let span = lanes.span(along);
-    let stroke = span.map(|x| place(point, direction, walk.way.scale, [x, 0.0]));
+    let (half, long) = (width / 2.0, (REFUGE_LENGTH - width) / 2.0);
+    let mut points = Vec::new();
+    for (from, sign) in [(0.0, 1.0), (std::f64::consts::PI, -1.0)] {
+        points.extend((0..=6).map(|k| {
+            let (s, c) = (from + f64::from(k) / 6.0 * std::f64::consts::PI).sin_cos();
+            let put = [centre + c * half, long * sign + s * half];
+            place(point, direction, walk.way.scale, put)
+        }));
+    }
+    let area = Area {
+        kind: AreaKind::Island,
+        paved: true,
+        ring: ring(&points)?,
+        holes: Vec::new(),
+    };
+    let span = [centre - half, centre + half];
+    let ahead = [-REFUGE_LENGTH / 2.0, REFUGE_LENGTH / 2.0];
+    let block = Block::new(point, direction, walk.way.scale, span, ahead);
+    Some((area, block))
+}
+
+/// The middles of mini roundabouts.
+fn discs(ways: &[Way], signs: &FxHashMap<i64, Sign>) -> Vec<Detail> {
+    /// Metres of the radius, of the narrowest road's width, at the least and at the
+    /// most.
+    const OF_WIDTH: f64 = 0.25;
+    const RADIUS: [f64; 2] = [0.75, 2.0];
+    const AROUND: u32 = 24;
+    // by node, the first road and the narrowest one's width
+    let mut found: FxHashMap<i64, (u32, Point, f64)> = FxHashMap::default();
+    let mut order: Vec<i64> = Vec::new();
+    for (index, way) in ways.iter().enumerate() {
+        if !way.profile.class.is_motor() {
+            continue;
+        }
+        for (node, at) in way.nodes.iter().zip(&way.points) {
+            if signs.get(node) == Some(&Sign::Mini) {
+                let width = way.profile.width;
+                let seen = found.entry(*node).or_insert_with(|| {
+                    order.push(*node);
+                    (index as u32, *at, width)
+                });
+                seen.2 = seen.2.min(width);
+            }
+        }
+    }
+    let disc = |node: &i64| {
+        let (way, at, width) = found[node];
+        let scale = ways[way as usize].scale;
+        let radius = (width * OF_WIDTH).clamp(RADIUS[0], RADIUS[1]);
+        let put = |k: u32| {
+            let (s, c) = (f64::from(k) / f64::from(AROUND) * std::f64::consts::TAU).sin_cos();
+            place(at, [0.0, -1.0], scale, [c * radius, s * radius])
+        };
+        let span = [-radius, radius];
+        Detail {
+            way,
+            kind: Kind::Disc,
+            confidence: 2,
+            at,
+            block: Block::new(at, [0.0, -1.0], scale, span, span),
+            strokes: Vec::new(),
+            heads: vec![(0..AROUND).map(put).collect()],
+        }
+    };
+    order.iter().map(disc).collect()
+}
+
+/// A line across the lanes of one direction, or lines `rows` metres along the road
+/// from `at`; triangles are whole and point at the traffic that comes.
+fn line(
+    way: u32,
+    walk: &Walk,
+    at: f64,
+    along: bool,
+    (kind, confidence): (Kind, u8),
+    rows: &[f64],
+) -> Detail {
+    let (point, direction) = (walk.at(at).0, walk.direction(at, 3.0));
+    let mut span = span_at(walk, at, along);
+    let scale = walk.way.scale;
+    let mut heads = Vec::new();
+    if kind == Kind::Triangles {
+        let [base, tall, gap] = TRIANGLE;
+        let count = ((span[1] - span[0] + gap) / (base + gap) + 1e-6)
+            .floor()
+            .max(1.0);
+        let width = count * (base + gap) - gap;
+        let middle = (span[0] + span[1]) / 2.0;
+        span = [middle - width / 2.0, middle + width / 2.0];
+        // the base ahead of the tip, as traffic goes
+        let y = if along { tall / 2.0 } else { -tall / 2.0 };
+        for k in 0..count as u32 {
+            let x = span[0] + f64::from(k) * (base + gap);
+            heads.push(
+                [[x, y], [x + base, y], [x + base / 2.0, -y]]
+                    .map(|q| place(point, direction, scale, q))
+                    .to_vec(),
+            );
+        }
+    }
+    let strokes = rows
+        .iter()
+        .map(|&y| {
+            span.map(|x| place(point, direction, scale, [x, y]))
+                .to_vec()
+        })
+        .collect();
+    let half = kind.width() / 2.0;
+    let ahead = [rows[0] - half, rows[rows.len() - 1] + half];
     Detail {
         way,
         kind,
         confidence,
         at: point,
-        strokes: vec![stroke.to_vec()],
-        heads: Vec::new(),
+        block: Block::new(point, direction, scale, span, ahead),
+        strokes,
+        heads,
     }
 }
 
-/// The arrows of one direction's lanes, side by side about `middle`.
-fn arrows(way: u32, walk: &Walk, middle: f64, along: bool, turns: &[Vec<Turn>]) -> Vec<Detail> {
+/// The arrows of one direction's lanes, side by side about `middle`, `size`
+/// times the usual length.
+fn arrows(
+    way: u32,
+    walk: &Walk,
+    middle: f64,
+    along: bool,
+    size: f64,
+    turns: &[Vec<Turn>],
+) -> Vec<Detail> {
     let point = walk.at(middle).0;
-    let mut direction = walk.direction(middle, ARROW / 2.0);
-    let lanes = walk.way.profile.lanes.as_ref().expect("a motor road's");
-    let span = lanes.span(along);
+    let mut direction = walk.direction(middle, ARROW * size / 2.0);
+    let lanes = lanes_at(walk, middle, along);
+    if lanes.len() != turns.len() {
+        return Vec::new();
+    }
     if !along {
         direction = [-direction[0], -direction[1]];
     }
     let mut out = Vec::new();
-    for (k, lane) in turns.iter().enumerate() {
-        let (strokes, heads) = arrow(lane);
-        if strokes.is_empty() {
+    for (turns, edges) in turns.iter().zip(lanes) {
+        let (strokes, heads) = arrow(turns);
+        let lane = edges[1] - edges[0];
+        // none in a lane that is opening yet, or closing
+        if strokes.is_empty() || lane < NARROWEST {
             continue;
         }
-        // lanes are from the driver's left
-        let off = (k as f64 + 0.5) * lanes.width;
-        let x = if along {
-            span[0] + off
-        } else {
-            -(span[1] - off)
-        };
-        let put = |q: [f64; 2]| {
-            place(
-                point,
-                direction,
-                walk.way.scale,
-                [x + q[0], q[1] - ARROW / 2.0],
-            )
-        };
+        let x = (edges[0] + edges[1]) / 2.0 * if along { 1.0 } else { -1.0 };
+        // as wide as it is long, and within its lane
+        let half = Kind::Arrow.width() / 2.0;
+        let reach = strokes
+            .iter()
+            .flatten()
+            .map(|q| q[0].abs() + half)
+            .chain(heads.iter().flatten().map(|q| q[0].abs()))
+            .fold(half, f64::max);
+        let wide = size.min((lane / 2.0 - ARROW_ROOM).max(half) / reach);
+        let fit = |q: [f64; 2]| [x + q[0] * wide, (q[1] - ARROW / 2.0) * size];
+        let put = |q: [f64; 2]| place(point, direction, walk.way.scale, fit(q));
+        let mut span = [x - half, x + half];
+        for q in strokes.iter().flatten().map(|q| (fit(*q)[0], half)) {
+            span = [span[0].min(q.0 - q.1), span[1].max(q.0 + q.1)];
+        }
+        for q in heads.iter().flatten().map(|q| fit(*q)[0]) {
+            span = [span[0].min(q), span[1].max(q)];
+        }
+        let length = ARROW * size / 2.0;
         out.push(Detail {
             way,
             kind: Kind::Arrow,
             confidence: 2,
             at: point,
+            block: Block::new(point, direction, walk.way.scale, span, [-length, length]),
             strokes: strokes
                 .into_iter()
                 .map(|s| s.into_iter().map(put).collect())
                 .collect(),
-            heads: heads.into_iter().map(|h| h.map(put)).collect(),
+            heads: heads.into_iter().map(|h| h.map(put).to_vec()).collect(),
         });
     }
     out
@@ -579,17 +1083,23 @@ fn arrow(turns: &[Turn]) -> (Strokes, Heads) {
             Turn::Right => -90.0,
             Turn::SharpRight => -135.0,
             Turn::Reverse => {
+                // under one that turns left, which it would cross
+                let low = if turns.len() > 1 && !through {
+                    1.9
+                } else {
+                    0.0
+                };
                 let turned: Vec<[f64; 2]> = (0..=6)
                     .map(|k| {
                         let (s, c) = (f64::from(k) / 6.0 * std::f64::consts::PI).sin_cos();
-                        [-0.45 + 0.45 * c, 3.6 + 0.45 * s]
+                        [-0.45 + 0.45 * c, 3.6 - low + 0.45 * s]
                     })
                     .collect();
                 let mut stroke = vec![[0.0, 0.0]];
                 stroke.extend(turned);
-                stroke.push([-0.9, 3.0]);
+                stroke.push([-0.9, 3.0 - low]);
                 strokes.push(stroke);
-                heads.push([[-1.25, 3.1], [-0.55, 3.1], [-0.9, 2.0]]);
+                heads.push([[-1.25, 3.1 - low], [-0.55, 3.1 - low], [-0.9, 2.0 - low]]);
                 continue;
             }
         };
@@ -623,7 +1133,13 @@ impl Detail {
     pub(super) fn rings(&self, scale: f64) -> Vec<Vec<Point>> {
         let half = self.kind.width() / 2.0 * scale;
         let mut out: Vec<Vec<Point>> = Vec::new();
-        for stroke in &self.strokes {
+        // the line of triangles is not painted
+        let strokes = if self.kind == Kind::Triangles {
+            &[][..]
+        } else {
+            &self.strokes[..]
+        };
+        for stroke in strokes {
             let dash = self.kind.dash().map(|(on, off)| (on * scale, off * scale));
             for p in stroke.windows(2) {
                 let length = distance(p[0], p[1]);
@@ -657,7 +1173,7 @@ impl Detail {
                 }
             }
         }
-        out.extend(self.heads.iter().map(|h| h.to_vec()));
+        out.extend(self.heads.iter().cloned());
         out
     }
 }
@@ -690,6 +1206,8 @@ mod tests {
             &network,
             &signs.iter().copied().collect(),
             &FxHashMap::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
         )
     }
 
@@ -823,6 +1341,85 @@ mod tests {
     }
 
     #[test]
+    fn where_traffic_keeps_left_it_stops_and_turns_on_the_left() {
+        use super::super::country;
+        use super::super::profile::profile_in;
+        let tags = [
+            ("highway", "primary"),
+            ("lanes", "4"),
+            ("lanes:forward", "2"),
+            ("turn:lanes:forward", "through|right"),
+            ("turn:lanes:backward", "left|through"),
+        ];
+        for code in ["PL", "GB"] {
+            let rules = country::rules(code);
+            let make = |t: &[(&str, &'static str)], n: &[(i64, f64, f64)]| Way {
+                profile: profile_in(|k| t.iter().find(|x| x.0 == k).map(|x| x.1), rules).unwrap(),
+                ..way(t, n)
+            };
+            let ways = [
+                make(
+                    &tags,
+                    &[
+                        (1, -100.0, 0.0),
+                        (2, -20.0, 0.0),
+                        (3, -14.0, 0.0),
+                        (4, 0.0, 0.0),
+                    ],
+                ),
+                make(&tags, &[(4, 0.0, 0.0), (5, 100.0, 0.0)]),
+                make(PRIMARY, &[(6, 0.0, -100.0), (4, 0.0, 0.0), (7, 0.0, 100.0)]),
+            ];
+            let left = rules.keeps_left();
+            // traffic going east stops across the north half, keeping left
+            let stop = details(&ways, &[(3, Sign::Line(Kind::Stop, Facing::Along))]);
+            let line = &of(&stop, Kind::Stop)[0].strokes[0];
+            let half = if left { [-7.0, 0.0] } else { [0.0, 7.0] };
+            assert_eq!(line, &vec![[-14.0, half[0]], [-14.0, half[1]]], "{code}");
+            // a give way is two lines in Britain, triangles in Poland
+            let give = details(&ways, &[(3, Sign::Line(Kind::GiveWay, Facing::Along))]);
+            if left {
+                let lines = &of(&give, Kind::GiveWay)[0].strokes;
+                assert_eq!(
+                    lines.iter().map(|l| l[0][0]).collect::<Vec<_>>(),
+                    [-14.45, -13.55]
+                );
+            } else {
+                let tri = of(&give, Kind::Triangles)[0];
+                assert_eq!(tri.heads.len(), 9);
+                // tips to the west, at the traffic that comes
+                assert!(
+                    tri.heads
+                        .iter()
+                        .all(|h| h[2][0] < h[0][0] && h[0][0] == h[1][0])
+                );
+                assert!(tri.heads.iter().all(|h| (0.0..7.0).contains(&h[2][1])));
+            }
+            // the arrows of traffic going east, from its drivers' left
+            let d = details(&ways, &[]);
+            let east: Vec<&Detail> = of(&d, Kind::Arrow)
+                .into_iter()
+                .filter(|a| a.way == 0 && a.heads[0][2][0] > a.strokes[0][0][0])
+                .collect();
+            assert!(!east.is_empty());
+            for a in east {
+                let (tail, tip) = (a.strokes[0][0], a.heads[0][2]);
+                let turns = (tip[1] - tail[1]).abs() > 0.5;
+                // the right turn's is the inner lane where traffic keeps left
+                let lane = match (left, turns) {
+                    (false, false) => 1.75,
+                    (false, true) => 5.25,
+                    (true, false) => -5.25,
+                    (true, true) => -1.75,
+                };
+                assert!((tail[1] - lane).abs() < 0.3, "{code} {a:?}");
+                // a right turn points right, whichever side traffic keeps to
+                assert!(!turns || tip[1] > tail[1]);
+            }
+        }
+    }
+
+    #[test]
     fn signals_at_a_junction_stop_every_arm() {
         let d = details(
             &junction(PRIMARY),
@@ -874,10 +1471,13 @@ mod tests {
         let first = arrows[0];
         // the left lane's, 6 m before the cut
         assert_eq!((first.strokes.len(), first.heads.len()), (2, 2));
-        assert_eq!(first.strokes[0][0], [-6.5 - 6.0 - 5.0, -1.75]);
-        assert_eq!(first.heads[0][2], [-6.5 - 6.0, -1.75]);
+        let across = first.strokes[0][0][1];
+        assert_eq!(first.strokes[0][0][0], -6.5 - 6.0 - 5.0);
+        assert_eq!(first.heads[0][2], [-6.5 - 6.0, across]);
+        // the lanes go on as the road beyond has them, from here on
+        assert!((-1.75..-0.4).contains(&across), "{across}");
         // the left turn points north, which is up
-        assert!(first.heads[1][2][1] < -1.75 - 0.5);
+        assert!(first.heads[1][2][1] < across - 0.5);
         // clear of a crossing, and none where the road is too short for one
         let crossed = details(&junction(&tags), &[(2, ZEBRA_SIGN)]);
         assert!(of(&crossed, Kind::Arrow).iter().all(|a| {
@@ -894,6 +1494,99 @@ mod tests {
         let arrows = of(&d, Kind::Arrow);
         // drivers go west: their left lane is the southern one
         assert!(arrows[0].heads[0][2][1] > 0.0, "{:?}", arrows[0]);
+    }
+
+    #[test]
+    fn arrows_are_longer_on_a_fast_road_and_keep_to_their_lanes() {
+        let of = |limit: &'static str| fast(|k| (k == "maxspeed").then_some(limit));
+        for limit in ["70", "90 km/h", "40 mph", "PL:rural", "none"] {
+            assert!(of(limit), "{limit}");
+        }
+        for limit in ["60", "50 km/h", "35 mph", "PL:urban", "walk", "inf", ""] {
+            assert!(!of(limit), "{limit}");
+        }
+        assert!(!fast(|_| None));
+        let tags = [
+            ("highway", "secondary"),
+            ("oneway", "yes"),
+            ("lanes", "2"),
+            ("width", "5.4"),
+            ("turn:lanes", "left|reverse"),
+        ];
+        let ways = junction(&tags);
+        let network = network::build(&ways);
+        let arrows = |fast: &[i64]| {
+            let fast = fast.iter().copied().collect();
+            let d = build(
+                &ways,
+                &network,
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                &fast,
+            );
+            let tails: Vec<f64> = d.list.iter().map(|d| d.strokes[0][0][0]).collect();
+            for d in &d.list {
+                // the left lane's 2.7 m, or the right's
+                let points = d.strokes.iter().flatten().chain(d.heads.iter().flatten());
+                let (low, high) =
+                    points.fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p[1]), b.max(p[1])));
+                let lane = if d.strokes[0][0][1] < 0.0 { -2.7 } else { 0.0 };
+                assert!(low > lane + 0.35 && high < lane + 2.35, "{low} {high}");
+            }
+            tails
+        };
+        let (slow, quick) = (arrows(&[]), arrows(&[1]));
+        assert_eq!((slow.len(), quick.len()), (6, 4));
+        assert!((slow[0] - quick[0] - 2.5).abs() < 1e-9);
+        assert!((quick[0] - quick[2] - 45.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_arrows_lead_to_nothing() {
+        let tags = |turns: &'static str| {
+            [
+                ("highway", "primary"),
+                ("oneway", "yes"),
+                ("lanes", "2"),
+                ("turn:lanes", turns),
+            ]
+        };
+        let plain = [("highway", "primary"), ("oneway", "yes"), ("lanes", "2")];
+        // past a junction, and on along a plain road
+        let on = |turns, then: &[(&str, &'static str)], length: f64| {
+            let mut ways = vec![
+                way(&tags(turns), &[(1, 0.0, 0.0), (2, 60.0, 0.0)]),
+                way(then, &[(2, 60.0, 0.0), (3, 60.0 + length, 0.0)]),
+                way(then, &[(3, 60.0 + length, 0.0), (4, 900.0, 0.0)]),
+            ];
+            ways.extend([
+                way(PRIMARY, &[(6, 900.0, -90.0), (4, 900.0, 0.0)]),
+                way(PRIMARY, &[(4, 900.0, 0.0), (7, 900.0, 90.0)]),
+            ]);
+            // one that only comes in
+            ways.push(way(&plain, &[(8, 10.0, 60.0), (2, 60.0, 0.0)]));
+            let d = details(&ways, &[]);
+            d.list.iter().filter(|d| d.kind == Kind::Arrow).count()
+        };
+        assert_eq!(on("left|through", &plain, 200.0), 0);
+        // a lane that ends says so
+        assert!(on("through|merge_to_left", &plain, 200.0) > 0);
+        // on ones alike until there is a junction, or where lanes change
+        assert!(on("left|through", &tags("left|through"), 200.0) > 2);
+        let three = [("highway", "primary"), ("oneway", "yes"), ("lanes", "3")];
+        assert!(on("left|through", &three, 200.0) > 0);
+        assert!(on("left|through", &tags("through|through"), 200.0) > 0);
+        // and where the junction is near
+        let near = [
+            way(&tags("left|through"), &[(1, 0.0, 0.0), (2, 60.0, 0.0)]),
+            way(&plain, &[(2, 60.0, 0.0), (4, 100.0, 0.0)]),
+            way(
+                PRIMARY,
+                &[(6, 100.0, -90.0), (4, 100.0, 0.0), (7, 100.0, 90.0)],
+            ),
+        ];
+        assert_eq!(of(&details(&near, &[]), Kind::Arrow).len(), 2 * 2);
     }
 
     #[test]
@@ -922,5 +1615,10 @@ mod tests {
             }
         }
         assert!(arrow(&[]).0.is_empty());
+        // a turn back stays under the turn left beside it
+        let (strokes, heads) = arrow(&[Reverse, Left]);
+        let top = |p: &[[f64; 2]]| p.iter().map(|p| p[1]).fold(f64::MIN, f64::max);
+        let low = |p: &[[f64; 2]]| p.iter().map(|p| p[1]).fold(f64::MAX, f64::min);
+        assert!(top(&strokes[0]) + 0.3 < low(&heads[1]) && low(&heads[0]) >= 0.0);
     }
 }

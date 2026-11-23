@@ -3,7 +3,7 @@
 //! terrain and are left to whoever draws them.
 
 use super::network::{Point, Way, distance};
-use super::profile::Level;
+use super::profile::{Class, Level};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 
@@ -72,18 +72,29 @@ fn over(kind: Kind) -> (&'static str, f64, f64) {
     }
 }
 
-/// Metres a road is followed from a bridge's end, for raising it.
+/// Metres a road is followed from a bridge's end, for raising it, a railway,
+/// which is less steep, a path, which is steeper, and steps.
 const APPROACH: f64 = 160.0;
+const RAIL_APPROACH: f64 = 320.0;
+const PATH_APPROACH: f64 = 80.0;
+const STEPS_APPROACH: f64 = 40.0;
+/// Metres of path between two flights of steps that lead up as one.
+const LANDING: f64 = 8.0;
 /// Metres round a node two ways share within which they do not cross.
 const SHARED: f64 = 3.0;
 /// World units of a cell segments are looked up by: about 100 m at 50 degrees.
-const CELL: f64 = 1024.0;
+pub(super) const CELL: f64 = 1024.0;
 
 fn layer(level: Level) -> Option<i8> {
     match level {
         Level::Bridge(layer) => Some(layer),
         _ => None,
     }
+}
+
+/// The cell of a point.
+pub(super) fn cell(p: Point) -> (i64, i64) {
+    ((p[0] / CELL).floor() as i64, (p[1] / CELL).floor() as i64)
 }
 
 /// The cells of `points`' segments.
@@ -116,7 +127,8 @@ pub(super) fn build(ways: &[Way], obstacles: &[Obstacle]) -> Vec<Group> {
     }
     let ground: FxHashSet<i64> = ways
         .iter()
-        .filter(|w| layer(w.profile.level).is_none() && w.profile.class.is_motor())
+        .filter(|w| layer(w.profile.level).is_none())
+        .filter(|w| w.profile.class.is_motor() || w.profile.class.is_rail())
         .flat_map(|w| w.nodes.iter().copied())
         .collect();
     for (node, at) in &ends {
@@ -127,9 +139,67 @@ pub(super) fn build(ways: &[Way], obstacles: &[Obstacle]) -> Vec<Group> {
             groups.join(at[0].0, i);
         }
     }
+    for (a, b) in side_by_side(ways, &pieces) {
+        groups.join(a, b);
+    }
     let crossings = crossings(ways, obstacles, &pieces);
 
-    for approach in approaches(ways, &pieces) {
+    let roads = approaches(ways, &pieces, APPROACH, |w| w.profile.class.is_motor(), &[]);
+    // a track is not raised off the roads that cross it
+    let crossed: Vec<i64> = ways
+        .iter()
+        .filter(|w| w.profile.class.is_motor() && w.profile.level == Level::Ground)
+        .flat_map(|w| w.nodes.iter().copied())
+        .collect();
+    let rails = approaches(
+        ways,
+        &pieces,
+        RAIL_APPROACH,
+        |w| w.profile.class.is_rail(),
+        &crossed,
+    );
+    // nor is a path, off the roads and the tracks; steps lead up where no path does
+    let crossed: Vec<i64> = ways
+        .iter()
+        .filter(|w| w.profile.level == Level::Ground)
+        .filter(|w| w.profile.class.is_motor() || w.profile.class.is_rail())
+        .flat_map(|w| w.nodes.iter().copied())
+        .collect();
+    let footbridges: Vec<Piece> = pieces
+        .iter()
+        .filter(|p| ways[p.way as usize].profile.class.is_path())
+        .cloned()
+        .collect();
+    let walked = |w: &Way| !w.profile.class.is_motor() && !w.profile.class.is_rail();
+    let steps = |w: &Way| w.profile.class == Class::Steps;
+    let paths = approaches(
+        ways,
+        &footbridges,
+        PATH_APPROACH,
+        |w| walked(w) && !steps(w),
+        &crossed,
+    );
+    let flight = |w: &Way| {
+        let length = || {
+            w.points
+                .windows(2)
+                .map(|p| distance(p[0], p[1]))
+                .sum::<f64>()
+        };
+        steps(w) || w.profile.level != Level::Ground || length() <= LANDING * w.scale
+    };
+    let mut stops = crossed;
+    let on = ways.iter().filter(|w| walked(w) && !flight(w));
+    stops.extend(on.flat_map(|w| w.nodes.iter().copied()));
+    let mut stairs = approaches(
+        ways,
+        &footbridges,
+        STEPS_APPROACH,
+        |w| walked(w) && flight(w),
+        &stops,
+    );
+    stairs.retain(|p| steps(&ways[p.way as usize]));
+    for approach in roads.into_iter().chain(rails).chain(paths).chain(stairs) {
         let index = pieces.len();
         groups.add();
         for end in 0..2 {
@@ -269,16 +339,81 @@ fn pieces(ways: &[Way]) -> Vec<Piece> {
     pieces
 }
 
-/// The roads on the ground that lead up to the bridges' ends: from each motor
-/// road's, as far as the road goes on alone, or to another bridge.
-fn approaches(ways: &[Way], pieces: &[Piece]) -> Vec<Piece> {
-    let motor = |w: &Way| w.profile.class.is_motor();
+/// Metres between the edges of a track's bridge and of another's beside it
+/// that are one bridge, and between places at which it is looked for.
+const ONE_BRIDGE: f64 = 0.5;
+const SIDE_STEP: f64 = 20.0;
+
+/// The tracks' bridges and what of their layer runs along them, edge to edge or
+/// in one place: a line's two tracks, or a tram in a road.
+fn side_by_side(ways: &[Way], pieces: &[Piece]) -> Vec<(usize, usize)> {
+    let mut at: FxHashMap<(i64, i64), Vec<(usize, usize)>> = FxHashMap::default();
+    for (i, piece) in pieces.iter().enumerate() {
+        for (segment, cell) in cells(&piece.points) {
+            at.entry(cell).or_default().push((i, segment));
+        }
+    }
+    let mut out = Vec::new();
+    for (i, piece) in pieces.iter().enumerate() {
+        let way = &ways[piece.way as usize];
+        if !way.profile.class.is_rail() {
+            continue;
+        }
+        for p in piece.points.windows(2) {
+            let length = distance(p[0], p[1]).max(f64::MIN_POSITIVE);
+            let d = [(p[1][0] - p[0][0]) / length, (p[1][1] - p[0][1]) / length];
+            let parts = (length / (SIDE_STEP * way.scale)).ceil().max(1.0) as u32;
+            for k in 0..parts {
+                let t = length * (f64::from(k) + 0.5) / f64::from(parts);
+                let q = [p[0][0] + d[0] * t, p[0][1] + d[1] * t];
+                let (x, y) = cell(q);
+                let near = (-1..=1).flat_map(|i| (-1..=1).map(move |j| (x + i, y + j)));
+                for &(j, segment) in near.filter_map(|c| at.get(&c)).flatten() {
+                    let other = &ways[pieces[j].way as usize];
+                    if i == j || other.profile.level != way.profile.level {
+                        continue;
+                    }
+                    let (a, b) = (pieces[j].points[segment], pieces[j].points[segment + 1]);
+                    let length = distance(a, b).max(f64::MIN_POSITIVE);
+                    let e = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
+                    let r = [q[0] - a[0], q[1] - a[1]];
+                    let t = r[0] * e[0] + r[1] * e[1];
+                    let right = (r[1] * e[0] - r[0] * e[1]) / way.scale - other.profile.centre;
+                    let reach = (way.profile.width + other.profile.width) / 2.0 + ONE_BRIDGE;
+                    if (0.0..=length).contains(&t)
+                        && right.abs() < reach
+                        && (d[0] * e[1] - d[1] * e[0]).abs() < ALONG
+                    {
+                        out.push((i, j));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The roads on the ground that lead up to the bridges' ends, of the ways
+/// `motor` accepts: from each one's, as far as the road goes on alone, to
+/// another bridge or one of the nodes `stops`, `reach` metres at most.
+fn approaches(
+    ways: &[Way],
+    pieces: &[Piece],
+    reach: f64,
+    motor: impl Fn(&Way) -> bool,
+    stops: &[i64],
+) -> Vec<Piece> {
     // where each node of a motor road that another shares lies on them
     let mut uses: FxHashMap<i64, u32> = FxHashMap::default();
     for way in ways.iter().filter(|w| motor(w)) {
         let last = way.nodes.len() - 1;
         for (i, &node) in way.nodes.iter().enumerate() {
             *uses.entry(node).or_default() += if i == 0 || i == last { 1 } else { 2 };
+        }
+    }
+    for node in stops {
+        if let Some(uses) = uses.get_mut(node) {
+            *uses += 2;
         }
     }
     let mut at: FxHashMap<i64, Vec<(usize, usize)>> = FxHashMap::default();
@@ -333,7 +468,7 @@ fn approaches(ways: &[Way], pieces: &[Piece]) -> Vec<Piece> {
                     length += distance(points[points.len() - 1], road.points[k]) / road.scale;
                     points.push(road.points[k]);
                     node = road.nodes[k];
-                    if length > APPROACH || uses[&node] > 2 || node == start {
+                    if length > reach || uses[&node] > 2 || node == start {
                         break 'road;
                     }
                 }
@@ -388,9 +523,21 @@ pub(super) struct Found {
     pub group: u32,
     pub piece: u32,
     pub approach: bool,
+    /// Whether it is a railway's, whose edge has no parapet.
+    pub rail: bool,
     /// Metres within the surface's nearer edge; below nothing, beyond it.
     pub inside: f64,
     pub tile: (u32, u32),
+}
+
+/// A bridge a point lies on: its way, the direction it goes there, and metres
+/// right of its line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Deck {
+    pub found: Found,
+    pub way: u32,
+    pub along: Point,
+    pub right: f64,
 }
 
 /// The sine of the angle to a piece beyond which a line crosses it and does
@@ -450,12 +597,47 @@ impl<'a> Index<'a> {
         self.beside(ways, p)
             .filter(|&(g, i, _, right)| {
                 let piece = &self.groups[g as usize].pieces[i as usize];
+                let class = ways[piece.way as usize].profile.class;
                 right.abs() < 0.2
                     && piece.approach != bridge
                     && (piece.approach || piece.way == way)
+                    && !class.is_rail()
+                    && !class.is_path()
             })
             .map(|(g, i, ..)| (g, i))
             .min()
+    }
+
+    /// The bridge, but a railway's, whose surface a point lies on or within `beyond`
+    /// metres of its edge: the highest, and of those the one it is furthest within.
+    pub(super) fn deck(&self, ways: &'a [Way], p: Point, beyond: f64) -> Option<Deck> {
+        self.beside(ways, p)
+            .filter_map(|(group, piece, along, right)| {
+                let of = &self.groups[group as usize].pieces[piece as usize];
+                let p = &ways[of.way as usize].profile;
+                let inside = p.width / 2.0 - (right - p.centre).abs();
+                let layer = layer(p.level).filter(|_| !of.approach && !p.class.is_rail())?;
+                let found = Found {
+                    group,
+                    piece,
+                    approach: false,
+                    rail: false,
+                    inside,
+                    tile: self.tiles[group as usize],
+                };
+                let deck = Deck {
+                    found,
+                    way: of.way,
+                    along,
+                    right,
+                };
+                (inside >= -beyond).then_some((layer, deck))
+            })
+            .reduce(|a, b| {
+                let more = (b.0, b.1.found.inside) > (a.0, a.1.found.inside);
+                if more { b } else { a }
+            })
+            .map(|found| found.1)
     }
 
     /// The piece the line from `a` to `b` runs along, the one it is furthest
@@ -470,15 +652,53 @@ impl<'a> Index<'a> {
                 let of = &self.groups[group as usize].pieces[piece as usize];
                 let p = &ways[of.way as usize].profile;
                 let inside = p.width / 2.0 - (right - p.centre).abs();
-                (inside >= -beyond).then_some(Found {
+                // what lines a road stands on no path beside it
+                let beside = of.approach && p.class.is_path();
+                (inside >= -beyond && !beside).then_some(Found {
                     group,
                     piece,
                     approach: of.approach,
+                    rail: p.class.is_rail(),
                     inside,
                     tile: self.tiles[group as usize],
                 })
             })
             .reduce(|a, b| if b.inside > a.inside { b } else { a })
+    }
+
+    /// The piece of a road of this level that the line from `a` to `b` runs
+    /// along and lies on, or within `beyond` metres of its edge.
+    pub(super) fn carrying(
+        &self,
+        ways: &'a [Way],
+        a: Point,
+        b: Point,
+        level: Level,
+        beyond: f64,
+    ) -> Option<(u32, u32)> {
+        let length = distance(a, b).max(f64::MIN_POSITIVE);
+        let along = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
+        let middle = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        self.beside(ways, middle)
+            .filter(|(_, _, d, _)| (along[0] * d[1] - along[1] * d[0]).abs() < ALONG)
+            .filter_map(|(group, piece, _, right)| {
+                let of = &self.groups[group as usize].pieces[piece as usize];
+                let p = &ways[of.way as usize].profile;
+                let inside = p.width / 2.0 - (right - p.centre).abs();
+                (p.class.is_motor() && p.level == level && inside >= -beyond)
+                    .then_some((inside, (group, piece)))
+            })
+            .reduce(|a, b| if b.0 > a.0 { b } else { a })
+            .map(|found| found.1)
+    }
+}
+
+/// What a piece must clear a bridge of this class by.
+fn over_bridge(class: Class) -> f64 {
+    match class {
+        Class::Rail => over(Kind::Rail).1,
+        class if class.is_path() => over(Kind::Path).1,
+        _ => OVER_ROAD,
     }
 }
 
@@ -552,13 +772,17 @@ fn crossings(ways: &[Way], obstacles: &[Obstacle], pieces: &[Piece]) -> Vec<Cros
     };
     let mut source = 0;
     for way in ways.iter() {
-        if way.profile.level == Level::Ground {
+        // tracks on the ground are obstacles
+        if way.profile.level == Level::Ground && !way.profile.class.is_rail() {
             let (kind, clearance) = if way.profile.class.is_motor() {
                 ("road", OVER_ROAD)
             } else {
                 ("path", over(Kind::Path).1)
             };
-            let half = way.profile.width / 2.0;
+            let mut half = way.profile.width / 2.0;
+            if way.profile.class.is_path() {
+                half = half.max(over(Kind::Path).2);
+            }
             look(
                 source,
                 &way.points,
@@ -601,8 +825,9 @@ fn crossings(ways: &[Way], obstacles: &[Obstacle], pieces: &[Piece]) -> Vec<Cros
             &|i| i as usize == j,
             &|i, at| {
                 let over = ways[pieces[i as usize].way as usize].profile.level;
+                let clearance = over_bridge(lower.profile.class);
                 (layer(over) > layer(lower.profile.level))
-                    .then(|| crossing(i, "bridge", Some((j as u32, at)), OVER_ROAD, half))
+                    .then(|| crossing(i, "bridge", Some((j as u32, at)), clearance, half))
             },
         );
         source += 1;
@@ -709,6 +934,80 @@ mod tests {
         );
     }
 
+    fn rail(id: i64, tags: &[(&str, &'static str)], nodes: &[(i64, f64, f64)]) -> Way {
+        let get = |k: &str| tags.iter().find(|t| t.0 == k).map(|t| t.1);
+        let track = super::super::rails::track(get).unwrap();
+        Way {
+            profile: track.profile(),
+            ..way(id, ROAD, nodes)
+        }
+    }
+
+    const TRACK: &[(&str, &str)] = &[("railway", "rail")];
+    const TRACKS: &[(&str, &str)] = &[("railway", "rail"), ("bridge", "yes")];
+
+    #[test]
+    fn a_railways_bridge_is_led_up_to_by_its_track_as_far_as_a_road_crosses() {
+        let ways = [
+            // over the bridge, under it, and across the track
+            way(1, HIGHER, &[(1, 20.0, -90.0), (2, 20.0, 90.0)]),
+            way(2, ROAD, &[(3, 80.0, -90.0), (4, 80.0, 90.0)]),
+            way(
+                3,
+                ROAD,
+                &[(5, 250.0, -90.0), (6, 250.0, 0.0), (7, 250.0, 90.0)],
+            ),
+            rail(
+                4,
+                TRACK,
+                &[(8, -300.0, 0.0), (9, -250.0, 0.0), (10, 0.0, 0.0)],
+            ),
+            rail(5, TRACKS, &[(10, 0.0, 0.0), (11, 100.0, 0.0)]),
+            rail(
+                6,
+                TRACK,
+                &[(11, 100.0, 0.0), (6, 250.0, 0.0), (12, 400.0, 0.0)],
+            ),
+        ];
+        let groups = build(&ways, &[]);
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        let of_track: Vec<_> = g
+            .pieces
+            .iter()
+            .filter(|p| ways[p.way as usize].profile.class == Class::Rail)
+            .map(|p| (p.approach, p.nodes, p.anchor))
+            .collect();
+        // farther than a road, whose approach is half as long
+        assert_eq!(
+            of_track,
+            [
+                (false, [10, 11], [true, true]),
+                (true, [8, 10], [true, false]),
+                (true, [11, 6], [false, true])
+            ]
+        );
+        let seen: Vec<_> = g.crossings.iter().map(|c| (c.kind, c.clearance)).collect();
+        assert_eq!(seen, [("bridge", 6.5), ("road", OVER_ROAD)]);
+    }
+
+    #[test]
+    fn tracks_side_by_side_are_one_group() {
+        let at = |y: f64| {
+            let ways = [
+                rail(1, TRACKS, &[(1, 0.0, 0.0), (2, 100.0, 0.0)]),
+                rail(2, TRACKS, &[(3, 100.0, y), (4, 0.0, y)]),
+            ];
+            build(&ways, &[]).len()
+        };
+        assert_eq!((at(4.5), at(9.0)), (1, 2));
+        // roads' are the renderer's to tell
+        let roads = [0.0, 4.5].map(|y| way(1, BRIDGE, &[(1, 0.0, y), (2, 100.0, y)]));
+        let [a, mut b] = roads;
+        b.nodes = vec![3, 4];
+        assert_eq!(build(&[a, b], &[]).len(), 2);
+    }
+
     #[test]
     fn three_levels_are_one_group_in_order() {
         let ways = [
@@ -794,6 +1093,73 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].points, [[0.0, 0.0], [60.0, 0.0]]);
         assert_eq!(found[1].points, [[90.0, 0.0], [120.0, 0.0]]);
+    }
+
+    const FOOT: &[(&str, &str)] = &[("highway", "footway")];
+    const FOOTBRIDGE: &[(&str, &str)] = &[("highway", "footway"), ("bridge", "yes")];
+    const STEPS: &[(&str, &str)] = &[("highway", "steps")];
+
+    #[test]
+    fn a_footbridge_clears_the_road_and_is_led_up_to_by_its_path_and_its_steps() {
+        let ways = [
+            // the path beyond is crossed by a road, which is not raised
+            way(1, FOOT, &[(1, -200.0, 0.0), (2, -50.0, 0.0), (3, 0.0, 0.0)]),
+            way(2, FOOTBRIDGE, &[(3, 0.0, 0.0), (4, 60.0, 0.0)]),
+            way(3, STEPS, &[(4, 60.0, 0.0), (5, 70.0, 0.0)]),
+            way(4, FOOT, &[(5, 70.0, 0.0), (6, 200.0, 0.0)]),
+            way(5, ROAD, &[(7, 30.0, -50.0), (8, 30.0, 50.0)]),
+            way(
+                6,
+                ROAD,
+                &[(9, -50.0, -50.0), (2, -50.0, 0.0), (10, -50.0, 50.0)],
+            ),
+        ];
+        let groups = build(&ways, &[]);
+        assert_eq!(groups.len(), 1);
+        let seen: Vec<_> = groups[0]
+            .pieces
+            .iter()
+            .map(|p| (p.way, p.approach, p.nodes, p.anchor))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (1, false, [3, 4], [true, true]),
+                (0, true, [2, 3], [true, false]),
+                (2, true, [4, 5], [false, true])
+            ]
+        );
+        let seen: Vec<_> = groups[0]
+            .crossings
+            .iter()
+            .map(|c| (c.kind, c.at, c.clearance))
+            .collect();
+        assert_eq!(seen, [("road", 30.0, OVER_ROAD)]);
+    }
+
+    #[test]
+    fn where_a_path_goes_on_beside_the_steps_it_is_the_path_that_leads_up() {
+        let ways = [
+            way(1, FOOTBRIDGE, &[(1, 0.0, 0.0), (2, 60.0, 0.0)]),
+            way(2, STEPS, &[(2, 60.0, 0.0), (3, 60.0, 9.0)]),
+            way(3, FOOT, &[(2, 60.0, 0.0), (4, 110.0, 0.0)]),
+        ];
+        let groups = build(&ways, &[]);
+        let led: Vec<_> = groups[0].pieces.iter().filter(|p| p.approach).collect();
+        assert_eq!((led.len(), led[0].way), (1, 2));
+        // a sidewalk's bridge is led up to by none
+        let sidewalk = &[
+            ("highway", "footway"),
+            ("footway", "sidewalk"),
+            ("bridge", "yes"),
+        ];
+        let [_, steps, path] = ways;
+        let ways = [
+            way(1, sidewalk, &[(1, 0.0, 0.0), (2, 60.0, 0.0)]),
+            steps,
+            path,
+        ];
+        assert_eq!(build(&ways, &[])[0].pieces.len(), 1);
     }
 
     #[test]
