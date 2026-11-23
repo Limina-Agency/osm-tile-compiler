@@ -119,9 +119,13 @@
     "attribution": "<a href=\"https://www.openmaptiles.org/\" target=\"_blank\">&copy; OpenMapTiles</a> <a href=\"https://www.openstreetmap.org/copyright\" target=\"_blank\">&copy; OpenStreetMap contributors</a>",
     "description": "Native Rust OpenMapTiles profile",
     "format": "pbf",
+    "generator": "osm-tile-compiler <version>",
     "maxzoom": 14,
     "minzoom": 0,
     "name": "OpenMapTiles",
+    "osm_data_timestamp": "2021-04-21T20:21:46Z",
+    "osm_replication_sequence": 2947,
+    "osm_replication_url": "http://download.geofabrik.de/europe/monaco-updates",
     "planetiler_openmaptiles_profile_commit": "91516fdf477915b1a985015811049b9b96c7f87e",
     "type": "baselayer",
     "vector_layers": [

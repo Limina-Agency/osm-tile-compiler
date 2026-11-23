@@ -45,6 +45,8 @@ These belong to other projects and follow them:
 |---|---|---|
 | OpenMapTiles schema | 3.16.0 | `OMT_SCHEMA_VERSION`; written as the archive metadata's `version` and the manifest's `version`, as OpenMapTiles does |
 | Planetiler OpenMapTiles profile | commit `91516fdf` | `omt::PROFILE_REVISION`; written as `planetiler_openmaptiles_profile_commit` |
+| This crate | its version | written as the archive metadata's `generator`, `osm-tile-compiler <version>`; `tests/monaco.rs` records it as `osm-tile-compiler <version>` so a release doesn't change the fingerprint |
+| OSM replication | the extract's header | written as `osm_data_timestamp` (RFC 3339, UTC), `osm_replication_sequence` and `osm_replication_url` when the header gives them |
 | Planetiler (comparison) | 0.10.2 | `benchmarks/compiler-parity/` |
 | PMTiles | specification v3 | the archive header |
 | MBTiles | specification 1.3 | `application_id` 0x4d504258 and the `metadata` table of `--format mbtiles` archives |

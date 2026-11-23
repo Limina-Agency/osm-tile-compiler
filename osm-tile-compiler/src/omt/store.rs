@@ -191,6 +191,8 @@ pub(super) struct ArchiveHeader<'a> {
     pub layers: &'a [&'static str],
     /// The ids of the supplemental datasets left out, for the metadata.
     pub omitted_sources: &'a [&'static str],
+    /// How current the OSM data is, for the metadata.
+    pub osm_data: &'a super::OsmDataInfo,
 }
 
 #[cfg(test)]
@@ -199,6 +201,11 @@ impl ArchiveHeader<'static> {
     pub fn for_test(bounds: CompileBounds, min_zoom: u8, max_zoom: u8) -> Self {
         static OPTIONS: std::sync::LazyLock<ArchiveOptions> =
             std::sync::LazyLock::new(ArchiveOptions::default);
+        static OSM_DATA: super::OsmDataInfo = super::OsmDataInfo {
+            replication_timestamp: None,
+            replication_sequence_number: None,
+            replication_base_url: None,
+        };
         Self {
             bounds,
             center: ArchiveCenter {
@@ -211,6 +218,7 @@ impl ArchiveHeader<'static> {
             max_zoom,
             layers: &super::LAYERS,
             omitted_sources: &[],
+            osm_data: &OSM_DATA,
         }
     }
 }
@@ -965,6 +973,7 @@ impl Store {
             &self.zooms,
             options,
             header.omitted_sources,
+            header.osm_data,
         );
         let mut archive = archive.open_writer(&ArchiveSpec {
             bounds,
@@ -1579,6 +1588,24 @@ fn merge_controlled(
     Ok(())
 }
 
+/// The metadata a header gives, parsed, with no layer fields or zooms.
+#[cfg(test)]
+pub(super) fn metadata_for_test(header: &ArchiveHeader) -> serde_json::Value {
+    serde_json::from_str(&metadata(
+        header.layers,
+        (header.min_zoom, header.max_zoom),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        header.options,
+        header.omitted_sources,
+        header.osm_data,
+    ))
+    .unwrap()
+}
+
+/// The metadata's `generator`: this crate and its version.
+pub(crate) const GENERATOR: &str = concat!("osm-tile-compiler ", env!("CARGO_PKG_VERSION"));
+
 fn metadata(
     layers: &[&str],
     (min, max): (u8, u8),
@@ -1586,6 +1613,7 @@ fn metadata(
     zooms: &BTreeMap<String, (u8, u8)>,
     options: &ArchiveOptions,
     omitted_sources: &[&str],
+    osm_data: &super::OsmDataInfo,
 ) -> String {
     let layers = layers
         .iter()
@@ -1609,8 +1637,19 @@ fn metadata(
         "description": options.description,
         "attribution": options.attribution,
         "planetiler_openmaptiles_profile_commit": super::PROFILE_REVISION,
+        "generator": GENERATOR,
         "vector_layers": layers,
     });
+    // Each is written only when the extract's header gives it.
+    if let Some(time) = osm_data.timestamp_rfc3339() {
+        metadata["osm_data_timestamp"] = serde_json::json!(time);
+    }
+    if let Some(sequence) = osm_data.replication_sequence_number {
+        metadata["osm_replication_sequence"] = serde_json::json!(sequence);
+    }
+    if let Some(url) = &osm_data.replication_base_url {
+        metadata["osm_replication_url"] = serde_json::json!(url);
+    }
     // Only an archive built without some supplemental datasets says so, so
     // a full build's metadata is as before.
     if !omitted_sources.is_empty() {

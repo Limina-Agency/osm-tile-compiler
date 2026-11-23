@@ -132,6 +132,64 @@ fn parity_verified(request: &OpenMapTilesRequest) -> bool {
         && request.max_zoom == 14
 }
 
+/// How current the OSM data of a compile is, from the extract's header. The
+/// archive's metadata carries it as `osm_data_timestamp`,
+/// `osm_replication_sequence` and `osm_replication_url`; each is left out
+/// when the header doesn't say.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OsmDataInfo {
+    /// The moment the data is current to, in seconds since the Unix epoch:
+    /// the header's `osmosis_replication_timestamp`, which Geofabrik sets and
+    /// `update` advances with every change file it applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication_timestamp: Option<i64>,
+    /// The replication sequence number the data is current to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication_sequence_number: Option<i64>,
+    /// The replication server whose diffs continue the data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication_base_url: Option<String>,
+}
+
+impl OsmDataInfo {
+    fn from_header(header: &osm_pbf_ingest::blob_index::PbfFileHeader) -> Self {
+        Self {
+            replication_timestamp: header.replication_timestamp,
+            replication_sequence_number: header.replication_sequence_number,
+            replication_base_url: header.replication_base_url.clone(),
+        }
+    }
+
+    /// The replication timestamp as an RFC 3339 UTC time, such as
+    /// `2026-11-18T20:21:22Z`.
+    pub fn timestamp_rfc3339(&self) -> Option<String> {
+        self.replication_timestamp.map(rfc3339)
+    }
+}
+
+/// Seconds since the Unix epoch as an RFC 3339 UTC time.
+pub(crate) fn rfc3339(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    // Days to a civil date, after Howard Hinnant's `civil_from_days`.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        second_of_day / 3600,
+        second_of_day / 60 % 60,
+        second_of_day % 60
+    )
+}
+
 /// What a compile wrote into the archive, and how long it took.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -172,6 +230,9 @@ pub struct CompileResult {
     /// What the merge cache did, when the compile used one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_cache: Option<MergeCacheStats>,
+    /// How current the OSM data is, as the archive's metadata records it.
+    #[serde(default)]
+    pub osm_data: OsmDataInfo,
 }
 
 /// The profile's state. Supplements fill it serially; afterwards workers only
@@ -422,7 +483,7 @@ pub(crate) fn compile(
     // Workers assemble and evaluate OSM sources against the now read-only
     // profile, then everything they accumulated is replayed in source order.
     let profile = Arc::new(profile);
-    ingest::read_osm(
+    let osm_header = ingest::read_osm(
         &request.input_pbf,
         &request.temp_dir,
         request.threads,
@@ -465,6 +526,10 @@ pub(crate) fn compile(
         .filter(|dataset| omitted(*dataset))
         .map(SupplementalDataset::id)
         .collect::<Vec<_>>();
+    let osm_data = osm_header
+        .as_ref()
+        .map(OsmDataInfo::from_header)
+        .unwrap_or_default();
     let header = store::ArchiveHeader {
         bounds,
         center,
@@ -473,6 +538,7 @@ pub(crate) fn compile(
         max_zoom: request.max_zoom,
         layers: &selection.layers(),
         omitted_sources: &omitted_sources,
+        osm_data: &osm_data,
     };
     let tile_stats =
         store.finish_cached(&partial, &header, request.threads, control, cache.as_mut())?;
@@ -524,5 +590,52 @@ pub(crate) fn compile(
         tile_stats,
         omitted_sources: omitted_sources.into_iter().map(String::from).collect(),
         merge_cache,
+        osm_data,
     })
+}
+
+#[cfg(test)]
+mod osm_data_tests {
+    use super::*;
+
+    #[test]
+    fn replication_timestamps_print_as_rfc3339_utc() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        // Monaco's fixture header.
+        assert_eq!(rfc3339(1_619_036_506), "2021-04-21T20:21:46Z");
+        // A leap day and the last second of a year.
+        assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339(1_798_761_599), "2026-12-31T23:59:59Z");
+        assert_eq!(rfc3339(-1), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn metadata_records_the_osm_data_only_when_the_header_gives_it() {
+        let bounds = CompileBounds::new(7.40, 43.72, 7.45, 43.76);
+        let mut header = store::ArchiveHeader::for_test(bounds, 0, 14);
+        let unknown = store::metadata_for_test(&header);
+        assert_eq!(unknown["generator"], store::GENERATOR);
+        for key in [
+            "osm_data_timestamp",
+            "osm_replication_sequence",
+            "osm_replication_url",
+        ] {
+            assert!(unknown.get(key).is_none(), "{key} without a header");
+        }
+        let known = OsmDataInfo {
+            replication_timestamp: Some(1_619_036_506),
+            replication_sequence_number: Some(2947),
+            replication_base_url: Some(
+                "https://download.geofabrik.de/europe/monaco-updates".into(),
+            ),
+        };
+        header.osm_data = &known;
+        let metadata = store::metadata_for_test(&header);
+        assert_eq!(metadata["osm_data_timestamp"], "2021-04-21T20:21:46Z");
+        assert_eq!(metadata["osm_replication_sequence"], 2947);
+        assert_eq!(
+            metadata["osm_replication_url"],
+            "https://download.geofabrik.de/europe/monaco-updates"
+        );
+    }
 }
