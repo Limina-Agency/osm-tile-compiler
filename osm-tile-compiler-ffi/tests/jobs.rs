@@ -58,11 +58,27 @@ fn result(job: *const OtcJob) -> Value {
     take(out)
 }
 
+/// The compile's stage identifiers, in the order a compile runs them.
+const STAGE_ORDER: [&str; 6] = [
+    "fetch_sources",
+    "read_sources",
+    "index_osm",
+    "read_osm",
+    "write_tiles",
+    "building_levels",
+];
+
 #[test]
 fn a_compile_is_polled_to_its_result() {
     let dir = tempfile::tempdir().unwrap();
     let job = start(&compile(dir.path())).unwrap();
+    // A poll shows only the latest report, and in a release build Monaco's
+    // stages can each end between two polls, so which stages a poll catches
+    // is timing. What holds every time: the stages seen are known and come
+    // in pipeline order, and progress never goes back.
     let mut stages = Vec::new();
+    let mut overall = 0.0;
+    let mut updates = 0;
     loop {
         let poll = take(unsafe { otc_job_poll(job) });
         if let Some(stage) = poll["stage"].as_str()
@@ -70,6 +86,19 @@ fn a_compile_is_polled_to_its_result() {
         {
             stages.push(stage.to_string());
         }
+        if let Some(now) = poll["overall"].as_f64() {
+            assert!(
+                now >= overall,
+                "overall went from {overall} to {now}: {poll}"
+            );
+            overall = now;
+        }
+        let now = poll["updates"].as_u64().unwrap();
+        assert!(
+            now >= updates,
+            "updates went from {updates} to {now}: {poll}"
+        );
+        updates = now;
         if poll["state"] != "running" {
             assert_eq!(poll["state"], "succeeded", "{poll}");
             assert_eq!(poll["overall"], 1.0);
@@ -81,7 +110,7 @@ fn a_compile_is_polled_to_its_result() {
             OTC_ERROR_NOT_FINISHED
         );
         assert!(out.is_null());
-        unsafe { otc_job_wait(job, 100) };
+        unsafe { otc_job_wait(job, 5) };
     }
     assert_eq!(unsafe { otc_job_state(job) }, 1);
     let result = result(job);
@@ -92,7 +121,19 @@ fn a_compile_is_polled_to_its_result() {
     assert!(output["result"]["tiles"].as_u64().unwrap() > 0);
     assert_eq!(output["archive"], json!(dir.path().join("monaco.pmtiles")));
     assert!(dir.path().join("monaco.pmtiles").is_file());
-    assert!(stages.contains(&"read_osm".to_string()), "{stages:?}");
+    // The work reported, and the last poll still shows its last report.
+    assert!(updates > 0);
+    assert!(!stages.is_empty(), "no stage was ever polled");
+    let order: Vec<usize> = stages
+        .iter()
+        .map(|stage| {
+            STAGE_ORDER
+                .iter()
+                .position(|known| known == stage)
+                .unwrap_or_else(|| panic!("unknown stage {stage}"))
+        })
+        .collect();
+    assert!(order.is_sorted(), "stages out of order: {stages:?}");
     unsafe { otc_job_free(job) };
 }
 
