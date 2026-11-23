@@ -12,6 +12,16 @@
   them, and `CompileResult::osm_data` (`OsmDataInfo`) carries them, so the
   manifest's `result` does too. The Monaco fingerprint changes for these
   keys only; every tile is the same.
+- Several extracts compile as one (osm-pbf-ingest 0.6.0): `compile a.osm.pbf b.osm.pbf` (and
+  `BasemapRequest::extra_inputs`, `extraInputs` in the C ABI request,
+  `extraInputPbfPaths` in the worker request) merges them into one sorted
+  file in the scratch directory first, with osm-pbf-ingest's `merge_files`,
+  in a new `merge_extracts` stage (`CompileStage::MergeExtracts`, between
+  `fetch_sources` and `read_sources`; like `fetch_sources`, not part of
+  `overall`). Shared objects are read once, from the extract with the newest
+  replication timestamp. Compiling Małopolskie and Pomorskie this way gives
+  the same tiles as compiling the file `osmium merge` writes. Breaking:
+  `CompileStage::ALL` has seven stages.
 - `update` with change files on the command line takes the newest timestamp
   from the state files beside them (`124347.osc.gz` and
   `124347.state.txt`), so an extract brought forward from downloaded diffs

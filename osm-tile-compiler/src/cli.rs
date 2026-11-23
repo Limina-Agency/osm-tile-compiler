@@ -34,7 +34,7 @@ const GEOFABRIK_INDEX_VAR: &str = "OSM_TILE_COMPILER_GEOFABRIK_INDEX";
 
 const USAGE: &str = "\
 Usage:
-  osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile <INPUT.pbf>... --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
@@ -53,7 +53,7 @@ Compiles an OpenStreetMap PBF extract into an OpenMapTiles-schema vector
 basemap, written as one PMTiles or MBTiles archive.
 
 Usage:
-  osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile <INPUT.pbf>... --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
@@ -68,7 +68,8 @@ Usage:
   osm-tile-compiler --version
 
 Commands:
-  compile          Compile INPUT.pbf, or the Geofabrik extract of a region,
+  compile          Compile INPUT.pbf (several are merged first, for an area
+                   across extracts), or the Geofabrik extract of a region,
                    into a new PMTiles archive
   building-levels  Write the building levels of a compiled archive to a new
                    PMTiles archive: its buildings as boxes for far views
@@ -256,6 +257,8 @@ stdout.";
 #[derive(Debug)]
 struct CompileArgs {
     input: Input,
+    /// More extracts to merge with `input`.
+    extra_inputs: Vec<PathBuf>,
     output: PathBuf,
     format: OutputFormat,
     sources: PathBuf,
@@ -563,6 +566,7 @@ fn parse_bounds<'a>(
 
 fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut input = None;
+    let mut extra_inputs = Vec::new();
     let mut area = None;
     let mut download_dir = None;
     let mut output = None;
@@ -592,13 +596,12 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
+            // Inputs after the first are merged with it.
             if input.is_some() {
-                return Err(format!(
-                    "unexpected argument '{}': compile takes one input PBF",
-                    arg.to_string_lossy()
-                ));
+                extra_inputs.push(PathBuf::from(arg));
+            } else {
+                input = Some(PathBuf::from(arg));
             }
-            input = Some(PathBuf::from(arg));
             continue;
         };
         match flag.as_str() {
@@ -772,6 +775,12 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         None if omit_sources.len() == SupplementalDataset::ALL.len() => PathBuf::new(),
         None => return Err("compile needs --sources <DIR>".into()),
     };
+    if !extra_inputs.is_empty() && !changes.is_empty() {
+        return Err(
+            "change files and --replication apply to one input PBF; update each extract first"
+                .into(),
+        );
+    }
     let input = match (input, area) {
         (Some(path), _) => Input::Pbf(path),
         (None, Some(name)) => Input::Area {
@@ -782,6 +791,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     };
     Ok(Command::Compile(Box::new(CompileArgs {
         input,
+        extra_inputs,
         output,
         format,
         sources,
@@ -1566,7 +1576,24 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     };
     let bounds = match args.bounds {
         Some(bounds) => bounds,
-        None => pbf_bounds(&input)?,
+        None => {
+            let mut bounds = pbf_bounds(&input)?;
+            for extra in &args.extra_inputs {
+                let more = pbf_bounds(extra)?;
+                if bounds.wraps() || more.wraps() {
+                    return Err(
+                        "an extract's header box crosses the antimeridian; give --bounds".into(),
+                    );
+                }
+                bounds = CompileBounds::new(
+                    bounds.north.max(more.north),
+                    bounds.south.min(more.south),
+                    bounds.east.max(more.east),
+                    bounds.west.min(more.west),
+                );
+            }
+            bounds
+        }
     };
     // A default scratch directory is ours alone, and it is removed afterwards
     // whether or not the compile succeeds. Its marker file, locked for the
@@ -1629,6 +1656,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     ));
     let mut request =
         BasemapRequest::new(input, args.output.clone(), args.sources, temp_dir.clone());
+    request.extra_inputs = args.extra_inputs;
     request.format = Some(args.format);
     request.sources_policy = if args.fetch {
         SourcesPolicy::FetchMissing

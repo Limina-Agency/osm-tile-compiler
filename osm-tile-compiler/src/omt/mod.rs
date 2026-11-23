@@ -7,6 +7,7 @@ mod f64_arrangement;
 mod f64_buffer;
 mod float_repair;
 mod ingest;
+pub(crate) use store::GENERATOR;
 mod input_area;
 mod interior_point;
 mod java_hashmap;
@@ -617,7 +618,7 @@ mod osm_data_tests {
 
     #[test]
     fn metadata_records_the_osm_data_only_when_the_header_gives_it() {
-        let bounds = CompileBounds::new(7.40, 43.72, 7.45, 43.76);
+        let bounds = CompileBounds::new(43.76, 43.72, 7.45, 7.40);
         let mut header = store::ArchiveHeader::for_test(bounds, 0, 14);
         let unknown = store::metadata_for_test(&header);
         assert_eq!(unknown["generator"], store::GENERATOR);

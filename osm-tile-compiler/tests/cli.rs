@@ -167,8 +167,18 @@ fn usage_errors_exit_with_2() {
         ),
         (&["compile", "in.pbf", "--threads", "0"], "at least 1"),
         (
-            &["compile", "a.pbf", "b.pbf"],
-            "unexpected argument 'b.pbf'",
+            &[
+                "compile",
+                "a.pbf",
+                "b.pbf",
+                "--replication",
+                "hour",
+                "--omit-sources",
+                "all",
+                "--output",
+                "x.pmtiles",
+            ],
+            "apply to one input PBF",
         ),
         (
             &["compile", "in.pbf", "--frob"],

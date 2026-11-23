@@ -151,6 +151,9 @@ struct AreaJson {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompileBasemapJson {
     input_pbf: PathBuf,
+    /// More extracts to merge with `inputPbf` [default: none].
+    #[serde(default)]
+    extra_inputs: Vec<PathBuf>,
     output: PathBuf,
     /// "pmtiles" or "mbtiles" [default: by the output's extension].
     format: Option<String>,
@@ -177,6 +180,7 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
     let json: CompileBasemapJson = serde_json::from_value(request)
         .map_err(|e| JobError::invalid_request(format!("Invalid compile_basemap request: {e}")))?;
     let mut request = BasemapRequest::new(json.input_pbf, json.output, json.sources, json.temp_dir);
+    request.extra_inputs = json.extra_inputs;
     if let Some(id) = json.format {
         request.format = Some(OutputFormat::from_id(&id).ok_or_else(|| {
             JobError::invalid_request(format!(
