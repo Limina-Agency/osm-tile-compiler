@@ -24,7 +24,9 @@ Monaco, the regions above it, and names the lookup must tell apart.
 `osm-tile-compiler/tests/area_download.rs` serves it and `monaco.osm.pbf`
 from a local HTTP server to test `compile --area`. The nightly workflow runs
 the same command against Geofabrik and checks that Monaco's entry here still
-matches the live index.
+matches the live index. The comparison is of the parsed entry, so a change
+of form alone, such as the live index giving ISO codes as a string where this
+file has an array, needs no update here; `extracts.rs` reads both forms.
 
 The record is made on Linux x86_64, as CI runs. The digests do not depend on
 the platform's math library: with glibc's replaced by the `libm` crate's

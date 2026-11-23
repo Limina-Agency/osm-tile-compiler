@@ -58,12 +58,32 @@ struct Properties {
     name: String,
     #[serde(default)]
     parent: Option<String>,
-    #[serde(default, rename = "iso3166-1:alpha2")]
+    #[serde(default, rename = "iso3166-1:alpha2", deserialize_with = "codes")]
     iso3166_1: Vec<String>,
-    #[serde(default, rename = "iso3166-2")]
+    #[serde(default, rename = "iso3166-2", deserialize_with = "codes")]
     iso3166_2: Vec<String>,
     #[serde(default)]
     urls: Urls,
+}
+
+/// ISO codes as Geofabrik lists them: an array of strings, as the index long
+/// did and the fixtures record, or a single string, which the live index
+/// gave by November 2026 (`"iso3166-1:alpha2": "AF"`). Anything else, or
+/// `null`, is no codes rather than an unreadable index: one odd entry must
+/// not stop every `--area` lookup.
+fn codes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Codes {
+        One(String),
+        Many(Vec<String>),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Codes::deserialize(deserializer)? {
+        Codes::One(code) => vec![code],
+        Codes::Many(codes) => codes,
+        Codes::Other(_) => Vec::new(),
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -428,6 +448,31 @@ mod tests {
         assert_eq!(poland.parent.as_deref(), Some("europe"));
         assert_eq!(poland.iso_codes, ["PL"]);
         assert!(parse_index(b"{}").is_err());
+    }
+
+    /// The live index's form since November 2026, which the nightly
+    /// `live_geofabrik_download` check failed on: a code as a plain string.
+    #[test]
+    fn reads_iso_codes_given_as_a_string_or_an_array() {
+        let json = br#"{"type": "FeatureCollection", "features": [
+          {"type": "Feature", "properties": {"id": "afghanistan", "parent": "asia",
+            "name": "Afghanistan", "iso3166-1:alpha2": "AF",
+            "urls": {"pbf": "https://download.geofabrik.de/asia/afghanistan-latest.osm.pbf"}}},
+          {"type": "Feature", "properties": {"id": "us/georgia", "parent": "us",
+            "name": "Georgia", "iso3166-2": "US-GA",
+            "urls": {"pbf": "https://download.geofabrik.de/north-america/us/georgia-latest.osm.pbf"}}},
+          {"type": "Feature", "properties": {"id": "poland", "parent": "europe",
+            "name": "Poland", "iso3166-1:alpha2": ["PL"], "iso3166-2": null,
+            "urls": {"pbf": "https://download.geofabrik.de/europe/poland-latest.osm.pbf"}}},
+          {"type": "Feature", "properties": {"id": "odd", "name": "Odd",
+            "iso3166-1:alpha2": 7, "iso3166-2": {"x": ["Y"]},
+            "urls": {"pbf": "https://download.geofabrik.de/odd-latest.osm.pbf"}}}
+        ]}"#;
+        let index = parse_index(json).unwrap();
+        let codes: Vec<_> = index.iter().map(|e| e.iso_codes.clone()).collect();
+        assert_eq!(codes, [vec!["AF"], vec!["US-GA"], vec!["PL"], vec![]]);
+        assert_eq!(find_extract(&index, "AF").unwrap().id, "afghanistan");
+        assert_eq!(find_extract(&index, "US-GA").unwrap().id, "us/georgia");
     }
 
     #[test]
