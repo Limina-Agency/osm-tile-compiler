@@ -314,6 +314,7 @@ pub fn read_osm(
     // before its directory goes, which Windows needs.
     let node_store_dir = NodeStoreDir(temp.join(NODE_STORE_DIR));
     let prepare_phase = crate::profiling::Phase::start("omt_prepare_index");
+    let index_stage = crate::stage_profile::Stage::start("index_osm");
     let area_boxes = area
         .as_ref()
         .map_or_else(Vec::new, InputArea::decimicro_boxes);
@@ -331,12 +332,14 @@ pub fn read_osm(
         || control.is_cancelled(),
     )?;
     drop(prepare_phase);
+    drop(index_stage);
     let area_nodes = std::mem::take(&mut prepared.tagged_nodes);
     let message = "Reading OSM and preparing vector tiles";
     progress(message);
     control.stage(CompileStage::ReadOsm, message)?;
     control.set_total(STAGE_UNITS);
     let _pass2_phase = crate::profiling::Phase::start("omt_pass2_and_relations");
+    let ways_stage = crate::stage_profile::Stage::start("ways");
     let relations = prepared
         .supported_relations
         .iter()
@@ -421,7 +424,9 @@ pub fn read_osm(
     sink.finish()?;
     drop(sink);
     drop(ways_phase);
+    drop(ways_stage);
     let _relations_phase = crate::profiling::Phase::start("omt_relations");
+    let _relations_stage = crate::stage_profile::Stage::start("relations");
     let first = pipeline.processed();
     pipeline.sync_with(|done, sent| {
         let share = (done - first) as f64 / (sent - first).max(1) as f64;

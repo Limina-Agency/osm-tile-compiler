@@ -132,6 +132,8 @@ Compile options:
                         all (then --sources is not needed). The archive's
                         metadata lists them as omitted_sources
   --json                Print the compile result as JSON on stdout
+  --profile <FILE>      Measure each stage's wall time, CPU time and thread
+                        use; print a table and write the report as JSON
   --name <TEXT>         Archive metadata name [default: OpenMapTiles]
   --description <TEXT>  Archive metadata description
   --attribution <HTML>  Attribution viewers show; must keep crediting
@@ -198,6 +200,7 @@ Update options (experimental):
 Building levels options:
   --threads <N>         Worker threads [default: available cores]; the archive
                         is the same for any number
+  --profile <FILE>      Measure each stage, as for compile
 
 Style options:
   --glyphs <URL>        Font glyphs, with {fontstack} and {range}
@@ -234,6 +237,7 @@ struct CompileArgs {
     fetch: bool,
     building_levels: bool,
     json: bool,
+    profile: Option<PathBuf>,
     layers: LayerSelection,
     languages: Option<Vec<String>>,
     changes: ChangeArgs,
@@ -324,6 +328,7 @@ struct BuildingLevelsArgs {
     input: PathBuf,
     output: PathBuf,
     threads: Option<usize>,
+    profile: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -526,6 +531,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut building_levels = false;
     let mut omit_sources = Vec::new();
     let mut json = false;
+    let mut profile = None;
     let mut only_layers = None;
     let mut excluded_layers = None;
     let mut languages = None;
@@ -558,6 +564,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
             "--area" => area = Some(value(&mut args, &flag)?.to_string_lossy().into_owned()),
             "--download-dir" => download_dir = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--temp-dir" => temp_dir = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--profile" => profile = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--bounds" => bounds = Some(parse_bounds(&mut args, &flag)?),
             "--polygon" => polygon = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--area-only" => area_only = true,
@@ -732,6 +739,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         fetch,
         building_levels,
         json,
+        profile,
         layers,
         languages,
         changes,
@@ -796,6 +804,7 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
 fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
     let mut paths = Vec::new();
     let mut threads = None;
+    let mut profile = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -811,6 +820,7 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
                 }
                 threads = Some(count);
             }
+            "--profile" => profile = Some(PathBuf::from(value(&mut args, &flag)?)),
             _ => return Err(format!("unknown building-levels option '{flag}'")),
         }
     }
@@ -820,6 +830,7 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
             input,
             output,
             threads,
+            profile,
         })),
         (_, _, Some(extra)) => Err(format!(
             "unexpected argument '{}': building-levels takes two archives",
@@ -1187,6 +1198,25 @@ fn report_levels(status: &mut Status, path: &Path, report: &BuildingLevelsReport
     }
 }
 
+/// Prints the stage profile and writes it as JSON to `path`.
+fn write_profile(
+    status: &mut Status,
+    path: Option<&Path>,
+    profile: Option<osm_tile_compiler::stage_profile::Report>,
+) -> Result<(), String> {
+    let (Some(path), Some(profile)) = (path, profile) else {
+        return Ok(());
+    };
+    for line in profile.table().lines() {
+        status.line(line);
+    }
+    let json = serde_json::to_string_pretty(&profile).map_err(|e| e.to_string())?;
+    std::fs::write(path, json + "\n")
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    status.line(&format!("Wrote the stage profile to {}", path.display()));
+    Ok(())
+}
+
 fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
     let mut status = Status::new();
     let threads = args
@@ -1198,16 +1228,20 @@ fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
         args.output.display()
     ));
     let _cooperating = interrupt::cooperate();
+    if args.profile.is_some() {
+        osm_tile_compiler::stage_profile::start(threads);
+    }
     let report =
-        write_building_levels_cancellable(&args.input, &args.output, threads, interrupt::requested)
-            .map_err(|error| match error {
-                CompileError::Cancelled => {
-                    format!("cancelled; {} was not written", args.output.display())
-                }
-                error => error.to_string(),
-            })?;
+        write_building_levels_cancellable(&args.input, &args.output, threads, interrupt::requested);
+    let profile = osm_tile_compiler::stage_profile::finish();
+    let report = report.map_err(|error| match error {
+        CompileError::Cancelled => {
+            format!("cancelled; {} was not written", args.output.display())
+        }
+        error => error.to_string(),
+    })?;
     report_levels(&mut status, &args.output, &report);
-    Ok(())
+    write_profile(&mut status, args.profile.as_deref(), profile)
 }
 
 /// Downloads the Geofabrik extract `name` names into `directory`, or finds
@@ -1419,6 +1453,9 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.languages = args.languages;
     request.building_levels = args.building_levels;
     request.merge_cache = args.merge_cache;
+    if args.profile.is_some() {
+        osm_tile_compiler::stage_profile::start(threads);
+    }
     let start = Instant::now();
     let mut stage = None;
     let output = compile_basemap(
@@ -1441,6 +1478,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         },
         interrupt::requested,
     );
+    let profile = osm_tile_compiler::stage_profile::finish();
     if let Some(updated) = &updated_input {
         let _ = std::fs::remove_file(updated);
     }
@@ -1483,6 +1521,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     if let Some((path, report)) = &output.building_levels {
         report_levels(&mut status, path, report);
     }
+    write_profile(&mut status, args.profile.as_deref(), profile)?;
     if let Some((old, delta_path)) = &delta {
         let _partial = interrupt::remove_on_exit(archive::partial_path(delta_path));
         let report = archive::diff(old, &args.output, delta_path)?;

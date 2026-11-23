@@ -184,6 +184,7 @@ pub(crate) fn write_levels(
             output.display()
         ));
     }
+    let scan_stage = crate::stage_profile::Stage::start("building_levels.scan");
     let archive = Archive::open(input)?;
     let header = Header::parse(&archive.section(0, HEADER_BYTES as u64)?)?;
     if header.tile_type != TILE_TYPE_MVT {
@@ -195,6 +196,8 @@ pub(crate) fn write_levels(
         .chunk_by(|a, b| (a.x >> 3, a.y >> 3) == (b.x >> 3, b.y >> 3))
         .collect();
     control.set_total(groups.len() as u64);
+    drop(scan_stage);
+    let levels_stage = crate::stage_profile::Stage::start("building_levels.levels");
     let levels = || {
         groups
             .par_iter()
@@ -217,7 +220,9 @@ pub(crate) fn write_levels(
                 .install(levels)?
         };
     control.check()?;
+    drop(levels_stage);
 
+    let _write_stage = crate::stage_profile::Stage::start("building_levels.write");
     let mut encoded = Vec::new();
     let mut stats = [LevelStats::default(); LEVEL_ZOOMS.len()];
     for group in groups {

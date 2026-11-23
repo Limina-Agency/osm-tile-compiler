@@ -573,6 +573,53 @@ async fn compiles_monaco_into_a_valid_archive() {
 }
 
 #[test]
+fn profile_reports_every_stage_and_keeps_the_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let pbf = monaco_pbf();
+    let compile = |name: &str, extra: &[&str]| {
+        let output = dir.path().join(name);
+        let mut args = vec![
+            "compile".as_ref(),
+            pbf.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+            "--omit-sources".as_ref(),
+            "all".as_ref(),
+            "--max-zoom".as_ref(),
+            "12".as_ref(),
+            "--threads".as_ref(),
+            "2".as_ref(),
+        ];
+        args.extend(extra.iter().map(OsStr::new));
+        let result = run(args);
+        assert!(result.status.success(), "{result:?}");
+        (std::fs::read(output).unwrap(), text(&result.stderr))
+    };
+    let report = dir.path().join("profile.json");
+    let (plain, _) = compile("plain.pmtiles", &[]);
+    let (profiled, stderr) = compile("profiled.pmtiles", &["--profile", report.to_str().unwrap()]);
+    assert_eq!(plain, profiled, "the profiler changed the archive");
+    assert!(
+        stderr.contains("Stage profile: 2 threads given"),
+        "{stderr}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(report["threads"], 2);
+    let stages = report["stages"].as_array().unwrap();
+    let names = stages
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    for stage in ["index_osm", "ways", "relations", "final_merge"] {
+        assert!(names.contains(&stage), "{stage} missing from {names:?}");
+    }
+    for stage in stages {
+        assert!(stage["wall_seconds"].as_f64().unwrap() >= 0.0);
+    }
+}
+
+#[test]
 fn diff_and_apply_rebuild_a_compiled_archive() {
     let dir = tempfile::tempdir().unwrap();
     let path = |name: &str| dir.path().join(name);

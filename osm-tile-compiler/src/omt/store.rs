@@ -652,6 +652,7 @@ impl Sorter {
             return Ok(());
         }
         let _phase = crate::profiling::Phase::start("omt_spill_sort_write");
+        let profiled = crate::stage_profile::enabled().then(std::time::Instant::now);
         // Keys are unique (they end in the insertion sequence).
         let frames = &self.frames;
         self.entries.sort_unstable_by(|a, b| a.cmp(b, frames));
@@ -668,6 +669,13 @@ impl Sorter {
         }
         let spilled = writer.finish()?;
         self.spilled.fetch_add(spilled, AtomicOrdering::Relaxed);
+        if let Some(started) = profiled {
+            crate::stage_profile::add(
+                crate::stage_profile::Counter::SpillSortWrite,
+                started.elapsed(),
+                spilled,
+            );
+        }
         self.entries.clear();
         self.frames.clear();
         Ok(())
@@ -805,6 +813,7 @@ impl Store {
         }
         control.set_total(run_bytes * passes);
         let merge_phase = crate::profiling::Phase::start("omt_intermediate_merge");
+        let merge_stage = crate::stage_profile::Stage::start("intermediate_merge");
         while self.runs.len() > MERGE_FAN_IN {
             let groups = self.runs.len().div_ceil(MERGE_FAN_IN);
             let outputs = (0..groups).map(|_| self.next_path()).collect::<Vec<_>>();
@@ -820,6 +829,7 @@ impl Store {
             }
         }
         drop(merge_phase);
+        drop(merge_stage);
         let metadata = metadata(
             header.layers,
             (minzoom, maxzoom),
@@ -838,6 +848,7 @@ impl Store {
         let mut writing = crate::profiling::Accumulator::new("omt_archive_write");
         let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
         let final_merge = crate::profiling::Phase::start("omt_final_merge_encode_write");
+        let final_stage = crate::stage_profile::Stage::start("final_merge");
         let (mut reuse, mut writer, counters) = match cache {
             Some(cache) => (
                 cache.reuse.as_mut(),
@@ -862,8 +873,8 @@ impl Store {
             |(timings, inclusive, old_file), job: TileJob| {
                 let id = job.id;
                 let reuse = old_archive.as_deref().map(|path| (path, old_file));
-                inclusive
-                    .measure(|| {
+                crate::stage_profile::time(crate::stage_profile::Counter::EncodeTile, || {
+                    inclusive.measure(|| {
                         encode_job(
                             job,
                             hashing,
@@ -874,14 +885,18 @@ impl Store {
                             control,
                         )
                     })
-                    .map(|(bytes, entry)| (id, bytes, entry))
+                })
+                .map(|(bytes, entry)| (id, bytes, entry))
             },
             |(id, tile, entry): (u64, Option<EncodedTile>, Option<TileEntry>)| {
                 if let (Some(writer), Some(entry)) = (writer.as_deref_mut(), &entry) {
                     writer.add(entry)?;
                 }
                 if let Some(tile) = tile {
-                    writing.measure(|| archive.write_tile(id, &tile.bytes))?;
+                    crate::stage_profile::time(
+                        crate::stage_profile::Counter::ArchiveWrite,
+                        || writing.measure(|| archive.write_tile(id, &tile.bytes)),
+                    )?;
                     let layers = tile
                         .layers
                         .iter()
@@ -935,6 +950,7 @@ impl Store {
             },
         );
         drop(final_merge);
+        drop(final_stage);
         if let Err(error) = encoded {
             for path in &self.runs {
                 let _ = fs::remove_file(path);
@@ -942,8 +958,10 @@ impl Store {
             return Err(error);
         }
         let finalizing = crate::profiling::Phase::start("omt_archive_finalize");
+        let finalize_stage = crate::stage_profile::Stage::start("finalize_archive");
         archive.finalize()?;
         drop(finalizing);
+        drop(finalize_stage);
         for path in std::mem::take(&mut self.runs) {
             fs::remove_file(path).map_err(|e| e.to_string())?;
         }

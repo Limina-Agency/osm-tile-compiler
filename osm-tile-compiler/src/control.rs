@@ -409,7 +409,9 @@ pub(crate) fn run<T: Send>(
     }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        .thread_name(|index| format!("osm-tile-compile-{index}"))
+        // Linux keeps 15 bytes of a thread's name: this one keeps the index,
+        // which the stage profiler needs to tell the threads apart.
+        .thread_name(|index| format!("compile-pool-{index}"))
         .build()
         .map_err(|e| CompileError::Failed {
             stage: None,
