@@ -580,27 +580,52 @@ pub(super) struct Sorter {
 // one sort of more than this takes long enough to stall the worker's share
 // of the rendering noticeably.
 const MAX_FRAME_BUDGET: usize = 2 << 30;
-// The workers keep their starting buffers until they have spilled this many
-// runs between them. Below it the final merge takes every run in one pass,
-// so larger buffers would only add memory; above it the compile is headed
-// for more runs than one merge takes.
+// Without an estimate of the compile's size, the workers keep their starting
+// buffers until they have spilled this many runs between them. Below it the
+// final merge takes every run in one pass, so larger buffers would only add
+// memory; above it the compile is headed for more runs than one merge takes.
 const GROW_AFTER_RUNS: usize = MERGE_FAN_IN / 2;
+// With an estimate, the workers aim for this many runs in all, leaving the
+// rest of the final merge's fan-in for each worker's last, partial run and for
+// an estimate that falls short.
+const TARGET_RUNS: usize = MERGE_FAN_IN * 3 / 4;
+// With an estimate, buffers keep the floor until this many runs, so that a
+// compile whose estimate is far too large (a small area of a large extract)
+// spills a few runs before any buffer grows.
+const PLAN_AFTER_RUNS: usize = MERGE_FAN_IN / 8;
 
 /// How large the workers' sort buffers may grow.
 ///
-/// Every worker starts with `floor` frame bytes. Once the workers have
-/// spilled `GROW_AFTER_RUNS` runs between them, each worker's next buffer
-/// is as large as everything it has spilled so far, up to its share of the
-/// sort memory: run sizes double until memory caps them. A small extract
-/// keeps the floor, its run count and its peak memory; a large one ends with
-/// a few dozen large runs per worker, and the merge combines the small early
-/// runs first (`Store::finish`), rather than every record twice or more.
+/// Every worker starts with `floor` frame bytes. Given an estimate of the
+/// frame bytes the whole compile spills, a buffer grows only as far as it
+/// must for the compile to end near `TARGET_RUNS` runs: the estimated bytes
+/// still to come, spread over the runs still to spill. Near and past the
+/// estimate, at least a quarter of what was spilled is taken to be still to
+/// come. So the buffers grow with the compile's
+/// size divided by the merge's fan-in, not with the compile's size: a
+/// country's buffers stay at tens of MiB where they used to grow to half of
+/// what the workers had spilled.
+///
+/// Without an estimate, once the workers have spilled `GROW_AFTER_RUNS`
+/// runs between them, each worker's next buffer is as large as everything it
+/// has spilled so far.
+///
+/// Either way a buffer is never more than doubled at once, nor larger than
+/// its share of the sort memory. A small extract keeps the floor, its run
+/// count and its peak memory; a large one ends with about `TARGET_RUNS`
+/// runs, or, when memory caps the buffers, more, and the merge combines the
+/// small early runs first (`Store::finish`), rather than every record twice
+/// or more.
 #[derive(Debug)]
 pub(super) struct SortBudget {
     floor: usize,
     /// Bytes each worker may hold in frames and sort entries together.
     worker_memory: usize,
+    /// Frame bytes the whole compile is expected to spill.
+    expected: Option<u64>,
     runs: AtomicUsize,
+    /// Frame bytes all workers have spilled.
+    spilled: AtomicU64,
 }
 
 impl SortBudget {
@@ -613,8 +638,16 @@ impl SortBudget {
         Self {
             floor: floor.max(1),
             worker_memory,
+            expected: None,
             runs: AtomicUsize::new(0),
+            spilled: AtomicU64::new(0),
         }
+    }
+    /// Sizes the buffers for a compile expected to spill about `frames`
+    /// frame bytes in all.
+    pub(super) fn expecting(mut self, frames: Option<u64>) -> Self {
+        self.expected = frames;
+        self
     }
     /// A budget that stays at `bytes`.
     #[cfg(test)]
@@ -623,10 +656,22 @@ impl SortBudget {
     }
 
     /// The frame budget for a sorter's next run, after it spilled a run of
-    /// its own (`spilled_*` count all of them) on a budget of `current`.
-    fn after_spill(&self, current: usize, spilled_frames: u64, spilled_records: u64) -> usize {
+    /// `run_frames` on a budget of `current` (`spilled_*` count all of the
+    /// sorter's runs).
+    fn after_spill(
+        &self,
+        current: usize,
+        run_frames: u64,
+        spilled_frames: u64,
+        spilled_records: u64,
+    ) -> usize {
         let runs = self.runs.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-        if runs < GROW_AFTER_RUNS || spilled_frames == 0 {
+        let total = self.spilled.fetch_add(run_frames, AtomicOrdering::Relaxed) + run_frames;
+        let growing = match self.expected {
+            Some(_) => runs >= PLAN_AFTER_RUNS,
+            None => runs >= GROW_AFTER_RUNS,
+        };
+        if !growing || spilled_frames == 0 {
             return current;
         }
         // A record costs its frame and its entry, and the entries' vector
@@ -636,7 +681,17 @@ impl SortBudget {
         let ceiling = self.worker_memory as u128 * frames / (frames + entry_bytes);
         let ceiling = (ceiling.min(MAX_FRAME_BUDGET as u128) as usize).max(self.floor);
         let doubled = usize::try_from(spilled_frames).unwrap_or(usize::MAX);
-        doubled.max(current).min(ceiling)
+        let Some(expected) = self.expected else {
+            return doubled.max(current).min(ceiling);
+        };
+        // However far past the estimate, a quarter more is still to come.
+        let expected = expected.max(total.saturating_add(total / 4));
+        let slots = TARGET_RUNS.saturating_sub(runs).max(1) as u64;
+        let needed = usize::try_from((expected - total).div_ceil(slots)).unwrap_or(usize::MAX);
+        if needed <= current {
+            return current;
+        }
+        needed.min(doubled.max(current)).min(ceiling)
     }
 }
 
@@ -778,7 +833,8 @@ impl Sorter {
         }
         let spilled = writer.finish()?;
         self.spilled.fetch_add(spilled, AtomicOrdering::Relaxed);
-        self.spilled_frames += self.frames.len() as u64;
+        let run_frames = self.frames.len() as u64;
+        self.spilled_frames += run_frames;
         self.spilled_records += self.entries.len() as u64;
         if let Some(started) = profiled {
             crate::stage_profile::add(
@@ -789,9 +845,12 @@ impl Sorter {
         }
         self.entries.clear();
         self.frames.clear();
-        let budget =
-            self.limits
-                .after_spill(self.budget, self.spilled_frames, self.spilled_records);
+        let budget = self.limits.after_spill(
+            self.budget,
+            run_frames,
+            self.spilled_frames,
+            self.spilled_records,
+        );
         if budget > self.budget {
             self.budget = budget;
             // Free the old buffer before reserving the new one, so the two
@@ -4384,23 +4443,64 @@ mod tests {
         let budget = SortBudget::new(100, Some(4 * 10_000), 4);
         // Runs below `GROW_AFTER_RUNS` keep the floor.
         for run in 1..GROW_AFTER_RUNS as u64 {
-            assert_eq!(budget.after_spill(100, run * 100, run), 100);
+            assert_eq!(budget.after_spill(100, 100, run * 100, run), 100);
         }
         // Then a run is as large as the sorter's earlier ones together.
-        assert_eq!(budget.after_spill(100, 300, 3), 300);
-        assert_eq!(budget.after_spill(300, 600, 6), 600);
+        assert_eq!(budget.after_spill(100, 100, 300, 3), 300);
+        assert_eq!(budget.after_spill(300, 300, 600, 6), 600);
         // Up to the worker's 10,000 bytes, less its entries and their spare
         // capacity: records of 100 frame bytes leave 100 / (100 + 2 * 32).
         let ceiling = (10_000 * 100 / (100 + 2 * entry)) as usize;
-        assert_eq!(budget.after_spill(600, 100 << 14, 1 << 14), ceiling);
+        assert_eq!(budget.after_spill(600, 600, 100 << 14, 1 << 14), ceiling);
         // Never below the floor, however little memory there is.
         let starved = SortBudget::new(100, Some(10), 4);
         starved.runs.store(GROW_AFTER_RUNS, AtomicOrdering::Relaxed);
-        assert_eq!(starved.after_spill(100, 1 << 20, 1 << 14), 100);
+        assert_eq!(starved.after_spill(100, 100, 1 << 20, 1 << 14), 100);
         // Unknown memory keeps the floor too.
         let unknown = SortBudget::new(100, None, 4);
         unknown.runs.store(GROW_AFTER_RUNS, AtomicOrdering::Relaxed);
-        assert_eq!(unknown.after_spill(100, 1 << 20, 1 << 14), 100);
+        assert_eq!(unknown.after_spill(100, 100, 1 << 20, 1 << 14), 100);
+    }
+
+    #[test]
+    fn sort_budget_with_an_estimate_grows_only_as_far_as_the_target_needs() {
+        let plenty = Some(1 << 40);
+        // 100,000 frame bytes expected: runs below `PLAN_AFTER_RUNS` keep
+        // the floor.
+        let budget = SortBudget::new(100, plenty, 4).expecting(Some(100_000));
+        for run in 1..PLAN_AFTER_RUNS as u64 {
+            assert_eq!(budget.after_spill(100, 100, 10_000, run), 100);
+        }
+        // Then the bytes still expected, over the runs left to `TARGET_RUNS`:
+        // 98,400 bytes over 80 runs. Not what the sorter spilled (10,000).
+        let total = PLAN_AFTER_RUNS as u64 * 100;
+        let slots = (TARGET_RUNS - PLAN_AFTER_RUNS) as u64;
+        let needed = (100_000 - total).div_ceil(slots) as usize;
+        assert_eq!(budget.after_spill(100, 100, 10_000, 100), needed);
+        // A buffer never shrinks, and grows no further while it is enough.
+        assert_eq!(budget.after_spill(5_000, 100, 10_000, 100), 5_000);
+
+        // A compile spilling far less than expected (a small area of a large
+        // extract) grows at most by doubling, as without an estimate.
+        let over = SortBudget::new(100, plenty, 4).expecting(Some(1 << 30));
+        over.runs.store(PLAN_AFTER_RUNS, AtomicOrdering::Relaxed);
+        assert_eq!(over.after_spill(100, 100, 200, 2), 200);
+        assert_eq!(over.after_spill(200, 200, 400, 4), 400);
+
+        // One that spills more than expected has a quarter more to come:
+        // 1,700 bytes spilled of an estimate of 1,000 leaves 425.
+        let under = SortBudget::new(1, plenty, 4).expecting(Some(1_000));
+        under.runs.store(PLAN_AFTER_RUNS, AtomicOrdering::Relaxed);
+        under.spilled.store(1_600, AtomicOrdering::Relaxed);
+        let slots = (TARGET_RUNS - PLAN_AFTER_RUNS - 1) as u64;
+        assert_eq!(
+            under.after_spill(1, 100, 1 << 20, 100),
+            425u64.div_ceil(slots) as usize
+        );
+        // Past `TARGET_RUNS` the buffers double, up to the memory share.
+        let late = SortBudget::new(100, Some(4 * 10_000), 4).expecting(Some(1_000));
+        late.runs.store(TARGET_RUNS, AtomicOrdering::Relaxed);
+        assert_eq!(late.after_spill(100, 100, 300, 1), 300);
     }
 
     #[test]

@@ -25,6 +25,17 @@
   `BasemapRequest::merge_cache` (`MergeCacheOptions`), and
   `CompileResult::merge_cache` reports what was reused.
 
+### Changed
+
+- Large compiles spill far fewer sort runs and skip most intermediate merge
+  passes. The render workers' sort buffers start at 8 MiB and grow, from the
+  input PBF's size, only as far as the compile needs to end with about 96
+  runs, up to half of the memory available when rendering starts;
+  `compile --sort-memory <MIB>` and `BasemapRequest::sort_memory` set that
+  cap. An intermediate pass merges only the smallest runs needed. Regional
+  extracts are unchanged; three regions merged into one 369 MiB PBF peak at
+  728 MiB with 2 threads, against 876 MiB in 0.1.3.
+
 ## 0.2.0 (2026-11-19)
 
 ### Breaking: one entry point with a typed request

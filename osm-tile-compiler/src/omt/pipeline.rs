@@ -33,12 +33,27 @@ use std::{
 // the records per run, the run count and the peak memory where they were.
 // Compiles that spill many runs grow it (`SortBudget`).
 const WORKER_SORT_BYTES: usize = 8 * 1024 * 1024;
+// Bytes the sort spills per byte of the input PBF, at zoom 14 with every layer:
+// 2.5 to 2.9 for Berlin, Pomorskie and Malopolskie (2026-11-18 extracts), and
+// 2.9 for the three merged into one. Erring high costs a little memory; erring
+// low, a short merge of the smallest runs. A smaller area, zoom range or layer
+// selection spills less than estimated; see `SortBudget` for how that is kept
+// from growing the buffers.
+const SPILL_PER_INPUT_BYTE: u64 = 3;
 
-/// The memory the tile sort's buffers may hold together: `requested`, or
-/// else half of what the machine has available when rendering starts. The
-/// other half is left to what the compile already holds and still grows.
-pub(super) fn sort_memory(requested: Option<u64>) -> Option<u64> {
-    requested.or_else(|| crate::memory::available_bytes().map(|bytes| bytes / 2))
+/// The tile sort's buffers for `threads` workers compiling an input PBF of
+/// `input_bytes`. Together they may hold `requested_memory`, or else half of
+/// what the machine has available when rendering starts; the other half is
+/// left to what the compile already holds and still grows.
+pub(super) fn sort_budget(
+    threads: usize,
+    requested_memory: Option<u64>,
+    input_bytes: Option<u64>,
+) -> SortBudget {
+    let memory =
+        requested_memory.or_else(|| crate::memory::available_bytes().map(|bytes| bytes / 2));
+    SortBudget::new(WORKER_SORT_BYTES, memory, threads)
+        .expecting(input_bytes.map(|bytes| bytes.saturating_mul(SPILL_PER_INPUT_BYTE)))
 }
 // Features travel in small batches: a wake-up per feature costs the producer
 // more than rendering most features does.
@@ -96,13 +111,12 @@ impl Pipeline {
     pub fn new(
         store: &Store,
         threads: usize,
-        sort_memory: Option<u64>,
+        budget: SortBudget,
         region: Region,
         zooms: (u8, u8),
         selection: Arc<Selection>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        let budget = SortBudget::new(WORKER_SORT_BYTES, sort_memory, threads);
         Self::with_budget(
             store,
             threads,
