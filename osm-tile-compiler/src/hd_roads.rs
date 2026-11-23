@@ -127,7 +127,9 @@
 //!   `lead` (a motor road's, last in its group, 60 m on from where a piece meets
 //!   the ground, onward past junctions as straight as it goes: to be raised as an
 //!   approach up to a step in the ground it climbs, the end of a structure the
-//!   tags leave short, and left out where there is none). Where its
+//!   tags leave short, and left out where there is none; its number, the same of
+//!   each way's piece of it, those one after another as it goes on, and
+//!   `lead_back` where a piece is followed from its end). Where its
 //!   cross-section is another at its start, or its end: `width0`, `centre0` and
 //!   `lines0` (metres alone, as `lines`), which over `taper0` metres turn into
 //!   those above, eased at both ends; `width1` and so on. `bare0`, and `bare1`: of
@@ -2056,8 +2058,10 @@ fn structure_tiles(
                 f.tag_bool("anchor0", piece.anchor[0]).map_err(failed)?;
                 f.tag_bool("anchor1", piece.anchor[1]).map_err(failed)?;
                 f.tag_bool("approach", piece.approach).map_err(failed)?;
-                if piece.lead {
-                    f.tag_bool("lead", true).map_err(failed)?;
+                if let Some(lead) = piece.lead {
+                    f.tag_uint("lead", u64::from(lead.chain) + 1)
+                        .map_err(failed)?;
+                    f.tag_bool("lead_back", lead.back).map_err(failed)?;
                 }
                 f.line(piece.points.iter().map(coord)).map_err(failed)?;
                 layer = f.end();
