@@ -233,10 +233,14 @@ osm-tile-compiler building-levels monaco.pmtiles monaco-buildings.pmtiles
 
 ## Trees
 
-The OpenMapTiles schema has no trees. `trees` writes those mapped one by one
-(`natural=tree` nodes) to an archive of their own, for renderers that stand a
-model at each: their places, and what their tags say of their height, crown,
-leaf type and cycle, and genus. Nothing is guessed.
+The OpenMapTiles schema has no trees. `trees` writes them to an archive of their
+own, for renderers that stand a model at each: the places of those mapped one
+by one (`natural=tree` nodes) or in rows (`natural=tree_row`, a tree every
+8 m), and what their tags say of their height, crown, leaf type and cycle, and
+genus. With them, a grid of 3 m cells of where woods, scrub, orchards and
+swamps are, for a renderer to grow trees in, with their leaf type and genus:
+clear of roads, railways, water, buildings, power lines, pistes and the mapped
+trees.
 
 ```sh
 osm-tile-compiler trees monaco-latest.osm.pbf monaco-trees.pmtiles

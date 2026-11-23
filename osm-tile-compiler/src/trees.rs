@@ -1,26 +1,33 @@
-//! Trees: a PMTiles archive of the trees mapped one by one (`natural=tree` nodes) in an OSM
-//! extract, for renderers that stand a model at each. The OpenMapTiles schema has none.
+//! Trees: a PMTiles archive of the trees mapped one by one (`natural=tree` nodes) or in rows
+//! (`natural=tree_row`) in an OSM extract, and of where its woods, scrub and orchards are, for
+//! renderers that stand a model at each tree and grow the rest. The OpenMapTiles schema has none
+//! of the first, and no leaf types of the second.
 //!
 //! The archive is PMTiles v3 with tile type unknown, gzipped per tile, z14 only. Each tile is
 //! a little-endian `u32` count and then columns of that many values: `x`, `y` (the place in
 //! the tile, in 65536ths of it from its north-west corner) and `height` (decimetres) as
 //! `u16`, then `crown` (its width, decimetres), `kind`, `genus` and `source` as `u8`, 10 bytes
-//! a tree. 0 is unknown in `height`, `crown`, `kind`'s fields and `genus`. Trees keep the
-//! extract's order, which is by node ID in the extracts everyone publishes. A tile with no
-//! trees is not written.
+//! a tree. 0 is unknown in `height`, `crown`, `kind`'s fields and `genus`; `source` is 0 for a
+//! tree's own node and 1 for one of a row. Trees keep the extract's order, which is by ID in
+//! the extracts everyone publishes, rows after nodes. Then the stands: a `u8` count, each stand's
+//! `cover` (1 wood, 2 scrub, 3 orchard, 4 swamp), `kind`, `genus` and height (metres), and,
+//! unless there are none, 512 x 512 `u8` cells by rows from the north-west, each 0 or a stand's
+//! number from 1 (`stands.rs`). A tile with neither trees nor stands is not written.
 //!
-//! Nothing is guessed: a tree whose tags say nothing is a place alone, and a renderer decides
-//! what stands there.
+//! Nothing is guessed but a row's spacing: a tree whose tags say nothing is a place alone, and
+//! a renderer decides what stands there.
 
 use crate::control::{CompileError, Control};
 use crate::omt::PartialArchive;
+use crate::stands::{self, Painted, Row, Stands, WaysOnly};
 use flate2::write::GzEncoder;
 use osm_pbf_ingest::{
     IngestBuildProfile, NodeBatch, NormalizedNode, Pass2Options, Pass2Sink, RelationBatch,
     WayBatch, run_pass2_with_options,
 };
 use pmtiles::{Compression, PmTilesWriter, TileCoord, TileId, TileType};
-use std::collections::BTreeMap;
+use rayon::prelude::*;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -33,7 +40,10 @@ pub const TREES_VERSION: u32 = 1;
 /// two constants above.
 const METADATA: &str =
     r#"{"format":"trees","version":1,"attribution":"© OpenStreetMap contributors"}"#;
-const ZOOM: u8 = 14;
+pub(crate) const ZOOM: u8 = 14;
+/// Metres between a row's trees, and from a mapped one within which a row has none.
+const ROW_SPACING: f64 = 8.0;
+const ROW_CLEAR: f64 = 5.0;
 const GZIP_LEVEL: u32 = 6;
 const MAX_LATITUDE: f64 = 85.051_128_779_806_59;
 
@@ -92,7 +102,7 @@ struct Tree {
     /// leafless), leaf cycle in the next two (1 deciduous, 2 evergreen, 3 between them).
     kind: u8,
     genus: u8,
-    /// 0: mapped as a node.
+    /// 0: mapped as a node; 1: in a row.
     source: u8,
 }
 
@@ -102,10 +112,17 @@ struct Tree {
 pub struct TreesReport {
     pub tiles: u64,
     pub trees: u64,
+    /// Of them, trees of rows.
+    pub in_rows: u64,
     /// Trees whose tags give a leaf type, or a genus.
     pub with_kind: u64,
     /// Trees whose tags give a height.
     pub with_height: u64,
+    /// Tiles with stands, and the stands' area, square kilometres.
+    pub stand_tiles: u64,
+    pub stand_km2: f64,
+    /// Areas left out because the extract does not hold all of them.
+    pub incomplete: u64,
     pub raw_bytes: u64,
     pub gz_bytes: u64,
     pub seconds: f64,
@@ -120,7 +137,7 @@ pub fn trees_path(archive: &Path) -> PathBuf {
     archive.with_file_name(format!("{stem}-trees.pmtiles"))
 }
 
-/// Reads the mapped trees of the OSM extract `input` and writes them to the new archive
+/// Reads the mapped trees and the stands of the OSM extract `input` and writes them to the new archive
 /// `output`, stopping when `should_cancel` returns true. The bytes are the same for any
 /// number of `threads`. An existing `output` is never replaced, and whatever the outcome no
 /// partial archive is left.
@@ -158,31 +175,60 @@ fn write(
 ) -> Result<TreesReport, String> {
     let start = Instant::now();
     let mut sink = Trees::default();
+    let cancelled = || control.check().is_err();
+    let profile = IngestBuildProfile::DesktopFull;
     let mut options = Pass2Options::new().keep_ways(|_| false);
     options.worker_threads = Some(threads);
     options.skip_relations = true;
-    run_pass2_with_options(
-        input,
-        IngestBuildProfile::DesktopFull,
-        options,
-        &mut sink,
-        |_| {},
-        || control.check().is_err(),
-    )?;
+    run_pass2_with_options(input, profile, options, &mut sink, |_| {}, cancelled)?;
     control.check()?;
-    if sink.tiles.is_empty() {
-        return Err(format!("{} has no natural=tree nodes", input.display()));
-    }
     let mut report = TreesReport {
-        tiles: sink.tiles.len() as u64,
+        tiles: 0,
         trees: 0,
+        in_rows: 0,
         with_kind: 0,
         with_height: 0,
+        stand_tiles: 0,
+        stand_km2: 0.0,
+        incomplete: 0,
         raw_bytes: 0,
         gz_bytes: 0,
         seconds: 0.0,
     };
     let failed = |e: pmtiles::PmtError| format!("Failed to write {}: {e}", output.display());
+    let painted = {
+        // a large extract's node positions
+        let temp = Temp::create(output)?;
+        let mut stands = Stands::prepare(input, &temp.0, threads, cancelled)?;
+        let options = stands.options(threads);
+        run_pass2_with_options(
+            input,
+            profile,
+            options,
+            &mut WaysOnly(&mut stands),
+            |_| {},
+            cancelled,
+        )?;
+        control.check()?;
+        let rows = std::mem::take(&mut stands.rows);
+        sink.rows(&rows)?;
+        report.incomplete = stands.incomplete_areas();
+        let places = std::mem::take(&mut sink.places);
+        stands.paint(places, || control.check())?
+    };
+    for ((x, y), p) in painted {
+        let coord = TileCoord::new(ZOOM, x, y).map_err(|e| format!("No tile {x} {y}: {e}"))?;
+        report.stand_tiles += 1;
+        report.stand_km2 += p.covered() as f64 * stands::cell_m2(y) / 1e6;
+        sink.reach(x, y);
+        sink.stands.insert(TileId::from(coord).value(), p);
+    }
+    if sink.tiles.is_empty() && sink.stands.is_empty() {
+        return Err(format!(
+            "{} has no trees, woods or orchards",
+            input.display()
+        ));
+    }
     let partial = PartialArchive::create(output)?;
     let [west, south, east, north] = sink.bounds;
     let mut writer = PmTilesWriter::new(TileType::Unknown)
@@ -195,21 +241,42 @@ fn write(
         .metadata(METADATA)
         .create(partial.file())
         .map_err(failed)?;
-    for (id, trees) in &sink.tiles {
+    let mut ids: Vec<u64> = sink
+        .tiles
+        .keys()
+        .chain(sink.stands.keys())
+        .copied()
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    report.tiles = ids.len() as u64;
+    // few enough at a time that their cells, uncompressed, are not all held
+    for ids in ids.chunks(64 * threads.max(1)) {
         control.check()?;
-        let raw = encode_tile(trees);
-        let mut gz = GzEncoder::new(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
-        let bytes = gz
-            .write_all(&raw)
-            .and_then(|()| gz.finish())
-            .map_err(|e| format!("Failed to compress a tile: {e}"))?;
-        report.trees += trees.len() as u64;
-        report.with_kind += trees.iter().filter(|t| t.kind != 0 || t.genus != 0).count() as u64;
-        report.with_height += trees.iter().filter(|t| t.height != 0).count() as u64;
-        report.raw_bytes += raw.len() as u64;
-        report.gz_bytes += bytes.len() as u64;
-        let coord = TileCoord::from(TileId::new(*id).map_err(failed)?);
-        writer.add_tile(coord, &bytes).map_err(failed)?;
+        let tiles: Vec<(usize, Vec<u8>)> = ids
+            .par_iter()
+            .map(|id| {
+                let trees = sink.tiles.get(id).map_or(&[][..], Vec::as_slice);
+                let raw = encode_tile(trees, sink.stands.get(id));
+                let mut gz = GzEncoder::new(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
+                gz.write_all(&raw)
+                    .and_then(|()| gz.finish())
+                    .map(|bytes| (raw.len(), bytes))
+                    .map_err(|e| format!("Failed to compress a tile: {e}"))
+            })
+            .collect::<Result<_, String>>()?;
+        for (id, (raw, bytes)) in ids.iter().zip(tiles) {
+            let trees = sink.tiles.get(id).map_or(&[][..], Vec::as_slice);
+            let count = |of: fn(&Tree) -> bool| trees.iter().filter(|t| of(t)).count() as u64;
+            report.trees += trees.len() as u64;
+            report.in_rows += count(|t| t.source == 1);
+            report.with_kind += count(|t| t.kind != 0 || t.genus != 0);
+            report.with_height += count(|t| t.height != 0);
+            report.raw_bytes += raw as u64;
+            report.gz_bytes += bytes.len() as u64;
+            let coord = TileCoord::from(TileId::new(*id).map_err(failed)?);
+            writer.add_tile(coord, &bytes).map_err(failed)?;
+        }
     }
     writer.finalize().map_err(failed)?;
     partial.persist(output)?;
@@ -217,9 +284,33 @@ fn write(
     Ok(report)
 }
 
+/// A directory beside the archive for as long as it is written.
+struct Temp(PathBuf);
+
+impl Temp {
+    fn create(output: &Path) -> Result<Self, String> {
+        let mut name = output.as_os_str().to_owned();
+        name.push(format!(".{}.tmp", std::process::id()));
+        let path = PathBuf::from(name);
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Temp {
+    fn drop(&mut self) {
+        // best effort, as the compile's
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Trees by their tile's PMTiles ID.
 struct Trees {
     tiles: BTreeMap<u64, Vec<Tree>>,
+    stands: BTreeMap<u64, Painted>,
+    /// The mapped trees, in the stands' units.
+    places: Vec<[i32; 2]>,
     bounds: [f64; 4],
 }
 
@@ -227,6 +318,8 @@ impl Default for Trees {
     fn default() -> Self {
         Self {
             tiles: BTreeMap::new(),
+            stands: BTreeMap::new(),
+            places: Vec::new(),
             bounds: [180.0, 90.0, -180.0, -90.0],
         }
     }
@@ -254,36 +347,118 @@ impl Trees {
         if node.tags.get("natural") != Some("tree") || node.lat.abs() > MAX_LATITUDE {
             return Ok(());
         }
-        let ((tx, ty), (x, y)) = place(node.lng, node.lat);
+        self.places.push(stands::unit(node.lng, node.lat));
+        self.push(node.lng, node.lat, tagged(&node.tags, 0))
+    }
+
+    /// `tree` at a place.
+    fn push(&mut self, longitude: f64, latitude: f64, tree: Tree) -> Result<(), String> {
+        let ((tx, ty), (x, y)) = place(longitude, latitude);
         let coord = TileCoord::new(ZOOM, tx, ty)
-            .map_err(|e| format!("Node {} is in no tile: {e}", node.node_id))?;
-        let tag = |key: &str| node.tags.get(key);
+            .map_err(|e| format!("{longitude} {latitude} is in no tile: {e}"))?;
         self.tiles
             .entry(TileId::from(coord).value())
             .or_default()
-            .push(Tree {
-                x,
-                y,
-                height: tag("height").or(tag("est_height")).map_or(0, decimetres),
-                crown: tag("diameter_crown")
-                    .map_or(0, decimetres)
-                    .min(u16::from(u8::MAX)) as u8,
-                kind: kind(tag("leaf_type"), tag("leaf_cycle")),
-                genus: tag("genus")
-                    .or(tag("species"))
-                    .or(tag("taxon"))
-                    .map_or(0, genus),
-                source: 0,
-            });
-        let b = &mut self.bounds;
-        *b = [
-            b[0].min(node.lng),
-            b[1].min(node.lat),
-            b[2].max(node.lng),
-            b[3].max(node.lat),
-        ];
+            .push(Tree { x, y, ..tree });
+        self.hold([longitude, latitude, longitude, latitude]);
         Ok(())
     }
+
+    fn hold(&mut self, b: [f64; 4]) {
+        let a = &mut self.bounds;
+        *a = [
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ];
+    }
+
+    /// Holds a tile in the bounds.
+    fn reach(&mut self, x: u32, y: u32) {
+        let n = f64::from(1u32 << ZOOM);
+        let lon = |x: u32| f64::from(x) / n * 360.0 - 180.0;
+        let lat = |y: u32| latitude(f64::from(y) / n);
+        self.hold([lon(x), lat(y + 1), lon(x + 1), lat(y)]);
+    }
+
+    /// The rows' trees, but where one is mapped already.
+    fn rows(&mut self, rows: &[Row]) -> Result<(), String> {
+        const BUCKET: i32 = 64;
+        let mut mapped: HashMap<[i32; 2], Vec<[i32; 2]>> = HashMap::new();
+        for p in &self.places {
+            mapped
+                .entry(p.map(|c| c.div_euclid(BUCKET)))
+                .or_default()
+                .push(*p);
+        }
+        let mut places = std::mem::take(&mut self.places);
+        for row in rows {
+            let tree = tagged(&row.tags, 1);
+            let clear = stands::units(ROW_CLEAR, row.line[0][1]);
+            for p in along(&row.line, stands::units(ROW_SPACING, row.line[0][1])) {
+                let taken = (-1..=1)
+                    .flat_map(|i| (-1..=1).map(move |j| (i, j)))
+                    .filter_map(|(i, j)| {
+                        mapped.get(&[p[0].div_euclid(BUCKET) + i, p[1].div_euclid(BUCKET) + j])
+                    })
+                    .flatten()
+                    .any(|m| f64::from(m[0] - p[0]).hypot(f64::from(m[1] - p[1])) < clear);
+                if !taken {
+                    let [longitude, latitude] = stands::place(p);
+                    self.push(longitude, latitude, tree)?;
+                    places.push(p);
+                }
+            }
+        }
+        self.places = places;
+        Ok(())
+    }
+}
+
+/// Places `spacing` apart along a line, from half of it in.
+fn along(line: &[[i32; 2]], spacing: f64) -> Vec<[i32; 2]> {
+    let mut out = Vec::new();
+    let mut next = spacing * 0.5;
+    let mut gone = 0.0;
+    for e in line.windows(2) {
+        let [a, b] = [e[0], e[1]].map(|p| p.map(f64::from));
+        let long = (b[0] - a[0]).hypot(b[1] - a[1]);
+        while next < gone + long {
+            let t = (next - gone) / long;
+            out.push([0, 1].map(|c| (a[c] + (b[c] - a[c]) * t).round() as i32));
+            next += spacing;
+        }
+        gone += long;
+    }
+    out
+}
+
+/// What a tree's, or its row's, tags say of it.
+fn tagged(tags: &osm_pbf_ingest::Tags, source: u8) -> Tree {
+    let tag = |key: &str| tags.get(key);
+    Tree {
+        x: 0,
+        y: 0,
+        height: tag("height").or(tag("est_height")).map_or(0, decimetres),
+        crown: tag("diameter_crown")
+            .map_or(0, decimetres)
+            .min(u16::from(u8::MAX)) as u8,
+        kind: kind(tag("leaf_type"), tag("leaf_cycle")),
+        genus: tag("genus")
+            .or(tag("species"))
+            .or(tag("taxon"))
+            .map_or(0, genus),
+        source,
+    }
+}
+
+/// The latitude of a share of the world's height.
+pub(crate) fn latitude(v: f64) -> f64 {
+    (std::f64::consts::PI * (1.0 - 2.0 * v))
+        .sinh()
+        .atan()
+        .to_degrees()
 }
 
 /// The z14 tile a place is in, and where in it.
@@ -302,7 +477,7 @@ fn place(longitude: f64, latitude: f64) -> ((u32, u32), (u16, u16)) {
 
 /// A length's tag in decimetres: metres, with or without the unit. 0 where it is in another
 /// unit, is not a number or could not be a tree's.
-fn decimetres(text: &str) -> u16 {
+pub(crate) fn decimetres(text: &str) -> u16 {
     let text = text.trim();
     let text = text.strip_suffix('m').unwrap_or(text).trim_end();
     match text.replace(',', ".").parse::<f64>() {
@@ -311,7 +486,7 @@ fn decimetres(text: &str) -> u16 {
     }
 }
 
-fn kind(leaf_type: Option<&str>, leaf_cycle: Option<&str>) -> u8 {
+pub(crate) fn kind(leaf_type: Option<&str>, leaf_cycle: Option<&str>) -> u8 {
     let leaf = match leaf_type {
         Some("broadleaved") => 1,
         Some("needleleaved") => 2,
@@ -330,7 +505,7 @@ fn kind(leaf_type: Option<&str>, leaf_cycle: Option<&str>) -> u8 {
 }
 
 /// A genus' number, from its name or a species' or taxon's, whose first word it is.
-fn genus(name: &str) -> u8 {
+pub(crate) fn genus(name: &str) -> u8 {
     let first = name.split_whitespace().next().unwrap_or("").to_lowercase();
     TREE_GENERA
         .iter()
@@ -338,7 +513,7 @@ fn genus(name: &str) -> u8 {
         .map_or(0, |i| i as u8 + 1)
 }
 
-fn encode_tile(trees: &[Tree]) -> Vec<u8> {
+fn encode_tile(trees: &[Tree], stands: Option<&Painted>) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + trees.len() * 10);
     out.extend((trees.len() as u32).to_le_bytes());
     for column in [|t: &Tree| t.x, |t: &Tree| t.y, |t: &Tree| t.height] {
@@ -351,6 +526,10 @@ fn encode_tile(trees: &[Tree]) -> Vec<u8> {
         |t: &Tree| t.source,
     ] {
         out.extend(trees.iter().map(column));
+    }
+    match stands {
+        Some(s) => s.encode(&mut out),
+        None => out.push(0),
     }
     out
 }
@@ -423,11 +602,11 @@ mod tests {
             genus: 7,
             source: 0,
         };
-        let bytes = encode_tile(&[t(0x0101), t(0x0202)]);
+        let bytes = encode_tile(&[t(0x0101), t(0x0202)], None);
         assert_eq!(
             bytes,
             [
-                2, 0, 0, 0, 1, 1, 2, 2, 2, 0, 2, 0, 4, 3, 4, 3, 5, 5, 6, 6, 7, 7, 0, 0
+                2, 0, 0, 0, 1, 1, 2, 2, 2, 0, 2, 0, 4, 3, 4, 3, 5, 5, 6, 6, 7, 7, 0, 0, 0
             ]
         );
     }
@@ -442,12 +621,39 @@ mod tests {
         let again = write_trees(&input, &b, 4, || false).unwrap();
         assert!(report.trees > 100, "{report:?}");
         assert_eq!(report.trees, again.trees);
-        assert_eq!(report.raw_bytes, report.trees * 10 + report.tiles * 4);
+        assert_eq!(
+            (&report.in_rows, report.stand_tiles),
+            (&again.in_rows, again.stand_tiles)
+        );
+        assert!(
+            report.stand_tiles > 0 && report.stand_km2 > 0.0,
+            "{report:?}"
+        );
         assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
         assert!(matches!(
             write_trees(&input, &a, 1, || false),
             Err(CompileError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn rows_stand_their_trees_apart_and_clear_of_mapped_ones() {
+        let a = stands::unit(19.937_3, 50.061_7);
+        let spacing = stands::units(ROW_SPACING, a[1]);
+        let line = [a, [a[0] + (spacing * 10.0) as i32, a[1]]];
+        assert_eq!(along(&line, spacing).len(), 10);
+        let mut t = Trees::default();
+        // beside the third
+        t.places
+            .push([a[0] + (spacing * 2.5) as i32, a[1] + (spacing * 0.2) as i32]);
+        let row = Row {
+            tags: osm_pbf_ingest::Tags::new(),
+            line: std::sync::Arc::from(line),
+        };
+        t.rows(&[row]).unwrap();
+        assert_eq!(t.tiles.values().map(Vec::len).sum::<usize>(), 9);
+        assert!(t.tiles.values().flatten().all(|t| t.source == 1));
+        assert_eq!(t.places.len(), 10);
     }
 
     #[test]

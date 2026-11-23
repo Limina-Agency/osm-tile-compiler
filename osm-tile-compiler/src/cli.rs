@@ -74,8 +74,8 @@ Usage:
 Commands:
   compile          Compile INPUT.pbf, or the Geofabrik extract of a region,
                    into a new PMTiles archive
-  trees            Write the trees mapped one by one in an extract to a new
-                   archive, for renderers that stand a model at each
+  trees            Write the mapped trees and the woods of an extract to a new
+                   archive, for renderers that stand a model at each tree
   building-levels  Write the building levels of a compiled archive to a new
                    PMTiles archive: its buildings as boxes for far views
   fetch-sources    Download, or verify, the supplemental datasets into DIR:
@@ -1181,7 +1181,7 @@ fn trees(args: DeriveArgs) -> Result<(), String> {
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     status.line(&format!(
-        "Writing the mapped trees of {} into {} ({threads} threads)",
+        "Writing the trees and woods of {} into {} ({threads} threads)",
         args.input.display(),
         args.output.display()
     ));
@@ -1196,10 +1196,12 @@ fn trees(args: DeriveArgs) -> Result<(), String> {
             }
         })?;
     status.line(&format!(
-        "Wrote {} in {:.1} s: {} trees in {} tiles, {} with a leaf type or genus, {} with a height, {} raw, {} gzipped",
+        "Wrote {} in {:.1} s: {} trees ({} in rows) and {:.0} km2 of stands in {} tiles, {} trees with a leaf type or genus, {} with a height, {} raw, {} gzipped",
         args.output.display(),
         report.seconds,
         report.trees,
+        report.in_rows,
+        report.stand_km2,
         report.tiles,
         report.with_kind,
         report.with_height,

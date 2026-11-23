@@ -94,6 +94,7 @@ mod omt;
 mod profiling;
 mod request;
 mod sources;
+mod stands;
 mod tile_geometry;
 mod tile_slicer;
 mod tile_stats;

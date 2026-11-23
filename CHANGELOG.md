@@ -4,8 +4,9 @@
 
 ### New
 
-- `trees` (`write_trees`): the trees mapped one by one in an extract, as an
-  archive of their own.
+- `trees` (`write_trees`): the trees mapped one by one or in rows in an
+  extract, and its woods, scrub, orchards and swamps as a grid to grow trees
+  in, as an archive of their own.
 
 ## 0.2.0 (2026-11-19)
 
