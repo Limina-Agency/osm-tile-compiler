@@ -1170,7 +1170,7 @@ mod tests {
         };
         // Rings on a coarse grid touch, share edges and cross each other
         // often; some are self-intersecting.
-        let mut ring = |next: &mut dyn FnMut(i32) -> i32| {
+        let ring = |next: &mut dyn FnMut(i32) -> i32| {
             let (cx, cy, r) = (next(12), next(12), 1 + next(8));
             let n = 3 + next(6) as usize;
             let mut points = (0..n)
