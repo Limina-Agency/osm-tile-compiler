@@ -60,7 +60,26 @@ pub(super) fn buffer(input: &MultiPolygon<f64>, distance: f64) -> Option<MultiPo
     if !distance.is_finite() {
         return None;
     }
-    if let Some(result) = buffer_with(input, distance, None) {
+    buffer_curves(input, distance, offset_curves(input, distance))
+}
+
+/// The raw offset curves `BufferCurveSetBuilder` makes for `input` at full
+/// precision, before noding.
+fn offset_curves(input: &MultiPolygon<f64>, distance: f64) -> Vec<Curve> {
+    let mut curves = Vec::new();
+    for polygon in &input.0 {
+        add_polygon(polygon, distance, None, &mut curves);
+    }
+    curves
+}
+
+/// [`buffer`] from the full-precision offset curves of `input`.
+fn buffer_curves(
+    input: &MultiPolygon<f64>,
+    distance: f64,
+    curves: Vec<Curve>,
+) -> Option<MultiPolygon<f64>> {
+    if let Some(result) = build_curves(curves, distance, None) {
         return Some(result);
     }
     // BufferOp.bufferReducedPrecision: snap-rounded noding on a grid scaled
@@ -103,6 +122,14 @@ fn buffer_with(
     for polygon in &input.0 {
         add_polygon(polygon, distance, scale, &mut curves);
     }
+    build_curves(curves, distance, scale)
+}
+
+fn build_curves(
+    curves: Vec<Curve>,
+    distance: f64,
+    scale: Option<f64>,
+) -> Option<MultiPolygon<f64>> {
     let noded = match scale {
         None => node_float(&curves)?,
         Some(scale) => node_snap_round(&curves, scale, true)?,
@@ -201,16 +228,33 @@ pub(super) fn buffer_union_unbuffer(
     drop_below: f64,
 ) -> Option<MultiPolygon<f64>> {
     use geo::Area;
-    let expanded = cluster
-        .iter()
-        .map(|g| buffer(g, distance))
-        .collect::<Option<Vec<_>>>()?;
-    if drop_below > 0.0
-        && distance > 1.0
-        && eroded_hull_area(&expanded, distance - 0.8) <= drop_below
-    {
-        return Some(MultiPolygon(vec![]));
-    }
+    let early_out = drop_below > 0.0 && distance > 1.0;
+    let expanded = if early_out {
+        // The buffered members lie within the hull of their offset curves, so
+        // the same bound holds before noding and building them.
+        let curves = cluster
+            .iter()
+            .map(|g| offset_curves(g, distance))
+            .collect::<Vec<_>>();
+        let points = curves
+            .iter()
+            .flatten()
+            .flat_map(|c| c.points.iter().copied())
+            .collect();
+        if eroded_hull_area(points, distance - 0.8) <= drop_below {
+            return Some(MultiPolygon(vec![]));
+        }
+        cluster
+            .iter()
+            .zip(curves)
+            .map(|(g, c)| buffer_curves(g, distance, c))
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        cluster
+            .iter()
+            .map(|g| buffer(g, distance))
+            .collect::<Option<Vec<_>>>()?
+    };
     let mut merged = buffer(&union(&expanded)?, -distance)?;
     let largest = cluster
         .iter()
@@ -230,20 +274,46 @@ pub(super) fn buffer_union_unbuffer(
     Some(merged)
 }
 
-/// An upper bound on the area of anything the unbuffered union of `expanded`
-/// can cover: the area of the convex hull of the buffered polygons, eroded by
-/// `amount`. The negative mitre buffer of a region lies within its erosion by
-/// a disc (a mitre or bevel join removes more than a round one), and the
-/// erosion of a region lies within the erosion of its convex hull. `amount`
-/// is the buffer distance less the slack for rounding to the grid (0.71) and
-/// for the input simplification (0.01 of the distance).
-fn eroded_hull_area(expanded: &[MultiPolygon<f64>], amount: f64) -> f64 {
-    let mut points = Vec::<Point>::new();
-    for g in expanded {
-        for p in &g.0 {
-            points.extend(p.exterior().0.iter().map(point));
-        }
-    }
+/// The bound `buffer_union_unbuffer` compares with the minimum area, from
+/// the members' offset curves before buffering.
+#[cfg(test)]
+pub(super) fn pre_buffer_bound(cluster: &[MultiPolygon<f64>], distance: f64) -> f64 {
+    let points = cluster
+        .iter()
+        .flat_map(|g| offset_curves(g, distance))
+        .flat_map(|c| c.points)
+        .collect();
+    eroded_hull_area(points, distance - 0.8)
+}
+
+/// The same bound from the buffered members, as the previous early-out
+/// computed it; `None` where a member does not buffer.
+#[cfg(test)]
+pub(super) fn post_buffer_bound(cluster: &[MultiPolygon<f64>], distance: f64) -> Option<f64> {
+    let expanded = cluster
+        .iter()
+        .map(|g| buffer(g, distance))
+        .collect::<Option<Vec<_>>>()?;
+    let points = expanded
+        .iter()
+        .flat_map(|g| &g.0)
+        .flat_map(|p| p.exterior().0.iter().map(point))
+        .collect();
+    Some(eroded_hull_area(points, distance - 0.8))
+}
+
+/// An upper bound on the area of anything the unbuffered union of the
+/// buffered members can cover, from `points`, which must include every
+/// vertex of their offset curves (or of the buffered members): the area of
+/// the convex hull of the points, eroded by `amount`. The buffered members
+/// lie within that hull, since their edges are pieces of the offset curves
+/// split where the curves cross. The negative mitre buffer of a region lies
+/// within its erosion by a disc (a mitre or bevel join removes more than a
+/// round one), and the erosion of a region lies within the erosion of its
+/// convex hull. `amount` is the buffer distance less the slack for rounding
+/// to the grid (0.71) and for the input simplification (0.01 of the
+/// distance).
+fn eroded_hull_area(mut points: Vec<Point>, amount: f64) -> f64 {
     if points.len() < 3
         || points
             .iter()

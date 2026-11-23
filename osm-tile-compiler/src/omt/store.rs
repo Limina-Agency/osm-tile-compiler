@@ -5343,6 +5343,117 @@ mod merge_replay {
         );
     }
 
+    /// Checks the early-out bounds on every merged cluster of the dumped
+    /// groups: no polygon the full dissolve keeps may have an exterior above
+    /// either bound, and reports how many clusters each bound skips and the
+    /// single-thread time the dissolve spends on them.
+    #[test]
+    #[ignore]
+    fn merge_replay_drop_bounds() {
+        use super::super::jts_buffer as jts;
+        let Some(groups) = groups() else { return };
+        let min_area: f64 = std::env::var("OTC_BENCH_MIN_AREA")
+            .ok()
+            .map_or(4., |v| v.parse().unwrap())
+            * 256.;
+        let overlay_buffer = |g: &MultiPolygon<f64>, amount: f64| {
+            g.buffer_with_style(
+                BufferStyle::new(amount).line_join(LineJoin::Miter(2. * (1_f64 / 5.).asin())),
+            )
+        };
+        let (mut merged_clusters, mut fallbacks) = (0usize, 0usize);
+        let (mut before_skips, mut after_skips) = (0usize, 0usize);
+        let (mut before_secs, mut after_secs, mut total_secs) = (0., 0., 0.);
+        let (mut bound_secs, mut buffer_secs_skipped) = (0., 0.);
+        let (mut above_before, mut above_after, mut wrong) = (0usize, 0usize, 0usize);
+        let (mut worst_before, mut worst_after) = (0_f64, 0_f64);
+        for (distance, geoms) in &groups {
+            if *distance <= 1. {
+                continue;
+            }
+            for (members, ..) in merge_nearby_collect(geoms, *distance) {
+                if members.len() == 1 {
+                    continue;
+                }
+                merged_clusters += 1;
+                let cluster: Vec<MultiPolygon<f64>> =
+                    members.iter().map(|&i| geoms[i].clone()).collect();
+                let t0 = Instant::now();
+                let before = jts::pre_buffer_bound(&cluster, *distance);
+                let t1 = Instant::now();
+                let after = jts::post_buffer_bound(&cluster, *distance);
+                for g in &cluster {
+                    let _ = jts::buffer(g, *distance);
+                }
+                let t2 = Instant::now();
+                let merged = match jts::buffer_union_unbuffer(&cluster, *distance, 0.) {
+                    Some(m) => m,
+                    None => {
+                        fallbacks += 1;
+                        overlay_buffer_union_unbuffer(&cluster, *distance, overlay_buffer)
+                    }
+                };
+                let envelope = merged
+                    .bounding_rect()
+                    .map_or(0., |r| r.width() * r.height());
+                let rings = if envelope < min_area {
+                    vec![]
+                } else {
+                    jts::snap_and_fix(&merged)
+                        .map(from_grid_polygons)
+                        .unwrap_or_else(|| from_polygons(merged.clone()))
+                };
+                let t3 = Instant::now();
+                let kept = filter_tile_polygon_areas(rings, min_area, min_area);
+                let out_max = to_polygons(&kept)
+                    .0
+                    .iter()
+                    .map(|p| Polygon::new(p.exterior().clone(), vec![]).unsigned_area())
+                    .fold(0., f64::max);
+                let secs = (t3 - t2).as_secs_f64() + (t2 - t1).as_secs_f64();
+                total_secs += secs;
+                bound_secs += (t1 - t0).as_secs_f64();
+                let after = after.unwrap_or(f64::INFINITY);
+                if out_max > before + 1e-9 {
+                    above_before += 1;
+                }
+                if out_max > after + 1e-9 {
+                    above_after += 1;
+                }
+                if out_max > 0. {
+                    worst_before = worst_before.max(out_max / before);
+                    worst_after = worst_after.max(out_max / after);
+                }
+                if before <= min_area {
+                    before_skips += 1;
+                    before_secs += secs;
+                    buffer_secs_skipped += (t2 - t1).as_secs_f64();
+                    if !kept.is_empty() {
+                        wrong += 1;
+                    }
+                } else if after <= min_area {
+                    after_skips += 1;
+                    after_secs += secs - (t2 - t1).as_secs_f64();
+                    if !kept.is_empty() {
+                        wrong += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "{merged_clusters} merged clusters, {fallbacks} through the overlay fallback, {total_secs:.2}s buffer to snap"
+        );
+        println!(
+            "before buffering: {before_skips} skipped, {before_secs:.2}s saved, of which buffer {buffer_secs_skipped:.2}s"
+        );
+        println!("after buffering only: {after_skips} more skipped, {after_secs:.2}s saved");
+        println!("bound before buffering costs {bound_secs:.2}s");
+        println!(
+            "outputs above the bound before buffering {above_before}, after {above_after}; wrongly skipped {wrong}; worst output/bound {worst_before:.4} and {worst_after:.4}"
+        );
+        assert_eq!((above_before, above_after, wrong), (0, 0, 0));
+    }
+
     /// The proximity clusters' members, without merging them.
     fn merge_nearby_collect(
         geoms: &[MultiPolygon<f64>],
