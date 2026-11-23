@@ -1,4 +1,5 @@
 //! Bounded external tile-record sort and OpenMapTiles MVT archive publication.
+use super::merge_cache::{self, LayerEntry, MergeCache, OldTile, TileEntry};
 #[cfg(test)]
 use super::record_codec::encode_payload;
 use super::record_codec::{
@@ -11,7 +12,7 @@ use crate::control::Control;
 use crate::{
     ArchiveCenter, CompileBounds,
     archive::ArchiveOptions,
-    chunk_store::PmtilesArchiveWriter,
+    output::{ArchiveSpec, ArchiveTarget},
     tile_geometry::{TileGeometry, TilePoint, TileRingGroup},
     tile_stats::{TILE_WARNING_BYTES, TileStats, TileStatsBuilder},
 };
@@ -555,11 +556,80 @@ impl Header {
 pub(super) struct Sorter {
     directory: PathBuf,
     worker: usize,
+    /// Frame bytes this buffer holds before it spills; see `SortBudget`.
     budget: usize,
+    limits: Arc<SortBudget>,
     frames: Vec<u8>,
     entries: Vec<SortEntry>,
     runs: Vec<PathBuf>,
+    /// Frame bytes and records this sorter has spilled.
+    spilled_frames: u64,
+    spilled_records: u64,
     spilled: Arc<AtomicU64>,
+}
+
+// The largest frame buffer a worker grows to. Frame offsets are 32-bit, and
+// one sort of more than this takes long enough to stall the worker's share
+// of the rendering noticeably.
+const MAX_FRAME_BUDGET: usize = 2 << 30;
+// The workers keep their starting buffers until they have spilled this many
+// runs between them. Below it the final merge takes every run in one pass,
+// so larger buffers would only add memory; above it the compile is headed
+// for more runs than one merge takes.
+const GROW_AFTER_RUNS: usize = MERGE_FAN_IN / 2;
+
+/// How large the workers' sort buffers may grow.
+///
+/// Every worker starts with `floor` frame bytes. Once the workers have
+/// spilled `GROW_AFTER_RUNS` runs between them, each worker's next buffer
+/// is as large as everything it has spilled so far, up to its share of the
+/// sort memory: run sizes double until memory caps them. A small extract
+/// keeps the floor, its run count and its peak memory; a large one ends with
+/// a few dozen large runs per worker, and the merge combines the small early
+/// runs first (`Store::finish`), rather than every record twice or more.
+#[derive(Debug)]
+pub(super) struct SortBudget {
+    floor: usize,
+    /// Bytes each worker may hold in frames and sort entries together.
+    worker_memory: usize,
+    runs: AtomicUsize,
+}
+
+impl SortBudget {
+    /// `floor` frame bytes per worker, growing as far as `memory` bytes split
+    /// among `workers`; `memory` below the floors keeps the floor.
+    pub(super) fn new(floor: usize, memory: Option<u64>, workers: usize) -> Self {
+        let worker_memory = memory.map_or(0, |memory| {
+            usize::try_from(memory / workers.max(1) as u64).unwrap_or(usize::MAX)
+        });
+        Self {
+            floor: floor.max(1),
+            worker_memory,
+            runs: AtomicUsize::new(0),
+        }
+    }
+    /// A budget that stays at `bytes`.
+    #[cfg(test)]
+    pub(super) fn fixed(bytes: usize) -> Arc<Self> {
+        Arc::new(Self::new(bytes, None, 1))
+    }
+
+    /// The frame budget for a sorter's next run, after it spilled a run of
+    /// its own (`spilled_*` count all of them) on a budget of `current`.
+    fn after_spill(&self, current: usize, spilled_frames: u64, spilled_records: u64) -> usize {
+        let runs = self.runs.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        if runs < GROW_AFTER_RUNS || spilled_frames == 0 {
+            return current;
+        }
+        // A record costs its frame and its entry, and the entries' vector
+        // may hold as much spare capacity again once it has doubled.
+        let entry_bytes = 2 * spilled_records as u128 * size_of::<SortEntry>() as u128;
+        let frames = spilled_frames as u128;
+        let ceiling = self.worker_memory as u128 * frames / (frames + entry_bytes);
+        let ceiling = (ceiling.min(MAX_FRAME_BUDGET as u128) as usize).max(self.floor);
+        let doubled = usize::try_from(spilled_frames).unwrap_or(usize::MAX);
+        doubled.max(current).min(ceiling)
+    }
 }
 
 /// A buffered record's sort key, less what the frame at `offset` holds: the
@@ -657,6 +727,7 @@ impl Sorter {
         if self.frames.capacity() == 0 {
             // The buffer fills to the budget before it spills; reserving it
             // whole saves growing (and holding up to twice) as it fills.
+            // `spill` reserves budgets grown past this.
             self.frames.reserve(self.budget.min(MAX_RECORD_BYTES));
         }
         let offset = u32::try_from(self.frames.len())
@@ -682,6 +753,7 @@ impl Sorter {
             return Ok(());
         }
         let _phase = crate::profiling::Phase::start("omt_spill_sort_write");
+        let profiled = crate::stage_profile::enabled().then(std::time::Instant::now);
         // Keys are unique (they end in the insertion sequence).
         let frames = &self.frames;
         self.entries.sort_unstable_by(|a, b| a.cmp(b, frames));
@@ -698,8 +770,27 @@ impl Sorter {
         }
         let spilled = writer.finish()?;
         self.spilled.fetch_add(spilled, AtomicOrdering::Relaxed);
+        self.spilled_frames += self.frames.len() as u64;
+        self.spilled_records += self.entries.len() as u64;
+        if let Some(started) = profiled {
+            crate::stage_profile::add(
+                crate::stage_profile::Counter::SpillSortWrite,
+                started.elapsed(),
+                spilled,
+            );
+        }
         self.entries.clear();
         self.frames.clear();
+        let budget =
+            self.limits
+                .after_spill(self.budget, self.spilled_frames, self.spilled_records);
+        if budget > self.budget {
+            self.budget = budget;
+            // Free the old buffer before reserving the new one, so the two
+            // are never held together.
+            self.frames = Vec::new();
+            self.frames.reserve_exact(budget);
+        }
         Ok(())
     }
     /// Spills the remainder and hands the run files to the caller.
@@ -767,14 +858,17 @@ impl Store {
             zooms: BTreeMap::new(),
         })
     }
-    pub(super) fn sorter(&self, worker: usize, budget: usize) -> Sorter {
+    pub(super) fn sorter(&self, worker: usize, limits: &Arc<SortBudget>) -> Sorter {
         Sorter {
             directory: self.directory.clone(),
             worker,
-            budget,
+            budget: limits.floor,
+            limits: limits.clone(),
             frames: vec![],
             entries: vec![],
             runs: vec![],
+            spilled_frames: 0,
+            spilled_records: 0,
             spilled: self.spilled.clone(),
         }
     }
@@ -788,14 +882,27 @@ impl Store {
         self.sequence += 1;
         path
     }
-    /// Writes the archive into `archive`, an empty file the caller owns, and
-    /// returns the sizes of the tiles written.
+    /// Writes the archive into `archive`, an empty file or partial archive
+    /// the caller owns, and returns the sizes of the tiles written.
+    #[cfg(test)]
     pub fn finish(
-        mut self,
-        archive: &File,
+        self,
+        archive: &dyn ArchiveTarget,
         header: &ArchiveHeader,
         threads: usize,
         control: &Control,
+    ) -> Result<TileStats, String> {
+        self.finish_cached(archive, header, threads, control, None)
+    }
+    /// As `finish`, reusing layers from an earlier archive and writing a
+    /// cache index as `cache` says.
+    pub fn finish_cached(
+        mut self,
+        archive: &dyn ArchiveTarget,
+        header: &ArchiveHeader,
+        threads: usize,
+        control: &Control,
+        cache: Option<&mut MergeCache>,
     ) -> Result<TileStats, String> {
         let (bounds, center, options) = (&header.bounds, header.center, header.options);
         let (minzoom, maxzoom) = (header.min_zoom, header.max_zoom);
@@ -810,33 +917,47 @@ impl Store {
             "raw_bytes":self.spilled.load(AtomicOrdering::Relaxed),
             "bytes":self.runs.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum::<u64>()})
         );
-        // Every pass reads all the records once: the fraction is the bytes
-        // merged over the run bytes times the passes. Both count records as
-        // frames, before compression.
+        // The final merge reads every record once, and each intermediate pass
+        // the records of the runs it merges. Progress counts records as
+        // frames, before compression; a run's share of them is taken to be
+        // its share of the run files' bytes.
         let run_bytes = self.spilled.load(AtomicOrdering::Relaxed);
-        let mut passes = 1;
-        let mut runs = self.runs.len();
-        while runs > MERGE_FAN_IN {
-            runs = runs.div_ceil(MERGE_FAN_IN);
-            passes += 1;
+        let mut sizes = run_sizes(&self.runs)?;
+        let file_bytes = sizes.iter().sum::<u64>();
+        let mut intermediate = 0u64;
+        while sizes.len() > MERGE_FAN_IN {
+            let plan = merge_plan(&sizes);
+            let merged = plan.iter().map(|group| group_bytes(&sizes, group));
+            let merged = merged.collect::<Vec<_>>();
+            intermediate += merged.iter().sum::<u64>();
+            sizes = unmerged(sizes, &plan);
+            sizes.extend(merged);
         }
-        control.set_total(run_bytes * passes);
+        let intermediate = (u128::from(run_bytes) * u128::from(intermediate)
+            / u128::from(file_bytes.max(1))) as u64;
+        control.set_total(run_bytes.saturating_add(intermediate));
         let merge_phase = crate::profiling::Phase::start("omt_intermediate_merge");
+        let merge_stage = crate::stage_profile::Stage::start("intermediate_merge");
         while self.runs.len() > MERGE_FAN_IN {
-            let groups = self.runs.len().div_ceil(MERGE_FAN_IN);
-            let outputs = (0..groups).map(|_| self.next_path()).collect::<Vec<_>>();
+            let plan = merge_plan(&run_sizes(&self.runs)?);
+            let groups = plan
+                .iter()
+                .map(|group| group.iter().map(|&run| self.runs[run].clone()).collect())
+                .collect::<Vec<Vec<_>>>();
+            let outputs = groups.iter().map(|_| self.next_path()).collect::<Vec<_>>();
             // Keys are unique, so any grouping merges to the same record order.
-            if let Err(error) = merge_groups(&self.runs, &outputs, threads, control) {
+            if let Err(error) = merge_groups(&groups, &outputs, threads, control) {
                 for path in &outputs {
                     let _ = fs::remove_file(path);
                 }
                 return Err(error);
             }
-            for input in std::mem::replace(&mut self.runs, outputs) {
-                fs::remove_file(input).map_err(|e| e.to_string())?;
-            }
+            // `merge_groups` removed the merged runs.
+            self.runs = unmerged(std::mem::take(&mut self.runs), &plan);
+            self.runs.extend(outputs);
         }
         drop(merge_phase);
+        drop(merge_stage);
         let metadata = metadata(
             header.layers,
             (minzoom, maxzoom),
@@ -845,11 +966,27 @@ impl Store {
             options,
             header.omitted_sources,
         );
-        let mut archive =
-            PmtilesArchiveWriter::create(archive, bounds, center, &metadata, minzoom, maxzoom)?;
+        let mut archive = archive.open_writer(&ArchiveSpec {
+            bounds,
+            center,
+            metadata_json: &metadata,
+            min_zoom: minzoom,
+            max_zoom: maxzoom,
+        })?;
         let mut writing = crate::profiling::Accumulator::new("omt_archive_write");
         let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
         let final_merge = crate::profiling::Phase::start("omt_final_merge_encode_write");
+        let final_stage = crate::stage_profile::Stage::start("final_merge");
+        let (mut reuse, mut writer, counters) = match cache {
+            Some(cache) => (
+                cache.reuse.as_mut(),
+                cache.writer.as_mut(),
+                Some(&cache.counters),
+            ),
+            None => (None, None, None),
+        };
+        let hashing = reuse.is_some() || writer.is_some();
+        let old_archive = reuse.as_ref().map(|reuse| reuse.archive.clone());
         let encoded = encode_ordered(
             threads,
             threads.saturating_mul(TILE_WINDOW_PER_THREAD),
@@ -858,20 +995,36 @@ impl Store {
                 (
                     EncodeTimings::new(),
                     crate::profiling::Accumulator::new("omt_encode_tile_inclusive"),
+                    None::<File>,
                 )
             },
-            |(timings, inclusive), job: TileJob| {
+            |(timings, inclusive, old_file), job: TileJob| {
                 let id = job.id;
-                inclusive
-                    .measure(|| {
-                        let records = timings.decode.measure(|| job.decode())?;
-                        encode_tile(records, timings, options.gzip_level, control)
+                let reuse = old_archive.as_deref().map(|path| (path, old_file));
+                crate::stage_profile::time(crate::stage_profile::Counter::EncodeTile, || {
+                    inclusive.measure(|| {
+                        encode_job(
+                            job,
+                            hashing,
+                            reuse,
+                            counters,
+                            timings,
+                            options.gzip_level,
+                            control,
+                        )
                     })
-                    .map(|bytes| (id, bytes))
+                })
+                .map(|(bytes, entry)| (id, bytes, entry))
             },
-            |(id, tile): (u64, Option<EncodedTile>)| {
+            |(id, tile, entry): (u64, Option<EncodedTile>, Option<TileEntry>)| {
+                if let (Some(writer), Some(entry)) = (writer.as_deref_mut(), &entry) {
+                    writer.add(entry)?;
+                }
                 if let Some(tile) = tile {
-                    writing.measure(|| archive.write_tile(id, &tile.bytes))?;
+                    crate::stage_profile::time(
+                        crate::stage_profile::Counter::ArchiveWrite,
+                        || writing.measure(|| archive.write_tile(id, &tile.bytes)),
+                    )?;
                     let layers = tile
                         .layers
                         .iter()
@@ -887,9 +1040,14 @@ impl Store {
                 let mut tile_bytes = 0usize;
                 merge_prefetched(&self.runs, threads, control, |encoded| {
                     if tile_id.is_some_and(|id| id != encoded.key.tile_id) {
+                        let id = tile_id.unwrap();
                         let job = TileJob {
-                            id: tile_id.unwrap(),
+                            id,
                             records: std::mem::take(&mut tile),
+                            old: match reuse.as_deref_mut() {
+                                Some(reuse) => reuse.take(id)?,
+                                None => None,
+                            },
                         };
                         stream.send(job, tile_bytes)?;
                         tile_bytes = 0;
@@ -903,12 +1061,24 @@ impl Store {
                     Ok(())
                 })?;
                 if let Some(id) = tile_id {
-                    stream.send(TileJob { id, records: tile }, tile_bytes)?;
+                    let old = match reuse {
+                        Some(reuse) => reuse.take(id)?,
+                        None => None,
+                    };
+                    stream.send(
+                        TileJob {
+                            id,
+                            records: tile,
+                            old,
+                        },
+                        tile_bytes,
+                    )?;
                 }
                 Ok(())
             },
         );
         drop(final_merge);
+        drop(final_stage);
         if let Err(error) = encoded {
             for path in &self.runs {
                 let _ = fs::remove_file(path);
@@ -916,8 +1086,10 @@ impl Store {
             return Err(error);
         }
         let finalizing = crate::profiling::Phase::start("omt_archive_finalize");
+        let finalize_stage = crate::stage_profile::Stage::start("finalize_archive");
         archive.finalize()?;
         drop(finalizing);
+        drop(finalize_stage);
         for path in std::mem::take(&mut self.runs) {
             fs::remove_file(path).map_err(|e| e.to_string())?;
         }
@@ -926,20 +1098,79 @@ impl Store {
     }
 }
 
-/// Merges each `MERGE_FAN_IN`-sized group of `runs` into the matching path in
-/// `outputs`, at most `threads` groups at a time.
+/// The sizes of the run files at `runs`.
+fn run_sizes(runs: &[PathBuf]) -> Result<Vec<u64>, String> {
+    runs.iter()
+        .map(|run| {
+            fs::metadata(run)
+                .map(|metadata| metadata.len())
+                .map_err(|e| format!("Failed to read {}: {e}", run.display()))
+        })
+        .collect()
+}
+
+/// The runs, of these `sizes`, that the next intermediate pass merges, as
+/// groups of indexes: the fewest and smallest runs whose merging leaves at
+/// most `MERGE_FAN_IN` runs for the final merge, or all of them, in groups
+/// of at most `MERGE_FAN_IN`, when one pass can't get that far. Growing sort
+/// buffers (`SortBudget`) leave many small early runs and few large ones, so
+/// a pass usually rewrites a small part of the records rather than all.
+fn merge_plan(sizes: &[u64]) -> Vec<Vec<usize>> {
+    let (runs, fan_in) = (sizes.len(), MERGE_FAN_IN);
+    if runs <= fan_in {
+        return vec![];
+    }
+    // Each group of k runs turns into one, so g groups taking
+    // runs - fan_in + g runs between them leave exactly fan_in.
+    let groups = (runs - fan_in).div_ceil(fan_in - 1);
+    let (groups, merged) = if groups <= fan_in {
+        (groups, runs - fan_in + groups)
+    } else {
+        (runs.div_ceil(fan_in), runs)
+    };
+    let mut order = (0..runs).collect::<Vec<_>>();
+    order.sort_by_key(|&run| (sizes[run], run));
+    (0..groups)
+        .map(|group| order[group * merged / groups..(group + 1) * merged / groups].to_vec())
+        .collect()
+}
+
+fn group_bytes(sizes: &[u64], group: &[usize]) -> u64 {
+    group.iter().map(|&run| sizes[run]).sum()
+}
+
+/// The items of `items` that no group of `plan` takes, in their order.
+fn unmerged<T>(items: Vec<T>, plan: &[Vec<usize>]) -> Vec<T> {
+    let mut merged = vec![false; items.len()];
+    for &index in plan.iter().flatten() {
+        merged[index] = true;
+    }
+    items
+        .into_iter()
+        .zip(merged)
+        .filter_map(|(item, merged)| (!merged).then_some(item))
+        .collect()
+}
+
+/// Merges each group of runs into the matching path in `outputs`, at most
+/// `threads` groups at a time, and removes a group's runs once it is merged,
+/// so a pass needs scratch space for one group's records twice, not all.
 fn merge_groups(
-    runs: &[PathBuf],
+    groups: &[Vec<PathBuf>],
     outputs: &[PathBuf],
     threads: usize,
     control: &Control,
 ) -> Result<(), String> {
     let next = AtomicUsize::new(0);
     let merge_group = |group: usize| -> Result<(), String> {
-        let batch = &runs[group * MERGE_FAN_IN..((group + 1) * MERGE_FAN_IN).min(runs.len())];
+        let batch = &groups[group];
         let mut writer = RunWriter::create(&outputs[group])?;
         merge_controlled(batch, control, |record| writer.write(&record))?;
-        writer.finish().map(drop)
+        writer.finish()?;
+        for run in batch {
+            fs::remove_file(run).map_err(|e| format!("Failed to remove {}: {e}", run.display()))?;
+        }
+        Ok(())
     };
     let results = std::thread::scope(|scope| {
         let workers = (0..threads.min(outputs.len()))
@@ -989,8 +1220,11 @@ const TILE_WINDOW_PER_THREAD: usize = 8;
 struct TileJob {
     id: u64,
     records: Vec<EncodedRecord>,
+    /// The tile in the archive being reused, if any.
+    old: Option<OldTile>,
 }
 impl TileJob {
+    #[cfg(test)]
     fn decode(self) -> Result<Vec<Record>, String> {
         self.records
             .into_iter()
@@ -1391,6 +1625,8 @@ struct EncodeTimings {
     geometry: crate::profiling::Accumulator,
     dictionaries: crate::profiling::Accumulator,
     protobuf_gzip: crate::profiling::Accumulator,
+    hash: crate::profiling::Accumulator,
+    reuse: crate::profiling::Accumulator,
 }
 impl EncodeTimings {
     fn new() -> Self {
@@ -1400,6 +1636,8 @@ impl EncodeTimings {
             geometry: crate::profiling::Accumulator::new("omt_merge_geometries"),
             dictionaries: crate::profiling::Accumulator::new("omt_mvt_geometry_dictionaries"),
             protobuf_gzip: crate::profiling::Accumulator::new("omt_protobuf_gzip"),
+            hash: crate::profiling::Accumulator::new("omt_merge_cache_hash"),
+            reuse: crate::profiling::Accumulator::new("omt_merge_cache_read"),
         }
     }
 }
@@ -1409,40 +1647,37 @@ struct EncodedTile {
     layers: Vec<(String, u64)>,
 }
 
-fn encode_tile(
-    records: Vec<Record>,
+/// A layer's records merged and encoded as a tile's layer field, or `None`
+/// when no feature is left.
+fn encode_layer_records(
+    name: &str,
+    mut records: Vec<Record>,
+    timings: &mut EncodeTimings,
+    control: &Control,
+) -> Result<Option<Vec<u8>>, String> {
+    control.check()?;
+    records.sort_by(order);
+    records = timings.density.measure(|| point_density(records));
+    records = timings
+        .geometry
+        .measure(|| merge_geometries_controlled(records, control))?;
+    let layer = timings
+        .dictionaries
+        .measure(|| encode_layer(name, &records))
+        .map_err(|e| format!("Failed to encode layer {name}: {e}"))?;
+    if layer.num_features() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(timings.protobuf_gzip.measure(|| layer.encode())))
+}
+
+/// Gzips a tile's layers; `None` when it has none.
+fn finish_tile(
+    tile: Vec<u8>,
+    sizes: Vec<(String, u64)>,
     timings: &mut EncodeTimings,
     gzip_level: u32,
-    control: &Control,
 ) -> Result<Option<EncodedTile>, String> {
-    let mut layers: BTreeMap<AttrKey, Vec<Record>> = BTreeMap::new();
-    for record in records {
-        layers.entry(record.layer.clone()).or_default().push(record);
-    }
-    // Each layer is encoded as a tile of its own; one after another they are
-    // the tile, since a tile is only its repeated layer field.
-    let mut tile = Vec::new();
-    let mut sizes = Vec::new();
-    for (name, mut records) in layers {
-        control.check()?;
-        records.sort_by(order);
-        records = timings.density.measure(|| point_density(records));
-        records = timings
-            .geometry
-            .measure(|| merge_geometries_controlled(records, control))?;
-        let layer = timings
-            .dictionaries
-            .measure(|| encode_layer(&name, &records))
-            .map_err(|e| format!("Failed to encode layer {name}: {e}"))?;
-        if layer.num_features() == 0 {
-            continue;
-        }
-        let start = tile.len();
-        timings
-            .protobuf_gzip
-            .measure(|| tile.extend_from_slice(&layer.encode()));
-        sizes.push((name.into_owned(), (tile.len() - start) as u64));
-    }
     if sizes.is_empty() {
         return Ok(None);
     }
@@ -1454,6 +1689,154 @@ fn encode_tile(
         bytes,
         layers: sizes,
     }))
+}
+
+/// Encodes a tile job. With `hashing`, also returns the tile's cache entry;
+/// with `reuse` (the old archive and this worker's handle on it), layers
+/// whose records match the old tile's are taken from it.
+fn encode_job(
+    job: TileJob,
+    hashing: bool,
+    reuse: Option<(&Path, &mut Option<File>)>,
+    counters: Option<&merge_cache::Counters>,
+    timings: &mut EncodeTimings,
+    gzip_level: u32,
+    control: &Control,
+) -> Result<(Option<EncodedTile>, Option<TileEntry>), String> {
+    let id = job.id;
+    // Records arrive sorted by layer, so each layer is one run of them.
+    let mut groups: Vec<(Layer, Vec<EncodedRecord>)> = Vec::new();
+    for record in job.records {
+        if record.key.tile_id != id {
+            return Err("OMT tile job contains a different tile".into());
+        }
+        match groups.last_mut() {
+            Some((layer, records)) if *layer == record.key.layer => records.push(record),
+            _ => groups.push((record.key.layer.clone(), vec![record])),
+        }
+    }
+    // Layers are encoded in name order, as a map by name would hold them.
+    groups.sort_by(|a, b| a.0.name().cmp(b.0.name()));
+    if groups.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err("OMT tile job holds a layer twice".into());
+    }
+    let keys = if hashing {
+        timings.hash.measure(|| {
+            groups
+                .iter()
+                .map(|(layer, records)| merge_cache::layer_key(id, layer.name(), records))
+                .collect::<Vec<_>>()
+        })
+    } else {
+        Vec::new()
+    };
+    let old = job.old.as_ref().filter(|_| hashing);
+    let count = |counter: fn(&merge_cache::Counters) -> &AtomicU64, n: usize| {
+        if let Some(counters) = counters {
+            merge_cache::Counters::add(counter(counters), n as u64);
+        }
+    };
+    let (path, mut file) = match reuse {
+        Some((path, file)) => (Some(path), Some(file)),
+        None => (None, None),
+    };
+    // Every layer the same as before: the old tile, as it is stored.
+    if let (Some(old), Some(path), Some(file)) = (old, path, file.as_deref_mut())
+        && old.copy
+        && old.entry.layers.len() == groups.len()
+        && old
+            .entry
+            .layers
+            .iter()
+            .zip(groups.iter().zip(&keys))
+            .all(|(entry, ((layer, _), key))| *entry.name == *layer.name() && entry.key == *key)
+    {
+        let tile = if old.entry.stored == 0 {
+            None
+        } else {
+            let bytes = timings
+                .reuse
+                .measure(|| merge_cache::read_stored(file, path, old))?;
+            Some(EncodedTile {
+                bytes,
+                layers: old
+                    .entry
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.size > 0)
+                    .map(|layer| (layer.name.to_string(), u64::from(layer.size)))
+                    .collect(),
+            })
+        };
+        count(|c| &c.tiles_reused, 1);
+        count(|c| &c.layers_reused, groups.len());
+        return Ok((tile, Some(old.entry.clone())));
+    }
+    let mut old_layers: Option<Vec<u8>> = None;
+    let mut tile = Vec::new();
+    let mut sizes = Vec::new();
+    let mut entries = Vec::with_capacity(if hashing { groups.len() } else { 0 });
+    for (index, (layer, records)) in groups.into_iter().enumerate() {
+        let name = layer.name();
+        // The same layer in the old tile, and where its bytes start there.
+        let hit = old.and_then(|old| {
+            let mut start = 0usize;
+            for entry in &old.entry.layers {
+                if *entry.name == *name {
+                    return (entry.key == keys[index]).then_some((old, start, entry.size));
+                }
+                start += entry.size as usize;
+            }
+            None
+        });
+        let bytes = match (hit, path, file.as_deref_mut()) {
+            (Some((old, start, size)), Some(path), Some(file)) => {
+                count(|c| &c.layers_reused, 1);
+                if size == 0 {
+                    None
+                } else {
+                    if old_layers.is_none() {
+                        old_layers = Some(
+                            timings
+                                .reuse
+                                .measure(|| merge_cache::read_layers(file, path, old))?,
+                        );
+                    }
+                    let all = old_layers.as_ref().expect("read above");
+                    Some(all[start..start + size as usize].to_vec())
+                }
+            }
+            _ => {
+                count(|c| &c.layers_encoded, 1);
+                let records = timings.decode.measure(|| {
+                    records
+                        .into_iter()
+                        .map(EncodedRecord::decode)
+                        .collect::<Result<Vec<_>, _>>()
+                })?;
+                encode_layer_records(name, records, timings, control)?
+            }
+        };
+        let size = bytes.as_ref().map_or(0, Vec::len);
+        if hashing {
+            entries.push(LayerEntry {
+                name: name.into(),
+                key: keys[index],
+                size: u32::try_from(size).map_err(|_| "OMT tile layer exceeds 4 GiB")?,
+            });
+        }
+        if let Some(bytes) = bytes {
+            tile.extend_from_slice(&bytes);
+            sizes.push((name.to_string(), size as u64));
+        }
+    }
+    let tile = finish_tile(tile, sizes, timings, gzip_level)?;
+    let entry = hashing.then(|| TileEntry {
+        tile_id: id,
+        stored: tile.as_ref().map_or(0, |tile| tile.bytes.len() as u32),
+        layers: entries,
+    });
+    Ok((tile, entry))
 }
 
 /// The layer's features, in `records` order. Attributes starting with `_` are
@@ -3671,7 +4054,11 @@ mod tests {
 
     #[test]
     fn worker_decode_preserves_record_order_and_rejects_corrupt_records() {
-        let make_job = |records: Vec<EncodedRecord>| TileJob { id: 0, records };
+        let make_job = |records: Vec<EncodedRecord>| TileJob {
+            id: 0,
+            records,
+            old: None,
+        };
         let decoded = make_job(vec![
             EncodedRecord::encode(&record(9), seq(0)).unwrap(),
             EncodedRecord::encode(&record(2), seq(0)).unwrap(),
@@ -3892,7 +4279,7 @@ mod tests {
         // budget small enough to spill several runs.
         let layers = ["poi", "zzz_custom", "building", "aaa_custom", "water"];
         let mut expected = vec![];
-        let mut sorter = store.sorter(0, 600);
+        let mut sorter = store.sorter(0, &SortBudget::fixed(600));
         for i in 0..200u64 {
             let mut r = record(i % 3);
             r.tile_id = (i * 7) % 4;
@@ -3928,12 +4315,62 @@ mod tests {
     }
 
     #[test]
+    fn merge_plan_merges_only_the_smallest_runs_it_needs() {
+        let f = MERGE_FAN_IN;
+        assert!(merge_plan(&vec![1; f]).is_empty());
+        // One run too many: the two smallest become one.
+        let mut sizes = (0..=f as u64).map(|run| 1000 - run).collect::<Vec<_>>();
+        assert_eq!(merge_plan(&sizes), vec![vec![f, f - 1]]);
+        // Many small early runs and a few large ones: only small ones merge.
+        sizes = [vec![8; 3 * f], vec![1 << 20; 40]].concat();
+        let plan = merge_plan(&sizes);
+        assert!(plan.iter().flatten().all(|&run| sizes[run] == 8));
+        let left = sizes.len() - plan.iter().map(Vec::len).sum::<usize>() + plan.len();
+        assert_eq!(left, f);
+        assert!(plan.iter().all(|group| (2..=f).contains(&group.len())));
+        // More than one pass can reach: every run, in groups of at most f.
+        sizes = vec![1; f * f + 1];
+        let plan = merge_plan(&sizes);
+        assert_eq!(plan.len(), f + 1);
+        assert_eq!(plan.iter().map(Vec::len).sum::<usize>(), sizes.len());
+        assert!(plan.iter().all(|group| group.len() <= f));
+        let mut runs = plan.concat();
+        runs.sort_unstable();
+        assert!(runs.iter().copied().eq(0..sizes.len()));
+    }
+
+    #[test]
+    fn sort_budget_grows_after_many_runs_up_to_its_memory() {
+        let entry = size_of::<SortEntry>() as u64;
+        let budget = SortBudget::new(100, Some(4 * 10_000), 4);
+        // Runs below `GROW_AFTER_RUNS` keep the floor.
+        for run in 1..GROW_AFTER_RUNS as u64 {
+            assert_eq!(budget.after_spill(100, run * 100, run), 100);
+        }
+        // Then a run is as large as the sorter's earlier ones together.
+        assert_eq!(budget.after_spill(100, 300, 3), 300);
+        assert_eq!(budget.after_spill(300, 600, 6), 600);
+        // Up to the worker's 10,000 bytes, less its entries and their spare
+        // capacity: records of 100 frame bytes leave 100 / (100 + 2 * 32).
+        let ceiling = (10_000 * 100 / (100 + 2 * entry)) as usize;
+        assert_eq!(budget.after_spill(600, 100 << 14, 1 << 14), ceiling);
+        // Never below the floor, however little memory there is.
+        let starved = SortBudget::new(100, Some(10), 4);
+        starved.runs.store(GROW_AFTER_RUNS, AtomicOrdering::Relaxed);
+        assert_eq!(starved.after_spill(100, 1 << 20, 1 << 14), 100);
+        // Unknown memory keeps the floor too.
+        let unknown = SortBudget::new(100, None, 4);
+        unknown.runs.store(GROW_AFTER_RUNS, AtomicOrdering::Relaxed);
+        assert_eq!(unknown.after_spill(100, 1 << 20, 1 << 14), 100);
+    }
+
+    #[test]
     fn opaque_merge_orders_equal_keys_by_sequence_across_multiple_passes() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = Store::new(temp.path()).unwrap();
         // Equal sort keys; sequences are interleaved across runs and workers.
         for run in 0..20u64 {
-            let mut sorter = store.sorter(run as usize, usize::MAX);
+            let mut sorter = store.sorter(run as usize, &SortBudget::fixed(usize::MAX));
             for offset in 0..3u64 {
                 let sequence = offset * 20 + run;
                 let mut r = record(7);
@@ -3967,7 +4404,7 @@ mod tests {
     fn interleaved_runs(temp: &Path) -> Store {
         let mut store = Store::new(temp).unwrap();
         for worker in 0..6u64 {
-            let mut sorter = store.sorter(worker as usize, 400 * 300);
+            let mut sorter = store.sorter(worker as usize, &SortBudget::fixed(400 * 300));
             for i in 0..1500u64 {
                 let mut r = record(i);
                 r.tile_id = (i * i * 7 + worker * 13) % 9000 / 30;
@@ -4315,7 +4752,7 @@ mod tests {
     /// Sorts records into one run owned by `store`; the position in `records`
     /// plus `first` is the insertion sequence.
     fn add_run(store: &mut Store, worker: usize, first: u64, records: Vec<Record>) {
-        let mut sorter = store.sorter(worker, usize::MAX);
+        let mut sorter = store.sorter(worker, &SortBudget::fixed(usize::MAX));
         for (offset, r) in records.iter().enumerate() {
             sorter
                 .add(EncodedRecord::encode(r, seq(first + offset as u64)).unwrap())
@@ -5139,9 +5576,6 @@ mod merge_replay {
                         })
                         .collect::<Vec<_>>(),
                 );
-                let brect = bpts.bounding_rect().unwrap();
-                let env_bound =
-                    (brect.width() - 2. * dd).max(0.) * (brect.height() - 2. * dd).max(0.);
                 let bhull = bpts.convex_hull();
                 let bhull_area = bhull.unsigned_area();
                 let iso_bound = (bhull_area.sqrt() - dd * std::f64::consts::PI.sqrt())
@@ -5330,8 +5764,7 @@ mod merge_replay {
             "bucket dropped clusters buffer union unbuffer snap | hull_time hull_pred hull_pred_secs env_pred sumbuf_pred"
         );
         for (b, name) in ["2", "3-5", "6-20", "21-100", ">100"].iter().enumerate() {
-            for d in 0..2 {
-                let r = &rows[b][d];
+            for (d, r) in rows[b].iter().enumerate() {
                 println!(
                     "{name:>7} {d} {:>7} {:6.2} {:6.2} {:6.2} {:6.2} | {:5.2} {:>7} {:6.2} {:>7} {:>7}",
                     r.clusters,

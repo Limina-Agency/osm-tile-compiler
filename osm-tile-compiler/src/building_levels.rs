@@ -23,7 +23,7 @@
 //! a thread, plus the finished tiles.
 
 use crate::control::{CompileError, Control};
-use crate::omt::PartialArchive;
+use crate::output::{OutputFormat, PartialArchive};
 use fast_mvt::{MvtFeatureRef, MvtReaderRef, MvtValueRef};
 use flate2::{read::GzDecoder, write::GzEncoder};
 use pmtiles::{Compression, PmTilesWriter, TileCoord, TileId, TileType};
@@ -184,6 +184,7 @@ pub(crate) fn write_levels(
             output.display()
         ));
     }
+    let scan_stage = crate::stage_profile::Stage::start("building_levels.scan");
     let archive = Archive::open(input)?;
     let header = Header::parse(&archive.section(0, HEADER_BYTES as u64)?)?;
     if header.tile_type != TILE_TYPE_MVT {
@@ -195,6 +196,8 @@ pub(crate) fn write_levels(
         .chunk_by(|a, b| (a.x >> 3, a.y >> 3) == (b.x >> 3, b.y >> 3))
         .collect();
     control.set_total(groups.len() as u64);
+    drop(scan_stage);
+    let levels_stage = crate::stage_profile::Stage::start("building_levels.levels");
     let levels = || {
         groups
             .par_iter()
@@ -217,7 +220,9 @@ pub(crate) fn write_levels(
                 .install(levels)?
         };
     control.check()?;
+    drop(levels_stage);
 
+    let _write_stage = crate::stage_profile::Stage::start("building_levels.write");
     let mut encoded = Vec::new();
     let mut stats = [LevelStats::default(); LEVEL_ZOOMS.len()];
     for group in groups {
@@ -279,7 +284,7 @@ pub(crate) fn has_building_layer(archive: &Path) -> Result<bool, String> {
 
 fn write_archive(output: &Path, header: &Header, tiles: &[(u64, Vec<u8>)]) -> Result<(), String> {
     let failed = |e: pmtiles::PmtError| format!("Failed to write {}: {e}", output.display());
-    let partial = PartialArchive::create(output)?;
+    let partial = PartialArchive::create(output, OutputFormat::PmTiles)?;
     let [west, south, east, north] = header.bounds;
     let [longitude, latitude] = header.center;
     let mut writer = PmTilesWriter::new(TileType::Unknown)

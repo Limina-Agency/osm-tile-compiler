@@ -8,8 +8,8 @@ use crate::interrupt;
 use osm_tile_compiler::{
     ArchiveCenter, Area, BasemapRequest, BuildingLevelsReport, ClipTo, CompileBounds, CompileError,
     CompileStage, DEFAULT_MAX_DIFFS, ExtractEvent, FetchEvent, FetchMode, LayerSelection,
-    OMT_LANGUAGES as LANGUAGES, OMT_LAYERS as LAYERS, ReadScope, Replication, SourcesPolicy,
-    SupplementalDataset, UpdateEvent, UpdateReport, UpdateRequest, ZoomRange,
+    OMT_LANGUAGES as LANGUAGES, OMT_LAYERS as LAYERS, OutputFormat, ReadScope, Replication,
+    SourcesPolicy, SupplementalDataset, UpdateEvent, UpdateReport, UpdateRequest, ZoomRange,
     archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
     kib, resolve_languages, update_extract, write_building_levels_cancellable,
@@ -38,8 +38,8 @@ const STYLE_SPRITE: &str = "https://openmaptiles.github.io/osm-bright-gl-style/s
 
 const USAGE: &str = "\
 Usage:
-  osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
-  osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
@@ -53,11 +53,11 @@ Usage:
 
 const HELP: &str = "\
 Compiles an OpenStreetMap PBF extract into an OpenMapTiles-schema vector
-basemap, written as one PMTiles archive.
+basemap, written as one PMTiles or MBTiles archive.
 
 Usage:
-  osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
-  osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
@@ -105,6 +105,9 @@ Compile options:
   --download-dir <DIR>  Where --area keeps extracts [default: --sources, or
                         the current directory with --omit-sources all]
   --output <FILE>       Archive to write; must not exist yet
+  --format <FORMAT>     pmtiles or mbtiles [default: mbtiles for a .mbtiles
+                        --output, otherwise pmtiles]. Building levels,
+                        --delta-from and the merge cache need pmtiles
   --sources <DIR>       Directory holding the supplemental datasets
   --bounds <W S E N>    Area to compile, in degrees [default: the PBF header's box];
                         W > E crosses the antimeridian
@@ -119,6 +122,9 @@ Compile options:
   --min-zoom <N>        Lowest zoom, 0-14 [default: 0]
   --max-zoom <N>        Highest zoom, 0-14 [default: 14]
   --threads <N>         Worker threads [default: available cores]
+  --sort-memory <MIB>   Memory the tile sort may hold before it writes runs
+                        to scratch, at least 8 MiB per thread [default: half
+                        of the memory available when rendering starts]
   --temp-dir <DIR>      Scratch space [default: <FILE>.tmp, removed afterwards]
   --fetch               Download any supplemental dataset missing from --sources
   --building-levels     Also write the building levels beside the archive, as
@@ -129,6 +135,8 @@ Compile options:
                         all (then --sources is not needed). The archive's
                         metadata lists them as omitted_sources
   --json                Print the compile result as JSON on stdout
+  --profile <FILE>      Measure each stage's wall time, CPU time and thread
+                        use; print a table and write the report as JSON
   --name <TEXT>         Archive metadata name [default: OpenMapTiles]
   --description <TEXT>  Archive metadata description
   --attribution <HTML>  Attribution viewers show; must keep crediting
@@ -154,6 +162,15 @@ Compile options:
   --delta-from <OLD.pmtiles>
                         Experimental: also write <NAME>.delta beside the
                         archive, the delta that turns OLD.pmtiles into it
+  --merge-cache         Experimental: also write <NAME>.merge-cache beside
+                        the archive, so that a later compile can reuse its
+                        tiles with --reuse-from
+  --reuse-from <OLD.pmtiles>
+                        Experimental: take each tile layer whose input is
+                        unchanged from OLD.pmtiles, compiled with
+                        --merge-cache, instead of merging and encoding it
+                        again; the archive is the same as without it. Implies
+                        --merge-cache
 
 Diff and apply options:
   --output <FILE>       File to write; must not exist yet
@@ -186,6 +203,7 @@ Update options (experimental):
 Building levels options:
   --threads <N>         Worker threads [default: available cores]; the archive
                         is the same for any number
+  --profile <FILE>      Measure each stage, as for compile
 
 Style options:
   --glyphs <URL>        Font glyphs, with {fontstack} and {range}
@@ -208,6 +226,7 @@ stdout.";
 struct CompileArgs {
     input: Input,
     output: PathBuf,
+    format: OutputFormat,
     sources: PathBuf,
     omit_sources: Vec<SupplementalDataset>,
     bounds: Option<CompileBounds>,
@@ -217,14 +236,17 @@ struct CompileArgs {
     archive: ArchiveOptions,
     zoom: ZoomRange,
     threads: Option<usize>,
+    sort_memory: Option<u64>,
     temp_dir: Option<PathBuf>,
     fetch: bool,
     building_levels: bool,
     json: bool,
+    profile: Option<PathBuf>,
     layers: LayerSelection,
     languages: Option<Vec<String>>,
     changes: ChangeArgs,
     delta_from: Option<PathBuf>,
+    merge_cache: osm_tile_compiler::MergeCacheOptions,
 }
 
 /// The change files and replication server `compile` and `update` apply.
@@ -310,6 +332,7 @@ struct BuildingLevelsArgs {
     input: PathBuf,
     output: PathBuf,
     threads: Option<usize>,
+    profile: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -497,6 +520,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut area = None;
     let mut download_dir = None;
     let mut output = None;
+    let mut format = None;
     let mut sources = None;
     let mut bounds = None;
     let mut polygon = None;
@@ -506,16 +530,19 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut min_zoom = 0;
     let mut max_zoom = 14;
     let mut threads = None;
+    let mut sort_memory = None;
     let mut temp_dir = None;
     let mut fetch = false;
     let mut building_levels = false;
     let mut omit_sources = Vec::new();
     let mut json = false;
+    let mut profile = None;
     let mut only_layers = None;
     let mut excluded_layers = None;
     let mut languages = None;
     let mut changes = ChangeArgs::default();
     let mut delta_from = None;
+    let mut merge_cache = osm_tile_compiler::MergeCacheOptions::default();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -531,10 +558,18 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         match flag.as_str() {
             "--help" | "-h" => return Ok(Command::Help),
             "--output" => output = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--format" => {
+                let id = value(&mut args, &flag)?.to_string_lossy().into_owned();
+                format =
+                    Some(OutputFormat::from_id(&id).ok_or_else(|| {
+                        format!("--format must be pmtiles or mbtiles, got '{id}'")
+                    })?);
+            }
             "--sources" => sources = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--area" => area = Some(value(&mut args, &flag)?.to_string_lossy().into_owned()),
             "--download-dir" => download_dir = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--temp-dir" => temp_dir = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--profile" => profile = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--bounds" => bounds = Some(parse_bounds(&mut args, &flag)?),
             "--polygon" => polygon = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--area-only" => area_only = true,
@@ -579,6 +614,13 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 }
                 threads = Some(count);
             }
+            "--sort-memory" => {
+                let mib: u64 = number(value(&mut args, &flag)?, &flag)?;
+                sort_memory = Some(
+                    mib.checked_mul(1 << 20)
+                        .ok_or("--sort-memory is too large")?,
+                );
+            }
             "--fetch" => fetch = true,
             "--building-levels" => building_levels = true,
             "--omit-sources" => {
@@ -610,6 +652,11 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 languages = Some(list);
             }
             "--delta-from" => delta_from = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--merge-cache" => merge_cache.write = true,
+            "--reuse-from" => {
+                merge_cache.reuse_from = Some(PathBuf::from(value(&mut args, &flag)?));
+                merge_cache.write = true;
+            }
             _ if changes.parse(&flag, &mut args)? => {}
             _ => return Err(format!("unknown compile option '{flag}'")),
         }
@@ -652,6 +699,27 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
             output.display()
         ));
     }
+    let format = format.unwrap_or_else(|| OutputFormat::from_path(&output));
+    if format != OutputFormat::PmTiles {
+        if building_levels {
+            return Err(format!(
+                "--building-levels needs a PMTiles archive, not {}",
+                format.name()
+            ));
+        }
+        if delta_from.is_some() {
+            return Err(format!(
+                "--delta-from needs a PMTiles archive, not {}",
+                format.name()
+            ));
+        }
+        if merge_cache.write {
+            return Err(format!(
+                "--merge-cache and --reuse-from need a PMTiles archive, not {}",
+                format.name()
+            ));
+        }
+    }
     let sources = match sources {
         Some(sources) => sources,
         // Nothing is read from it.
@@ -669,6 +737,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     Ok(Command::Compile(Box::new(CompileArgs {
         input,
         output,
+        format,
         sources,
         omit_sources,
         bounds,
@@ -678,14 +747,17 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         archive,
         zoom,
         threads,
+        sort_memory,
         temp_dir,
         fetch,
         building_levels,
         json,
+        profile,
         layers,
         languages,
         changes,
         delta_from,
+        merge_cache,
     })))
 }
 
@@ -745,6 +817,7 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
 fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
     let mut paths = Vec::new();
     let mut threads = None;
+    let mut profile = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -760,6 +833,7 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
                 }
                 threads = Some(count);
             }
+            "--profile" => profile = Some(PathBuf::from(value(&mut args, &flag)?)),
             _ => return Err(format!("unknown building-levels option '{flag}'")),
         }
     }
@@ -769,6 +843,7 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
             input,
             output,
             threads,
+            profile,
         })),
         (_, _, Some(extra)) => Err(format!(
             "unexpected argument '{}': building-levels takes two archives",
@@ -1136,6 +1211,25 @@ fn report_levels(status: &mut Status, path: &Path, report: &BuildingLevelsReport
     }
 }
 
+/// Prints the stage profile and writes it as JSON to `path`.
+fn write_profile(
+    status: &mut Status,
+    path: Option<&Path>,
+    profile: Option<osm_tile_compiler::stage_profile::Report>,
+) -> Result<(), String> {
+    let (Some(path), Some(profile)) = (path, profile) else {
+        return Ok(());
+    };
+    for line in profile.table().lines() {
+        status.line(line);
+    }
+    let json = serde_json::to_string_pretty(&profile).map_err(|e| e.to_string())?;
+    std::fs::write(path, json + "\n")
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    status.line(&format!("Wrote the stage profile to {}", path.display()));
+    Ok(())
+}
+
 fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
     let mut status = Status::new();
     let threads = args
@@ -1147,16 +1241,20 @@ fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
         args.output.display()
     ));
     let _cooperating = interrupt::cooperate();
+    if args.profile.is_some() {
+        osm_tile_compiler::stage_profile::start(threads);
+    }
     let report =
-        write_building_levels_cancellable(&args.input, &args.output, threads, interrupt::requested)
-            .map_err(|error| match error {
-                CompileError::Cancelled => {
-                    format!("cancelled; {} was not written", args.output.display())
-                }
-                error => error.to_string(),
-            })?;
+        write_building_levels_cancellable(&args.input, &args.output, threads, interrupt::requested);
+    let profile = osm_tile_compiler::stage_profile::finish();
+    let report = report.map_err(|error| match error {
+        CompileError::Cancelled => {
+            format!("cancelled; {} was not written", args.output.display())
+        }
+        error => error.to_string(),
+    })?;
     report_levels(&mut status, &args.output, &report);
-    Ok(())
+    write_profile(&mut status, args.profile.as_deref(), profile)
 }
 
 /// Downloads the Geofabrik extract `name` names into `directory`, or finds
@@ -1348,6 +1446,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     ));
     let mut request =
         BasemapRequest::new(input, args.output.clone(), args.sources, temp_dir.clone());
+    request.format = Some(args.format);
     request.sources_policy = if args.fetch {
         SourcesPolicy::FetchMissing
     } else {
@@ -1366,6 +1465,11 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.layers = args.layers;
     request.languages = args.languages;
     request.building_levels = args.building_levels;
+    request.sort_memory = args.sort_memory;
+    request.merge_cache = args.merge_cache;
+    if args.profile.is_some() {
+        osm_tile_compiler::stage_profile::start(threads);
+    }
     let start = Instant::now();
     let mut stage = None;
     let output = compile_basemap(
@@ -1388,6 +1492,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         },
         interrupt::requested,
     );
+    let profile = osm_tile_compiler::stage_profile::finish();
     if let Some(updated) = &updated_input {
         let _ = std::fs::remove_file(updated);
     }
@@ -1418,12 +1523,19 @@ fn compile(args: CompileArgs) -> Result<(), String> {
             kib(largest.bytes)
         ));
     }
+    if let Some(cache) = &result.merge_cache {
+        status.line(&format!(
+            "Merge cache: reused {} tiles and {} tile layers, encoded {} tile layers",
+            cache.tiles_reused, cache.layers_reused, cache.layers_encoded
+        ));
+    }
     for warning in &result.warnings {
         status.line(&format!("warning: {warning}"));
     }
     if let Some((path, report)) = &output.building_levels {
         report_levels(&mut status, path, report);
     }
+    write_profile(&mut status, args.profile.as_deref(), profile)?;
     if let Some((old, delta_path)) = &delta {
         let _partial = interrupt::remove_on_exit(archive::partial_path(delta_path));
         let report = archive::diff(old, &args.output, delta_path)?;
