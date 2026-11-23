@@ -104,6 +104,19 @@ fn usage_errors_exit_with_2() {
             "--delta-from needs a PMTiles archive, not MBTiles",
         ),
         (
+            &[
+                "compile",
+                "in.pbf",
+                "--sources",
+                "s",
+                "--output",
+                "o.mbtiles",
+                "--reuse-from",
+                "old.pmtiles",
+            ],
+            "--merge-cache and --reuse-from need a PMTiles archive, not MBTiles",
+        ),
+        (
             &["compile", "in.pbf", "--bounds", "1", "2", "3"],
             "four numbers",
         ),
@@ -895,4 +908,99 @@ fn ctrl_c_cancels_a_compile_and_removes_its_scratch() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert!(left.is_empty(), "left behind: {left:?}\n{seen}");
+}
+
+#[test]
+fn a_merge_cache_reuses_unchanged_tiles_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let pbf = monaco_pbf();
+    let changes = path("changes.osc");
+    std::fs::write(&changes, MONACO_CHANGES).unwrap();
+    let compile = |output: &std::path::Path, extra: &[&OsStr]| {
+        let mut args = vec![
+            "compile".as_ref(),
+            pbf.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+            "--omit-sources".as_ref(),
+            "all".as_ref(),
+            "--max-zoom".as_ref(),
+            "13".as_ref(),
+            "--json".as_ref(),
+        ];
+        args.extend(extra.iter().copied());
+        let output = run(args);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let old = path("old.pmtiles");
+    let result = compile(&old, &["--merge-cache".as_ref()]);
+    assert_eq!(result["merge_cache"]["layers_reused"], 0, "{result}");
+    assert!(path("old.merge-cache").is_file());
+
+    // After a change, reuse writes the archive a compile without it writes,
+    // and takes most tile layers from the old archive.
+    let (plain, cached) = (path("plain.pmtiles"), path("cached.pmtiles"));
+    let with_changes = ["--changes".as_ref(), changes.as_os_str()];
+    let result = compile(&plain, &with_changes);
+    assert!(result.get("merge_cache").is_none(), "{result}");
+    let result = compile(
+        &cached,
+        &[
+            with_changes[0],
+            with_changes[1],
+            "--reuse-from".as_ref(),
+            old.as_os_str(),
+        ],
+    );
+    assert_eq!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&cached).unwrap()
+    );
+    let stats = &result["merge_cache"];
+    let (reused, encoded) = (
+        stats["layers_reused"].as_u64().unwrap(),
+        stats["layers_encoded"].as_u64().unwrap(),
+    );
+    assert!(encoded > 0 && reused > encoded, "{result}");
+    assert!(stats["tiles_reused"].as_u64().unwrap() > 0, "{result}");
+    assert!(path("cached.merge-cache").is_file());
+
+    // At another gzip level whole tiles cannot be copied, but layers can.
+    let (plain9, cached9) = (path("plain9.pmtiles"), path("cached9.pmtiles"));
+    let level = ["--gzip-level".as_ref(), "9".as_ref()];
+    compile(&plain9, &level);
+    let result = compile(
+        &cached9,
+        &[level[0], level[1], "--reuse-from".as_ref(), old.as_os_str()],
+    );
+    assert_eq!(
+        std::fs::read(&plain9).unwrap(),
+        std::fs::read(&cached9).unwrap()
+    );
+    assert_eq!(result["merge_cache"]["tiles_reused"], 0, "{result}");
+    assert_eq!(result["merge_cache"]["layers_encoded"], 0, "{result}");
+
+    // An index beside another archive is refused.
+    std::fs::copy(path("cached.merge-cache"), path("old.merge-cache")).unwrap();
+    let wrong = path("wrong.pmtiles");
+    let output = run([
+        "compile".as_ref(),
+        pbf.as_os_str(),
+        "--output".as_ref(),
+        wrong.as_os_str(),
+        "--omit-sources".as_ref(),
+        "all".as_ref(),
+        "--max-zoom".as_ref(),
+        "13".as_ref(),
+        "--reuse-from".as_ref(),
+        old.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("does not belong to"),
+        "{output:?}"
+    );
+    assert!(!wrong.exists());
 }

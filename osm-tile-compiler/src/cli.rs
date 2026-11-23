@@ -106,8 +106,8 @@ Compile options:
                         the current directory with --omit-sources all]
   --output <FILE>       Archive to write; must not exist yet
   --format <FORMAT>     pmtiles or mbtiles [default: mbtiles for a .mbtiles
-                        --output, otherwise pmtiles]. Building levels and
-                        --delta-from need pmtiles
+                        --output, otherwise pmtiles]. Building levels,
+                        --delta-from and the merge cache need pmtiles
   --sources <DIR>       Directory holding the supplemental datasets
   --bounds <W S E N>    Area to compile, in degrees [default: the PBF header's box];
                         W > E crosses the antimeridian
@@ -157,6 +157,15 @@ Compile options:
   --delta-from <OLD.pmtiles>
                         Experimental: also write <NAME>.delta beside the
                         archive, the delta that turns OLD.pmtiles into it
+  --merge-cache         Experimental: also write <NAME>.merge-cache beside
+                        the archive, so that a later compile can reuse its
+                        tiles with --reuse-from
+  --reuse-from <OLD.pmtiles>
+                        Experimental: take each tile layer whose input is
+                        unchanged from OLD.pmtiles, compiled with
+                        --merge-cache, instead of merging and encoding it
+                        again; the archive is the same as without it. Implies
+                        --merge-cache
 
 Diff and apply options:
   --output <FILE>       File to write; must not exist yet
@@ -229,6 +238,7 @@ struct CompileArgs {
     languages: Option<Vec<String>>,
     changes: ChangeArgs,
     delta_from: Option<PathBuf>,
+    merge_cache: osm_tile_compiler::MergeCacheOptions,
 }
 
 /// The change files and replication server `compile` and `update` apply.
@@ -521,6 +531,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut languages = None;
     let mut changes = ChangeArgs::default();
     let mut delta_from = None;
+    let mut merge_cache = osm_tile_compiler::MergeCacheOptions::default();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -622,6 +633,11 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 languages = Some(list);
             }
             "--delta-from" => delta_from = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--merge-cache" => merge_cache.write = true,
+            "--reuse-from" => {
+                merge_cache.reuse_from = Some(PathBuf::from(value(&mut args, &flag)?));
+                merge_cache.write = true;
+            }
             _ if changes.parse(&flag, &mut args)? => {}
             _ => return Err(format!("unknown compile option '{flag}'")),
         }
@@ -678,6 +694,12 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 format.name()
             ));
         }
+        if merge_cache.write {
+            return Err(format!(
+                "--merge-cache and --reuse-from need a PMTiles archive, not {}",
+                format.name()
+            ));
+        }
     }
     let sources = match sources {
         Some(sources) => sources,
@@ -714,6 +736,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         languages,
         changes,
         delta_from,
+        merge_cache,
     })))
 }
 
@@ -1395,6 +1418,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.layers = args.layers;
     request.languages = args.languages;
     request.building_levels = args.building_levels;
+    request.merge_cache = args.merge_cache;
     let start = Instant::now();
     let mut stage = None;
     let output = compile_basemap(
@@ -1445,6 +1469,12 @@ fn compile(args: CompileArgs) -> Result<(), String> {
             "Largest tile: {} at {}",
             largest.tile,
             kib(largest.bytes)
+        ));
+    }
+    if let Some(cache) = &result.merge_cache {
+        status.line(&format!(
+            "Merge cache: reused {} tiles and {} tile layers, encoded {} tile layers",
+            cache.tiles_reused, cache.layers_reused, cache.layers_encoded
         ));
     }
     for warning in &result.warnings {

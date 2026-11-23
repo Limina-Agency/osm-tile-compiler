@@ -1,4 +1,5 @@
 //! Bounded external tile-record sort and OpenMapTiles MVT archive publication.
+use super::merge_cache::{self, LayerEntry, MergeCache, OldTile, TileEntry};
 use super::record_codec::{
     LAYER_NAMES, Reader, decode_payload, encode_payload, encode_varint, layer_id, zigzag,
 };
@@ -759,12 +760,25 @@ impl Store {
     }
     /// Writes the archive into `archive`, an empty file or partial archive
     /// the caller owns, and returns the sizes of the tiles written.
+    #[cfg(test)]
     pub fn finish(
+        self,
+        archive: &dyn ArchiveTarget,
+        header: &ArchiveHeader,
+        threads: usize,
+        control: &Control,
+    ) -> Result<TileStats, String> {
+        self.finish_cached(archive, header, threads, control, None)
+    }
+    /// As `finish`, reusing layers from an earlier archive and writing a
+    /// cache index as `cache` says.
+    pub fn finish_cached(
         mut self,
         archive: &dyn ArchiveTarget,
         header: &ArchiveHeader,
         threads: usize,
         control: &Control,
+        cache: Option<&mut MergeCache>,
     ) -> Result<TileStats, String> {
         let (bounds, center, options) = (&header.bounds, header.center, header.options);
         let (minzoom, maxzoom) = (header.min_zoom, header.max_zoom);
@@ -824,6 +838,16 @@ impl Store {
         let mut writing = crate::profiling::Accumulator::new("omt_archive_write");
         let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
         let final_merge = crate::profiling::Phase::start("omt_final_merge_encode_write");
+        let (mut reuse, mut writer, counters) = match cache {
+            Some(cache) => (
+                cache.reuse.as_mut(),
+                cache.writer.as_mut(),
+                Some(&cache.counters),
+            ),
+            None => (None, None, None),
+        };
+        let hashing = reuse.is_some() || writer.is_some();
+        let old_archive = reuse.as_ref().map(|reuse| reuse.archive.clone());
         let encoded = encode_ordered(
             threads,
             threads.saturating_mul(TILE_WINDOW_PER_THREAD),
@@ -832,18 +856,30 @@ impl Store {
                 (
                     EncodeTimings::new(),
                     crate::profiling::Accumulator::new("omt_encode_tile_inclusive"),
+                    None::<File>,
                 )
             },
-            |(timings, inclusive), job: TileJob| {
+            |(timings, inclusive, old_file), job: TileJob| {
                 let id = job.id;
+                let reuse = old_archive.as_deref().map(|path| (path, old_file));
                 inclusive
                     .measure(|| {
-                        let records = timings.decode.measure(|| job.decode())?;
-                        encode_tile(records, timings, options.gzip_level, control)
+                        encode_job(
+                            job,
+                            hashing,
+                            reuse,
+                            counters,
+                            timings,
+                            options.gzip_level,
+                            control,
+                        )
                     })
-                    .map(|bytes| (id, bytes))
+                    .map(|(bytes, entry)| (id, bytes, entry))
             },
-            |(id, tile): (u64, Option<EncodedTile>)| {
+            |(id, tile, entry): (u64, Option<EncodedTile>, Option<TileEntry>)| {
+                if let (Some(writer), Some(entry)) = (writer.as_deref_mut(), &entry) {
+                    writer.add(entry)?;
+                }
                 if let Some(tile) = tile {
                     writing.measure(|| archive.write_tile(id, &tile.bytes))?;
                     let layers = tile
@@ -861,9 +897,14 @@ impl Store {
                 let mut tile_bytes = 0usize;
                 merge_prefetched(&self.runs, threads, control, |encoded| {
                     if tile_id.is_some_and(|id| id != encoded.key.tile_id) {
+                        let id = tile_id.unwrap();
                         let job = TileJob {
-                            id: tile_id.unwrap(),
+                            id,
                             records: std::mem::take(&mut tile),
+                            old: match reuse.as_deref_mut() {
+                                Some(reuse) => reuse.take(id)?,
+                                None => None,
+                            },
                         };
                         stream.send(job, tile_bytes)?;
                         tile_bytes = 0;
@@ -877,7 +918,18 @@ impl Store {
                     Ok(())
                 })?;
                 if let Some(id) = tile_id {
-                    stream.send(TileJob { id, records: tile }, tile_bytes)?;
+                    let old = match reuse {
+                        Some(reuse) => reuse.take(id)?,
+                        None => None,
+                    };
+                    stream.send(
+                        TileJob {
+                            id,
+                            records: tile,
+                            old,
+                        },
+                        tile_bytes,
+                    )?;
                 }
                 Ok(())
             },
@@ -963,8 +1015,11 @@ const TILE_WINDOW_PER_THREAD: usize = 8;
 struct TileJob {
     id: u64,
     records: Vec<EncodedRecord>,
+    /// The tile in the archive being reused, if any.
+    old: Option<OldTile>,
 }
 impl TileJob {
+    #[cfg(test)]
     fn decode(self) -> Result<Vec<Record>, String> {
         self.records
             .into_iter()
@@ -1365,6 +1420,8 @@ struct EncodeTimings {
     geometry: crate::profiling::Accumulator,
     dictionaries: crate::profiling::Accumulator,
     protobuf_gzip: crate::profiling::Accumulator,
+    hash: crate::profiling::Accumulator,
+    reuse: crate::profiling::Accumulator,
 }
 impl EncodeTimings {
     fn new() -> Self {
@@ -1374,6 +1431,8 @@ impl EncodeTimings {
             geometry: crate::profiling::Accumulator::new("omt_merge_geometries"),
             dictionaries: crate::profiling::Accumulator::new("omt_mvt_geometry_dictionaries"),
             protobuf_gzip: crate::profiling::Accumulator::new("omt_protobuf_gzip"),
+            hash: crate::profiling::Accumulator::new("omt_merge_cache_hash"),
+            reuse: crate::profiling::Accumulator::new("omt_merge_cache_read"),
         }
     }
 }
@@ -1383,40 +1442,37 @@ struct EncodedTile {
     layers: Vec<(String, u64)>,
 }
 
-fn encode_tile(
-    records: Vec<Record>,
+/// A layer's records merged and encoded as a tile's layer field, or `None`
+/// when no feature is left.
+fn encode_layer_records(
+    name: &str,
+    mut records: Vec<Record>,
+    timings: &mut EncodeTimings,
+    control: &Control,
+) -> Result<Option<Vec<u8>>, String> {
+    control.check()?;
+    records.sort_by(order);
+    records = timings.density.measure(|| point_density(records));
+    records = timings
+        .geometry
+        .measure(|| merge_geometries_controlled(records, control))?;
+    let layer = timings
+        .dictionaries
+        .measure(|| encode_layer(name, &records))
+        .map_err(|e| format!("Failed to encode layer {name}: {e}"))?;
+    if layer.num_features() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(timings.protobuf_gzip.measure(|| layer.encode())))
+}
+
+/// Gzips a tile's layers; `None` when it has none.
+fn finish_tile(
+    tile: Vec<u8>,
+    sizes: Vec<(String, u64)>,
     timings: &mut EncodeTimings,
     gzip_level: u32,
-    control: &Control,
 ) -> Result<Option<EncodedTile>, String> {
-    let mut layers: BTreeMap<AttrKey, Vec<Record>> = BTreeMap::new();
-    for record in records {
-        layers.entry(record.layer.clone()).or_default().push(record);
-    }
-    // Each layer is encoded as a tile of its own; one after another they are
-    // the tile, since a tile is only its repeated layer field.
-    let mut tile = Vec::new();
-    let mut sizes = Vec::new();
-    for (name, mut records) in layers {
-        control.check()?;
-        records.sort_by(order);
-        records = timings.density.measure(|| point_density(records));
-        records = timings
-            .geometry
-            .measure(|| merge_geometries_controlled(records, control))?;
-        let layer = timings
-            .dictionaries
-            .measure(|| encode_layer(&name, &records))
-            .map_err(|e| format!("Failed to encode layer {name}: {e}"))?;
-        if layer.num_features() == 0 {
-            continue;
-        }
-        let start = tile.len();
-        timings
-            .protobuf_gzip
-            .measure(|| tile.extend_from_slice(&layer.encode()));
-        sizes.push((name.into_owned(), (tile.len() - start) as u64));
-    }
     if sizes.is_empty() {
         return Ok(None);
     }
@@ -1428,6 +1484,154 @@ fn encode_tile(
         bytes,
         layers: sizes,
     }))
+}
+
+/// Encodes a tile job. With `hashing`, also returns the tile's cache entry;
+/// with `reuse` (the old archive and this worker's handle on it), layers
+/// whose records match the old tile's are taken from it.
+fn encode_job(
+    job: TileJob,
+    hashing: bool,
+    reuse: Option<(&Path, &mut Option<File>)>,
+    counters: Option<&merge_cache::Counters>,
+    timings: &mut EncodeTimings,
+    gzip_level: u32,
+    control: &Control,
+) -> Result<(Option<EncodedTile>, Option<TileEntry>), String> {
+    let id = job.id;
+    // Records arrive sorted by layer, so each layer is one run of them.
+    let mut groups: Vec<(Layer, Vec<EncodedRecord>)> = Vec::new();
+    for record in job.records {
+        if record.key.tile_id != id {
+            return Err("OMT tile job contains a different tile".into());
+        }
+        match groups.last_mut() {
+            Some((layer, records)) if *layer == record.key.layer => records.push(record),
+            _ => groups.push((record.key.layer.clone(), vec![record])),
+        }
+    }
+    // Layers are encoded in name order, as a map by name would hold them.
+    groups.sort_by(|a, b| a.0.name().cmp(b.0.name()));
+    if groups.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err("OMT tile job holds a layer twice".into());
+    }
+    let keys = if hashing {
+        timings.hash.measure(|| {
+            groups
+                .iter()
+                .map(|(layer, records)| merge_cache::layer_key(id, layer.name(), records))
+                .collect::<Vec<_>>()
+        })
+    } else {
+        Vec::new()
+    };
+    let old = job.old.as_ref().filter(|_| hashing);
+    let count = |counter: fn(&merge_cache::Counters) -> &AtomicU64, n: usize| {
+        if let Some(counters) = counters {
+            merge_cache::Counters::add(counter(counters), n as u64);
+        }
+    };
+    let (path, mut file) = match reuse {
+        Some((path, file)) => (Some(path), Some(file)),
+        None => (None, None),
+    };
+    // Every layer the same as before: the old tile, as it is stored.
+    if let (Some(old), Some(path), Some(file)) = (old, path, file.as_deref_mut())
+        && old.copy
+        && old.entry.layers.len() == groups.len()
+        && old
+            .entry
+            .layers
+            .iter()
+            .zip(groups.iter().zip(&keys))
+            .all(|(entry, ((layer, _), key))| *entry.name == *layer.name() && entry.key == *key)
+    {
+        let tile = if old.entry.stored == 0 {
+            None
+        } else {
+            let bytes = timings
+                .reuse
+                .measure(|| merge_cache::read_stored(file, path, old))?;
+            Some(EncodedTile {
+                bytes,
+                layers: old
+                    .entry
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.size > 0)
+                    .map(|layer| (layer.name.to_string(), u64::from(layer.size)))
+                    .collect(),
+            })
+        };
+        count(|c| &c.tiles_reused, 1);
+        count(|c| &c.layers_reused, groups.len());
+        return Ok((tile, Some(old.entry.clone())));
+    }
+    let mut old_layers: Option<Vec<u8>> = None;
+    let mut tile = Vec::new();
+    let mut sizes = Vec::new();
+    let mut entries = Vec::with_capacity(if hashing { groups.len() } else { 0 });
+    for (index, (layer, records)) in groups.into_iter().enumerate() {
+        let name = layer.name();
+        // The same layer in the old tile, and where its bytes start there.
+        let hit = old.and_then(|old| {
+            let mut start = 0usize;
+            for entry in &old.entry.layers {
+                if *entry.name == *name {
+                    return (entry.key == keys[index]).then_some((old, start, entry.size));
+                }
+                start += entry.size as usize;
+            }
+            None
+        });
+        let bytes = match (hit, path, file.as_deref_mut()) {
+            (Some((old, start, size)), Some(path), Some(file)) => {
+                count(|c| &c.layers_reused, 1);
+                if size == 0 {
+                    None
+                } else {
+                    if old_layers.is_none() {
+                        old_layers = Some(
+                            timings
+                                .reuse
+                                .measure(|| merge_cache::read_layers(file, path, old))?,
+                        );
+                    }
+                    let all = old_layers.as_ref().expect("read above");
+                    Some(all[start..start + size as usize].to_vec())
+                }
+            }
+            _ => {
+                count(|c| &c.layers_encoded, 1);
+                let records = timings.decode.measure(|| {
+                    records
+                        .into_iter()
+                        .map(EncodedRecord::decode)
+                        .collect::<Result<Vec<_>, _>>()
+                })?;
+                encode_layer_records(name, records, timings, control)?
+            }
+        };
+        let size = bytes.as_ref().map_or(0, Vec::len);
+        if hashing {
+            entries.push(LayerEntry {
+                name: name.into(),
+                key: keys[index],
+                size: u32::try_from(size).map_err(|_| "OMT tile layer exceeds 4 GiB")?,
+            });
+        }
+        if let Some(bytes) = bytes {
+            tile.extend_from_slice(&bytes);
+            sizes.push((name.to_string(), size as u64));
+        }
+    }
+    let tile = finish_tile(tile, sizes, timings, gzip_level)?;
+    let entry = hashing.then(|| TileEntry {
+        tile_id: id,
+        stored: tile.as_ref().map_or(0, |tile| tile.bytes.len() as u32),
+        layers: entries,
+    });
+    Ok((tile, entry))
 }
 
 /// The layer's features, in `records` order. Attributes starting with `_` are
@@ -3645,7 +3849,11 @@ mod tests {
 
     #[test]
     fn worker_decode_preserves_record_order_and_rejects_corrupt_records() {
-        let make_job = |records: Vec<EncodedRecord>| TileJob { id: 0, records };
+        let make_job = |records: Vec<EncodedRecord>| TileJob {
+            id: 0,
+            records,
+            old: None,
+        };
         let decoded = make_job(vec![
             EncodedRecord::encode(&record(9), seq(0)).unwrap(),
             EncodedRecord::encode(&record(2), seq(0)).unwrap(),

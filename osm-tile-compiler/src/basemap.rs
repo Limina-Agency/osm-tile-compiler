@@ -82,6 +82,12 @@ pub struct BasemapRequest {
     ///
     /// [`write_building_levels`]: crate::write_building_levels
     pub building_levels: bool,
+    /// Whether to write a merge cache index beside the archive, and an
+    /// earlier archive to reuse unchanged tile layers from [default:
+    /// neither]. Experimental. Reuse makes a compile after an OSM update
+    /// skip merging and encoding the tiles the update left alone; the
+    /// archive is the same as without it.
+    pub merge_cache: crate::MergeCacheOptions,
 }
 
 impl BasemapRequest {
@@ -109,6 +115,7 @@ impl BasemapRequest {
             layers: LayerSelection::All,
             languages: None,
             building_levels: false,
+            merge_cache: crate::MergeCacheOptions::default(),
         }
     }
 
@@ -166,6 +173,13 @@ impl BasemapRequest {
                 self.output_format().name()
             )));
         }
+        let caching = self.merge_cache.write || self.merge_cache.reuse_from.is_some();
+        if caching && self.output_format() != OutputFormat::PmTiles {
+            return Err(invalid(format!(
+                "the merge cache works with PMTiles archives only, not {}",
+                self.output_format().name()
+            )));
+        }
         if self.area.read == ReadScope::NearArea && !self.area.is_limited() {
             return Err(invalid(
                 "reading only near the area needs bounds or a polygon".into(),
@@ -179,6 +193,17 @@ impl BasemapRequest {
                     "refusing to replace existing archive {}",
                     archive.display()
                 )));
+            }
+        }
+        if let Some(old) = &self.merge_cache.reuse_from {
+            let index = crate::merge_cache_path(old);
+            for file in [old, &index] {
+                if !file.is_file() {
+                    return Err(invalid(format!(
+                        "the merge cache to reuse needs {}, which does not exist",
+                        file.display()
+                    )));
+                }
             }
         }
         Ok(layers)
@@ -322,6 +347,7 @@ fn compile(
         omit_sources: request.omit_sources.clone(),
         area_only: request.area.read == ReadScope::NearArea,
         format: request.output_format(),
+        merge_cache: request.merge_cache.clone(),
     };
     omt::validate(&compile_request)?;
     let used = request.used_sources();
