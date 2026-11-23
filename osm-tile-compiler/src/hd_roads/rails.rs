@@ -78,6 +78,7 @@ impl Track {
                 Confidence::Assumed
             },
             width: self.deck(),
+            measured: self.tagged,
             centre: 0.0,
             lines: vec![
                 (-self.gauge / 2.0, Line::Rail),

@@ -1255,7 +1255,7 @@ fn hd_roads(args: HdRoadsArgs) -> Result<(), String> {
     status.line(&format!(
         "  {} tiles, {} surfaces, {} markings ({} crossings, stops, arrows and other \
          paint, {} areas, of them {} crossings' islands and {} carriageways), \
-         {} turning circles, {} tracks, {} barriers, {} fences, {} things, {} pitches ({} with lines), \
+         {} turning circles, {} roads fitted to paths, {} tracks, {} barriers, {} fences, {} things, {} pitches ({} with lines), \
          {} bridge groups ({} pieces, {} crossings), {} raw, {} gzipped",
         report.tiles,
         report.surfaces,
@@ -1265,6 +1265,7 @@ fn hd_roads(args: HdRoadsArgs) -> Result<(), String> {
         report.refuges,
         report.carriageways,
         report.turning_circles,
+        report.fitted,
         report.tracks,
         report.barriers,
         report.fences,

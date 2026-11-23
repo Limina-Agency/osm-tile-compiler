@@ -10,7 +10,9 @@
 //!   or `tunnel`, with its `layer`), corners rounded where roads meet, a disc
 //!   where one ends in a turning circle (as wide as its `diameter`, else 10 to
 //!   16 m), and `paved`; a road paved with sett, cobbles, slabs or concrete says
-//!   so in `paved_by` (`sett`, `cobble`, `slabs`, `concrete`). A carriageway mapped
+//!   so in `paved_by` (`sett`, `cobble`, `slabs`, `concrete`). A road whose width
+//!   no tag gives is narrowed, as far as its lanes may be, where paths mapped
+//!   beside it would lie under it (`hd_roads/sides.rs`). A carriageway mapped
 //!   as an area (`area:highway`) is that area, not
 //!   what its way is widened to. Beside them `parking`, and in them `island`, what
 //!   is kerbed off, the middles of crossings with one too (two-way roads of 6 m at
@@ -264,6 +266,8 @@ pub struct HdRoadsReport {
     pub carriageways: u64,
     /// Discs at roads' ends where one turns round.
     pub turning_circles: u64,
+    /// Roads narrowed to the paths mapped beside them.
+    pub fitted: u64,
     /// Stretches of barriers.
     pub barriers: u64,
     /// Railways' and trams' tracks that are drawn.
@@ -330,6 +334,7 @@ fn write(
     let read_seconds = start.elapsed().as_secs_f64();
     let profiles = distinct_profiles(&source.ways);
     lanes::place(&mut source.ways);
+    let fitted = sides::fit(&mut source.ways[..source.roads]);
     sides::separate(&mut source.ways[..source.roads]);
     let Source {
         ways: all,
@@ -422,6 +427,7 @@ fn write(
         refuges: refuge_count,
         carriageways: (areas.iter().filter(|a| a.kind == AreaKind::Road)).count() as u64,
         turning_circles,
+        fitted,
         profiles,
         details: details.list.len() as u64,
         areas: areas.len() as u64,

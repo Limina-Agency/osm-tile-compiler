@@ -45,7 +45,7 @@ impl Class {
     }
 
     /// Metres across one lane where nothing says otherwise.
-    fn lane_width(self) -> f64 {
+    pub(super) fn lane_width(self) -> f64 {
         match self {
             Self::Motorway => 3.75,
             Self::Trunk | Self::Primary => 3.5,
@@ -333,8 +333,9 @@ pub(super) struct Profile {
     pub level: Level,
     pub paved: bool,
     pub confidence: Confidence,
-    /// The surface's whole width, shoulders included.
+    /// The surface's whole width, shoulders included, and whether a tag gives it.
     pub width: f64,
+    pub measured: bool,
     /// The surface's middle.
     pub centre: f64,
     /// Painted lines, left to right.
@@ -367,6 +368,27 @@ impl Profile {
         }
         if let Some(lanes) = &mut self.lanes {
             lanes.left += metres;
+        }
+    }
+
+    /// Narrows the surface to between `edges`, all of it in proportion: its
+    /// lanes, its lines and what is beside them in the carriageway.
+    pub(super) fn narrow(&mut self, [left, right]: [f64; 2]) {
+        let [was_left, was_right] = self.surface();
+        let share = (right - left) / (was_right - was_left);
+        let at = |x: f64| left + (x - was_left) * share;
+        (self.centre, self.width) = ((left + right) / 2.0, right - left);
+        for line in &mut self.lines {
+            line.0 = at(line.0);
+        }
+        if let Some(lanes) = &mut self.lanes {
+            lanes.left = at(lanes.left);
+            lanes.width *= share;
+        }
+        for side in &mut self.sides {
+            side.cycle *= share;
+            side.parking *= share;
+            side.shoulder *= share;
         }
     }
 
@@ -485,6 +507,7 @@ pub(super) fn profile_in<'a>(
                 Confidence::Assumed
             },
             width: width.unwrap_or_else(|| class.lane_width()),
+            measured: width.is_some(),
             centre: 0.0,
             lines: Vec::new(),
             lanes: None,
@@ -602,6 +625,7 @@ pub(super) fn profile_in<'a>(
         paved,
         confidence,
         width: across + left_side + right_side,
+        measured: width.is_some(),
         centre: left + across / 2.0 + (right_side - left_side) / 2.0,
         lines,
         lanes: Some(Box::new(Lanes {

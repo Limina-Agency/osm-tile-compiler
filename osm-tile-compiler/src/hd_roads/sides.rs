@@ -7,7 +7,8 @@
 //! Within the carriageway a side is, from the lanes out: the cycle lane, the
 //! parking, the shoulder. Out past the surface's edge: the parking beside it,
 //! the cycle track, the sidewalk. A track or sidewalk that is mapped as a way of
-//! its own beside the road is not drawn again.
+//! its own beside the road is not drawn again, and a road whose width no tag
+//! gives is narrowed to keep clear of the paths mapped beside it.
 //!
 //! Humps, cushions and tables have one look, whatever the country: on each
 //! ramp traffic comes up, a row of white triangles across its lanes, pointing
@@ -22,6 +23,7 @@ use super::paint::Block;
 use super::profile::{Bays, Class, Level, Symbol};
 use super::spans;
 use i_overlay::i_shape::base::data::Shapes;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// What slows traffic at a node, as `traffic_calming` says.
@@ -154,6 +156,171 @@ pub(super) fn separate(ways: &mut [Way]) -> [u64; 2] {
         counts[of] += 1;
     }
     counts
+}
+
+/// The narrowest a lane is made to fit paths beside it: metres, and a share of
+/// its class's usual width.
+const FIT_LANE: (f64, f64) = (2.25, 0.8);
+/// Metres between the places a road is looked at, and from its ends where it is
+/// not (there paths turn in to cross).
+const FIT_SAMPLE: f64 = 4.0;
+const FIT_ENDS: f64 = 6.0;
+/// The cosine of the angle within which a path runs beside a road.
+const PARALLEL: f64 = 0.94;
+/// Metres from a road's line within which a path is on it, not beside it.
+const ON_LINE: f64 = 1.0;
+/// Of a road's places, the share a path must be beside it at, and the share
+/// whose path's edge the road keeps clear of.
+const FIT_SHARE: f64 = 0.3;
+const FIT_CLEAR: f64 = 0.75;
+
+/// Narrows the motor roads of the ground whose width no tag gives, where paths
+/// mapped beside them (sidewalks, footways, cycleways, paths) lie within it: the
+/// road's edge on that side goes back to the paths' near edge, as far as its
+/// lanes may narrow. The class's usual width is a guess; where the paths are is
+/// what is mapped. How many are narrowed.
+pub(super) fn fit(ways: &mut [Way]) -> u64 {
+    let cell = |v: f64| (v / CELL).floor() as i64;
+    let mut cells: Cells = FxHashMap::default();
+    for (index, way) in ways.iter().enumerate() {
+        let path = matches!(
+            way.profile.class,
+            Class::Sidewalk | Class::Footway | Class::Cycleway | Class::Path | Class::Bridleway
+        );
+        if !path || way.profile.level != Level::Ground {
+            continue;
+        }
+        for (k, p) in way.points.windows(2).enumerate() {
+            let mut seen: Vec<(i64, i64)> = samples(p, CELL / 2.0)
+                .into_iter()
+                .map(|q| (cell(q[0]), cell(q[1])))
+                .collect();
+            seen.dedup();
+            for c in seen {
+                cells.entry(c).or_default().push((index as u32, k as u32));
+            }
+        }
+    }
+    let ways_ref: &[Way] = ways;
+    let narrowed: Vec<(usize, [f64; 2])> = (ways_ref.par_iter().enumerate())
+        .filter_map(|(index, way)| Some((index, fitted(ways_ref, &cells, way)?)))
+        .collect();
+    for &(index, edges) in &narrowed {
+        ways[index].profile.narrow(edges);
+    }
+    narrowed.len() as u64
+}
+
+/// A road's edges, fitted to the paths beside it, if they move.
+fn fitted(ways: &[Way], cells: &Cells, way: &Way) -> Option<[f64; 2]> {
+    let p = &way.profile;
+    let lanes = p.lanes.as_ref()?;
+    if !p.class.is_motor() || p.measured || p.level != Level::Ground {
+        return None;
+    }
+    let cell = |v: f64| (v / CELL).floor() as i64;
+    let [left, right] = p.surface();
+    // metres out from the line to each edge
+    let edges = [-left, right];
+    let length: f64 = (way.points.windows(2))
+        .map(|w| distance(w[0], w[1]))
+        .sum::<f64>()
+        / way.scale;
+    let (mut places, mut limits) = (0usize, [Vec::new(), Vec::new()]);
+    let mut from = 0.0;
+    for w in way.points.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let long = distance(a, b);
+        if long <= 0.0 {
+            continue;
+        }
+        let along = [(b[0] - a[0]) / long, (b[1] - a[1]) / long];
+        // right of the way's direction, y growing southwards
+        let normal = [-along[1], along[0]];
+        for q in samples(w, FIT_SAMPLE * way.scale) {
+            let s = from + distance(a, q) / way.scale;
+            if s < FIT_ENDS || s > length - FIT_ENDS {
+                continue;
+            }
+            places += 1;
+            let reach = (edges[0].max(edges[1]) + FIT_REACH_PATH) * way.scale;
+            let mut nearest = [f64::INFINITY; 2];
+            for x in cell(q[0] - reach)..=cell(q[0] + reach) {
+                for y in cell(q[1] - reach)..=cell(q[1] + reach) {
+                    for &(w, k) in cells.get(&(x, y)).into_iter().flatten() {
+                        let path = &ways[w as usize];
+                        let (c, d) = (path.points[k as usize], path.points[k as usize + 1]);
+                        let span = distance(c, d);
+                        let cos = ((d[0] - c[0]) * along[0] + (d[1] - c[1]) * along[1]) / span;
+                        if span <= 0.0 || cos.abs() < PARALLEL {
+                            continue;
+                        }
+                        let foot = nearest_on(q, c, d);
+                        let away = [foot[0] - q[0], foot[1] - q[1]];
+                        let off = distance(q, foot) / way.scale;
+                        if off < ON_LINE || off * way.scale > reach {
+                            continue;
+                        }
+                        let i = usize::from(away[0] * normal[0] + away[1] * normal[1] > 0.0);
+                        // to its near edge
+                        let clear = off - path.profile.width / 2.0;
+                        nearest[i] = nearest[i].min(clear);
+                    }
+                }
+            }
+            for i in 0..2 {
+                if nearest[i] < edges[i] {
+                    limits[i].push(nearest[i]);
+                }
+            }
+        }
+        from += long / way.scale;
+    }
+    if places == 0 {
+        return None;
+    }
+    let mut out = edges;
+    for i in 0..2 {
+        let found = &mut limits[i];
+        if (found.len() as f64) < FIT_SHARE * places as f64 {
+            continue;
+        }
+        found.sort_by(f64::total_cmp);
+        // clear of the paths at that share of the places they are found at
+        let k = ((1.0 - FIT_CLEAR) * (found.len() - 1) as f64).round() as usize;
+        out[i] = found[k];
+    }
+    if out == edges {
+        return None;
+    }
+    // as narrow as its lanes may be, given back to each side as it was taken
+    let lane = FIT_LANE.0.max(FIT_LANE.1 * p.class.lane_width());
+    let least = (edges[0] + edges[1]) * (lane / lanes.width).min(1.0);
+    let short = least - (out[0] + out[1]);
+    if short > 0.0 {
+        let taken = [edges[0] - out[0], edges[1] - out[1]];
+        let all = taken[0] + taken[1];
+        for i in 0..2 {
+            out[i] += short * taken[i] / all;
+        }
+    }
+    let moved = (edges[0] - out[0]).max(edges[1] - out[1]);
+    (moved > 0.1).then_some([-out[0], out[1]])
+}
+
+/// Metres past a road's further edge that a path's line is looked for.
+const FIT_REACH_PATH: f64 = 2.0;
+
+/// The point of a segment nearest `q`.
+fn nearest_on(q: Point, a: Point, b: Point) -> Point {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let square = ab[0] * ab[0] + ab[1] * ab[1];
+    let t = if square > 0.0 {
+        (((q[0] - a[0]) * ab[0] + (q[1] - a[1]) * ab[1]) / square).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    [a[0] + ab[0] * t, a[1] + ab[1] * t]
 }
 
 /// Points along a segment `every` units apart, its start among them, its end not.
@@ -870,6 +1037,43 @@ mod tests {
         assert!(strips(&ways, &n, 0, &[], EVERYWHERE).is_empty());
         assert!(lines(&ways, &n, 0, &[], EVERYWHERE).is_empty());
         assert!(painted(&ways, &n, &FxHashMap::default()).is_empty());
+    }
+
+    #[test]
+    fn a_road_of_no_width_is_narrowed_to_the_paths_beside_it() {
+        let sidewalk = [("highway", "footway"), ("footway", "sidewalk")];
+        let line = |id: i64, y: f64| [(id * 10, 0.0, y), (id * 10 + 1, 100.0, y)];
+        // a street of 5.5 m, its sidewalks' lines 2.6 m right and 3.5 m left
+        let mut ways = vec![
+            way(1, &[("highway", "residential")], &line(1, 0.0)),
+            way(2, &sidewalk, &line(2, 2.6)),
+            way(3, &sidewalk, &line(3, -3.5)),
+        ];
+        assert_eq!(ways[0].profile.surface(), [-2.75, 2.75]);
+        assert_eq!(fit(&mut ways), 1);
+        let p = &ways[0].profile;
+        // back to 2.5 m and 1.6 m, short of two lanes of 2.25 m: the 0.4 m given
+        // back as each side gave up
+        let [left, right] = p.surface();
+        let back = 0.4 * 0.25 / 1.4;
+        assert!(
+            (left + 2.5 + back).abs() < 1e-9 && (right - left - 4.5).abs() < 1e-9,
+            "{left} {right}"
+        );
+        let lanes = p.lanes.as_ref().unwrap();
+        assert!((lanes.left - left).abs() < 1e-9 && (lanes.width - 2.25).abs() < 1e-9);
+        assert!(p.lines.iter().all(|l| (left..=right).contains(&l.0)));
+        // nor where its width is tagged, a path crosses or runs on its line
+        let tagged = [("highway", "residential"), ("width", "5.5")];
+        let crossing = [(40, 50.0, -10.0), (41, 50.0, 10.0)];
+        let mut others = vec![
+            way(1, &tagged, &line(1, 0.0)),
+            way(2, &sidewalk, &line(2, 2.6)),
+            way(5, &[("highway", "residential")], &line(5, 300.0)),
+            way(4, &sidewalk, &crossing.map(|(n, x, y)| (n, x, y + 300.0))),
+            way(6, &sidewalk, &line(6, 300.5)),
+        ];
+        assert_eq!(fit(&mut others), 0);
     }
 
     #[test]
