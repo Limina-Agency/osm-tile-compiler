@@ -361,6 +361,8 @@ struct Worker<'a> {
     feature_count: u64,
     /// Set when work stopped because another worker failed.
     stopped: bool,
+    /// The encoded attributes of the records being rendered.
+    attrs_scratch: Vec<u8>,
 }
 
 impl Worker<'_> {
@@ -433,7 +435,14 @@ impl Worker<'_> {
         }
         self.target.selection.strip_names(&mut feature);
         let mut index = 0u32;
-        render::emit_with_record_sink(
+        // The records of one zoom share everything but their tile and
+        // geometry (`emit_records`), so their attributes are encoded once,
+        // and the layer summary, which only keeps the earliest sequence
+        // number of what it sees, needs only the first of them.
+        let mut attrs_zoom = None;
+        let mut observed_zoom = None;
+        let attrs = &mut self.attrs_scratch;
+        render::emit_records(
             feature,
             self.target.region,
             self.target.min_zoom,
@@ -448,11 +457,19 @@ impl Worker<'_> {
                     .ok_or("Feature emitted too many records")?;
                 // A line that collapsed on the tile grid only takes part in
                 // merging; it is never written, so the layer summary skips it.
-                if !matches!(&record.geometry, TileGeometry::Line { paths, .. } if paths.is_empty())
+                if observed_zoom != Some(record.zoom)
+                    && !matches!(&record.geometry, TileGeometry::Line { paths, .. } if paths.is_empty())
                 {
-                    self.metadata.observe(&record, seq);
+                    self.metadata.observe(record, seq);
+                    observed_zoom = Some(record.zoom);
                 }
-                self.sorter.add(EncodedRecord::encode(&record, seq)?)
+                if attrs_zoom != Some(record.zoom) {
+                    attrs.clear();
+                    super::record_codec::encode_attrs(&record.attrs, attrs);
+                    attrs_zoom = Some(record.zoom);
+                }
+                self.sorter
+                    .add(EncodedRecord::encode_with_attrs(record, seq, attrs)?)
             },
         )
     }
@@ -473,6 +490,7 @@ fn work(
         sources: 0,
         feature_count: 0,
         stopped: false,
+        attrs_scratch: Vec::new(),
     };
     let mut busy = crate::profiling::Accumulator::new("omt_render_worker_busy");
     while let Ok(work) = receiver.recv() {

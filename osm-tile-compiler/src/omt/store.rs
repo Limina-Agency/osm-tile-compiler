@@ -1,7 +1,10 @@
 //! Bounded external tile-record sort and OpenMapTiles MVT archive publication.
 use super::merge_cache::{self, LayerEntry, MergeCache, OldTile, TileEntry};
+#[cfg(test)]
+use super::record_codec::encode_payload;
 use super::record_codec::{
-    LAYER_NAMES, Reader, decode_payload, encode_payload, encode_varint, layer_id, zigzag,
+    LAYER_NAMES, Reader, decode_payload, encode_attrs, encode_payload_head, encode_varint,
+    layer_id, zigzag,
 };
 use super::render::Record;
 use super::spill::{RunReader, RunWriter};
@@ -428,13 +431,41 @@ thread_local! {
     static PAYLOAD_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 impl EncodedRecord {
+    #[cfg(test)]
     pub(super) fn encode(record: &Record, seq: Seq) -> Result<Self, String> {
+        Self::encode_with(record, seq, |scratch| encode_payload(record, scratch))
+    }
+    /// `encode`, with the record's attributes already encoded as `attrs`
+    /// (by `encode_attrs`), as records that share them can be.
+    pub(super) fn encode_with_attrs(
+        record: &Record,
+        seq: Seq,
+        attrs: &[u8],
+    ) -> Result<Self, String> {
+        debug_assert_eq!(
+            attrs,
+            &{
+                let mut own = Vec::new();
+                encode_attrs(&record.attrs, &mut own);
+                own
+            }[..]
+        );
+        Self::encode_with(record, seq, |scratch| {
+            encode_payload_head(record, scratch);
+            scratch.extend_from_slice(attrs);
+        })
+    }
+    fn encode_with(
+        record: &Record,
+        seq: Seq,
+        encode: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<Self, String> {
         if layer_id(&record.layer).is_none() && record.layer.len() > MAX_LAYER_BYTES {
             return Err("OMT sort layer exceeds frame limit".into());
         }
         let payload = PAYLOAD_SCRATCH.with_borrow_mut(|scratch| {
             scratch.clear();
-            encode_payload(record, scratch);
+            encode(scratch);
             scratch.clone()
         });
         if payload.len() > MAX_RECORD_BYTES {
