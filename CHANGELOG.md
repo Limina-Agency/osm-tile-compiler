@@ -12,7 +12,7 @@
   them, and `CompileResult::osm_data` (`OsmDataInfo`) carries them, so the
   manifest's `result` does too. The Monaco fingerprint changes for these
   keys only; every tile is the same.
-- Several extracts compile as one: `compile a.osm.pbf b.osm.pbf` (and
+- Several extracts compile as one (osm-pbf-ingest 0.6.0): `compile a.osm.pbf b.osm.pbf` (and
   `BasemapRequest::extra_inputs`, `extraInputs` in the C ABI request,
   `extraInputPbfPaths` in the worker request) merges them into one sorted
   file in the scratch directory first, with osm-pbf-ingest's `merge_files`,
