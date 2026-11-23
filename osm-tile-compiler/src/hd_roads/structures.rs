@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 pub(super) enum Kind {
     Path,
     Rail,
+    /// Its wires are lower than a railway's: 4.6 m at the least in Polish cities.
+    Tram,
     /// A river or canal.
     River,
     /// A stream or ditch.
@@ -36,6 +38,10 @@ pub(super) struct Piece {
     pub anchor: [bool; 2],
     /// A road on the ground that leads up to a bridge, and may be raised to it.
     pub approach: bool,
+    /// A road that leads on from where a bridge or its approach meets the ground,
+    /// for where it lands: raised only up to a step in the ground it climbs, where
+    /// a structure the tags leave out stands (an approach too, free at both ends).
+    pub lead: bool,
 }
 
 /// Where a piece passes over something.
@@ -67,6 +73,7 @@ fn over(kind: Kind) -> (&'static str, f64, f64) {
     match kind {
         Kind::Path => ("path", 3.0, 1.5),
         Kind::Rail => ("rail", 6.5, 2.5),
+        Kind::Tram => ("rail", 4.7, 2.0),
         Kind::River => ("water", 2.0, 6.0),
         Kind::Stream => ("water", 0.7, 1.0),
     }
@@ -211,6 +218,22 @@ pub(super) fn build(ways: &[Way], obstacles: &[Obstacle]) -> Vec<Group> {
         }
         pieces.push(approach);
     }
+    // last, so that what crossings name keeps its numbers where a lead is left out
+    // a node's in each group once: those of the first piece that meets the ground there
+    let mut led: FxHashMap<(usize, i64), usize> = FxHashMap::default();
+    for (from, lead) in leads(ways, &pieces) {
+        if *led
+            .entry((groups.find(from), lead.nodes[0]))
+            .or_insert(from)
+            != from
+        {
+            continue;
+        }
+        let index = pieces.len();
+        groups.add();
+        groups.join(from, index);
+        pieces.push(lead);
+    }
     for c in &crossings {
         if let Some((under, _)) = c.under {
             groups.join(c.over as usize, under as usize);
@@ -249,25 +272,27 @@ pub(super) struct Portal {
 /// Metres of a tunnel from its portal that tell which way it goes in.
 const INTO: f64 = 25.0;
 
-/// The portals of motor roads' tunnels, in the ways' order.
+/// The portals of motor roads' and tracks' tunnels, in the ways' order: where
+/// one comes out onto a road or a track of its kind on the ground.
 pub(super) fn portals(ways: &[Way]) -> Vec<Portal> {
-    let motor = || ways.iter().filter(|w| w.profile.class.is_motor());
+    let carried = |w: &Way| w.profile.class.is_motor() || w.profile.class.is_rail();
+    let all = || ways.iter().filter(|w| carried(w));
     let ends = |level: fn(Level) -> bool| -> FxHashSet<i64> {
-        motor()
+        all()
             .filter(|w| level(w.profile.level))
             .flat_map(|w| [w.nodes[0], w.nodes[w.nodes.len() - 1]])
             .collect()
     };
     let ground = ends(|l| l == Level::Ground);
     let mut tunnels: FxHashMap<i64, u32> = FxHashMap::default();
-    for way in motor().filter(|w| matches!(w.profile.level, Level::Tunnel(_))) {
+    for way in all().filter(|w| matches!(w.profile.level, Level::Tunnel(_))) {
         for node in [way.nodes[0], way.nodes[way.nodes.len() - 1]] {
             *tunnels.entry(node).or_default() += 1;
         }
     }
     let mut out = Vec::new();
     for (index, way) in ways.iter().enumerate() {
-        if !way.profile.class.is_motor() || !matches!(way.profile.level, Level::Tunnel(_)) {
+        if !carried(way) || !matches!(way.profile.level, Level::Tunnel(_)) {
             continue;
         }
         for end in 0..2 {
@@ -332,6 +357,7 @@ fn pieces(ways: &[Way]) -> Vec<Piece> {
                 nodes: [way.nodes[from], way.nodes[to]],
                 anchor: [false; 2],
                 approach: false,
+                lead: false,
             });
             from = to;
         }
@@ -500,10 +526,132 @@ fn approaches(
                 nodes,
                 anchor,
                 approach: true,
+                lead: false,
             });
         }
     }
     out
+}
+
+/// Metres a road is followed from where a motor road's bridge or approach meets
+/// the ground, for where it lands; and radians off straight on that it is
+/// followed past the end of its way.
+const LEAD: f64 = 60.0;
+const ONWARD: f64 = 0.6;
+
+/// The roads of the ground that lead on from each node where the motor roads'
+/// pieces meet the ground, but those the pieces take, `LEAD` metres along: with
+/// the piece each leads from. Their far ends are joined to nothing (numbers
+/// below zero, of their own).
+fn leads(ways: &[Way], pieces: &[Piece]) -> Vec<(usize, Piece)> {
+    let ground = |w: &Way| w.profile.class.is_motor() && w.profile.level == Level::Ground;
+    let mut on: FxHashMap<i64, Vec<(usize, usize)>> = FxHashMap::default();
+    for (index, way) in ways.iter().enumerate().filter(|(_, w)| ground(w)) {
+        for (k, &node) in way.nodes.iter().enumerate() {
+            on.entry(node).or_default().push((index, k));
+        }
+    }
+    let bits = |p: Point| [p[0].to_bits(), p[1].to_bits()];
+    // the first steps the pieces take from their ends
+    let mut taken: FxHashSet<(i64, [u64; 2])> = FxHashSet::default();
+    for p in pieces {
+        let n = p.points.len();
+        taken.insert((p.nodes[0], bits(p.points[1])));
+        taken.insert((p.nodes[1], bits(p.points[n - 2])));
+    }
+    let mut out = Vec::new();
+    for (from, p) in pieces.iter().enumerate() {
+        if !ways[p.way as usize].profile.class.is_motor() {
+            continue;
+        }
+        for end in (0..2).filter(|&e| p.anchor[e]) {
+            let node = p.nodes[end];
+            for &(index, k) in on.get(&node).into_iter().flatten() {
+                let way = &ways[index];
+                for forward in [true, false] {
+                    let next = if forward { k + 1 } else { k.wrapping_sub(1) };
+                    if next >= way.nodes.len() || taken.contains(&(node, bits(way.points[next]))) {
+                        continue;
+                    }
+                    let points = follow(ways, &on, (index, k, forward), LEAD);
+                    if points.len() < 2 {
+                        continue;
+                    }
+                    let piece = Piece {
+                        way: index as u32,
+                        points,
+                        nodes: [node, 0],
+                        anchor: [false, false],
+                        approach: true,
+                        lead: true,
+                    };
+                    out.push((from, piece));
+                }
+            }
+        }
+    }
+    for (i, (_, lead)) in out.iter_mut().enumerate() {
+        lead.nodes[1] = -(i as i64) - 1;
+    }
+    out
+}
+
+/// A road followed from a node of a way, either way along it, `reach` metres:
+/// past its way's end onto the way that goes on most nearly straight.
+fn follow(
+    ways: &[Way],
+    on: &FxHashMap<i64, Vec<(usize, usize)>>,
+    (mut index, mut k, mut forward): (usize, usize, bool),
+    reach: f64,
+) -> Vec<Point> {
+    let mut points = vec![ways[index].points[k]];
+    let mut length = 0.0;
+    loop {
+        let way = &ways[index];
+        let next = if forward { k + 1 } else { k.wrapping_sub(1) };
+        if next >= way.nodes.len() {
+            let n = points.len();
+            if n < 2 {
+                break;
+            }
+            let (a, b) = (points[n - 2], points[n - 1]);
+            let heading = (b[1] - a[1]).atan2(b[0] - a[0]);
+            let node = way.nodes[k];
+            let turn =
+                |&&(i, j): &&(usize, usize), ahead: bool| -> Option<(f64, (usize, usize, bool))> {
+                    let w = &ways[i];
+                    let to = if ahead { j + 1 } else { j.wrapping_sub(1) };
+                    if i == index || to >= w.nodes.len() {
+                        return None;
+                    }
+                    let (c, d) = (w.points[j], w.points[to]);
+                    let off = ((d[1] - c[1]).atan2(d[0] - c[0]) - heading + std::f64::consts::PI)
+                        .rem_euclid(std::f64::consts::TAU)
+                        - std::f64::consts::PI;
+                    (off.abs() < ONWARD).then_some((off.abs(), (i, j, ahead)))
+                };
+            let onward = (on.get(&node).into_iter().flatten())
+                .flat_map(|a| [turn(&a, true), turn(&a, false)])
+                .flatten()
+                .min_by(|x, y| x.0.total_cmp(&y.0));
+            let Some((_, at)) = onward else { break };
+            (index, k, forward) = at;
+            continue;
+        }
+        let (a, b) = (way.points[k], way.points[next]);
+        let step = distance(a, b) / way.scale;
+        if length + step >= reach {
+            let t = (reach - length) / step;
+            points.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+            break;
+        }
+        length += step;
+        if step > 0.0 {
+            points.push(b);
+        }
+        k = next;
+    }
+    points
 }
 
 /// By cell, segments: group, piece and place in it.
@@ -552,7 +700,8 @@ impl<'a> Index<'a> {
     ) -> Self {
         let mut at = Segments::default();
         for (g, group) in groups.iter().enumerate() {
-            for (i, piece) in group.pieces.iter().enumerate() {
+            // a lead is raised where it lands, if anywhere: what is on it stays on the ground
+            for (i, piece) in group.pieces.iter().enumerate().filter(|(_, p)| !p.lead) {
                 let way = &ways[piece.way as usize];
                 let reach = (way.profile.width / 2.0 + way.profile.centre.abs() + 3.0) * way.scale;
                 for (k, p) in piece.points.windows(2).enumerate() {
@@ -697,6 +846,7 @@ impl<'a> Index<'a> {
 fn over_bridge(class: Class) -> f64 {
     match class {
         Class::Rail => over(Kind::Rail).1,
+        Class::Tram => over(Kind::Tram).1,
         class if class.is_path() => over(Kind::Path).1,
         _ => OVER_ROAD,
     }
@@ -1216,9 +1366,36 @@ mod tests {
         let far: Vec<_> = groups[0]
             .pieces
             .iter()
-            .filter(|p| p.approach)
+            .filter(|p| p.approach && !p.lead)
             .map(|p| p.nodes)
             .collect();
         assert_eq!(far, [[1, 7], [2, 3]]);
+        // and on from where they meet the ground, 60 m, last in the group
+        let leads: Vec<_> = groups[0].pieces.iter().filter(|p| p.lead).collect();
+        assert!(!leads.is_empty());
+        let first = groups[0].pieces.iter().position(|p| p.lead).unwrap();
+        assert!(groups[0].pieces[first..].iter().all(|p| p.lead));
+        let met: Vec<i64> = (groups[0].pieces[..first].iter())
+            .flat_map(|p| (0..2).filter(|&e| p.anchor[e]).map(move |e| p.nodes[e]))
+            .collect();
+        for lead in &leads {
+            let metres: f64 = lead
+                .points
+                .windows(2)
+                .map(|w| distance(w[0], w[1]))
+                .sum::<f64>();
+            assert!(
+                met.contains(&lead.nodes[0]) && lead.nodes[1] < 0 && metres <= LEAD + 1e-6,
+                "{lead:?}"
+            );
+            assert_eq!((lead.approach, lead.anchor), (true, [false; 2]));
+        }
+        // none goes back along what is there
+        for lead in &leads {
+            let back = groups[0].pieces[..first]
+                .iter()
+                .any(|p| p.points.contains(&lead.points[1]));
+            assert!(!back, "{lead:?}");
+        }
     }
 }

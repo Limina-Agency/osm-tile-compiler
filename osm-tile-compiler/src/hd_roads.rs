@@ -123,7 +123,11 @@
 //!   `node0` and `node1` (pieces join where these are equal), `anchor0` and
 //!   `anchor1` (whether it meets the ground there), and `approach` (a road on
 //!   the ground leading up to a bridge, to be raised to it if need be, or a
-//!   footbridge's path, or, as `steps`, the flight that goes up to it). Where its
+//!   footbridge's path, or, as `steps`, the flight that goes up to it), and
+//!   `lead` (a motor road's, last in its group, 60 m on from where a piece meets
+//!   the ground, onward past junctions as straight as it goes: to be raised as an
+//!   approach up to a step in the ground it climbs, the end of a structure the
+//!   tags leave short, and left out where there is none). Where its
 //!   cross-section is another at its start, or its end: `width0`, `centre0` and
 //!   `lines0` (metres alone, as `lines`), which over `taper0` metres turn into
 //!   those above, eased at both ends; `width1` and so on. `bare0`, and `bare1`: of
@@ -138,7 +142,7 @@
 //! - `barrier`, lines: `kind` `guard_rail`, `jersey`, `cable` or `noise`,
 //!   `height` (metres), and where it stands on one, the `group` and `piece`.
 //!   What runs along a bridge's edge is left to its parapet.
-//! - `portal`, lines: where a tunnel comes out, `way`, `width`, `centre`
+//! - `portal`, lines: where a road's or a track's tunnel comes out, `way`, `width`, `centre`
 //!   and `inward` (whether the line, in the way's direction, goes into it).
 //!
 //! Where ways follow each other their lanes do (`hd_roads/lanes.rs`): each lies
@@ -393,7 +397,7 @@ fn write(
         .filter_map(|d| Some((index.on(all, d.way, d.at)?, d)))
         .collect();
     let rails = tracks.painted(all, &index);
-    let portals = structures::portals(ways);
+    let portals = structures::portals(ways_and_tracks);
     let stretches = furniture::stretches(all, &index, barriers, structure_tile);
     let things = things::build(ways, all, &index, &details, mapped, fences);
     let grounds = grounds::build(&source.grounds, areas, ways);
@@ -579,7 +583,8 @@ fn obstacle<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<structures::Kin
         return None;
     }
     match (get("railway"), get("waterway"), get("highway")) {
-        (Some("rail" | "tram" | "light_rail" | "subway" | "narrow_gauge"), ..) => Some(Kind::Rail),
+        (Some("tram"), ..) => Some(Kind::Tram),
+        (Some("rail" | "light_rail" | "subway" | "narrow_gauge"), ..) => Some(Kind::Rail),
         (_, Some("river" | "canal"), _) => Some(Kind::River),
         (_, Some("stream" | "ditch" | "drain"), _) => Some(Kind::Stream),
         (_, _, Some("footway" | "path" | "pedestrian" | "track" | "bridleway" | "steps")) => {
@@ -2051,6 +2056,9 @@ fn structure_tiles(
                 f.tag_bool("anchor0", piece.anchor[0]).map_err(failed)?;
                 f.tag_bool("anchor1", piece.anchor[1]).map_err(failed)?;
                 f.tag_bool("approach", piece.approach).map_err(failed)?;
+                if piece.lead {
+                    f.tag_bool("lead", true).map_err(failed)?;
+                }
                 f.line(piece.points.iter().map(coord)).map_err(failed)?;
                 layer = f.end();
             }
