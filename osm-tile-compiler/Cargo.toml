@@ -56,7 +56,7 @@ pmtiles = { workspace = true, features = ["write"] }
 rayon = { workspace = true }
 crossbeam-channel = "0.5"
 # Compresses the sort runs spilled to the scratch directory (omt/spill.rs).
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
