@@ -97,6 +97,49 @@ fn a_compile_is_polled_to_its_result() {
 }
 
 #[test]
+fn a_style_pack_is_written_from_a_local_mirror() {
+    let dir = tempfile::tempdir().unwrap();
+    let mirror = dir.path().join("mirror");
+    for font in ["Noto Sans Regular", "Noto Sans Bold", "Noto Sans Italic"] {
+        std::fs::create_dir_all(mirror.join(font)).unwrap();
+        std::fs::write(mirror.join(font).join("0-255.pbf"), b"glyphs").unwrap();
+    }
+    std::fs::write(mirror.join("sprite.json"), b"{}").unwrap();
+    std::fs::write(mirror.join("sprite.png"), b"png").unwrap();
+    let pack = dir.path().join("pack");
+    let job = start(&json!({
+        "abiVersion": ABI_VERSION,
+        "kind": "write_style_pack",
+        "request": {
+            "directory": pack,
+            "archiveUrl": "asset://monaco.pmtiles",
+            "glyphs": format!("{}/{{fontstack}}/{{range}}.pbf", mirror.display()),
+            "sprite": mirror.join("sprite"),
+            "baseUrl": "asset://pack",
+        },
+    }))
+    .unwrap();
+    while unsafe { otc_job_state(job) } == 0 {
+        unsafe { otc_job_wait(job, 100) };
+    }
+    let result = result(job);
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["kind"], "write_style_pack");
+    let report = &result["result"];
+    assert_eq!(report["style"], json!(pack.join("style.json")));
+    assert_eq!(report["ranges"].as_array().unwrap().len(), 7);
+    // Every Latin range but the first, in each font, and the @2x sprite.
+    assert_eq!(report["missing"].as_array().unwrap().len(), 3 * 6 + 2);
+    let style: Value =
+        serde_json::from_slice(&std::fs::read(pack.join("style.json")).unwrap()).unwrap();
+    assert_eq!(
+        style["glyphs"],
+        "asset://pack/fonts/{fontstack}/{range}.pbf"
+    );
+    unsafe { otc_job_free(job) };
+}
+
+#[test]
 fn a_cancelled_compile_leaves_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let job = start(&compile(dir.path())).unwrap();

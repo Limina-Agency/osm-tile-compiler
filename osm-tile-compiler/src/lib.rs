@@ -62,8 +62,10 @@
 //!
 //! Besides compiling, the crate fetches the inputs ([`fetch_sources`],
 //! [`fetch_extract`]), writes building levels for an archive
-//! ([`write_building_levels`]), and inspects, diffs and patches archives
-//! ([`archive`]).
+//! ([`write_building_levels`]), inspects, diffs and patches archives
+//! ([`archive`]), and writes the MapLibre style for an archive
+//! ([`maplibre_style`]) or an offline pack of it with its fonts and icons
+//! ([`write_style_pack`]).
 
 /// The message a panic was raised with, for errors that report a caught
 /// panic. Shared with the binary.
@@ -95,6 +97,7 @@ mod profiling;
 mod request;
 mod sources;
 pub mod stage_profile;
+mod style_pack;
 mod tile_geometry;
 mod tile_slicer;
 mod tile_stats;
@@ -124,6 +127,10 @@ pub use omt::{
 pub use output::OutputFormat;
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
+pub use style_pack::{
+    DEFAULT_GLYPHS_URL, DEFAULT_SPRITE_URL, STYLE_FONTSTACKS, StylePackEvent, StylePackReport,
+    StylePackRequest, maplibre_style, write_style_pack,
+};
 pub use tile_stats::{LayerStats, TILE_WARNING_BYTES, TileSize, TileStats, ZoomStats};
 pub use updates::{
     ClipTo, DEFAULT_MAX_DIFFS, PLANET_REPLICATION, Replication, UpdateEvent, UpdateReport,

@@ -9,10 +9,12 @@ use osm_tile_compiler::{
     ArchiveCenter, Area, BasemapRequest, BuildingLevelsReport, ClipTo, CompileBounds, CompileError,
     CompileStage, DEFAULT_MAX_DIFFS, ExtractEvent, FetchEvent, FetchMode, LayerSelection,
     OMT_LANGUAGES as LANGUAGES, OMT_LAYERS as LAYERS, OutputFormat, ReadScope, Replication,
-    SourcesPolicy, SupplementalDataset, UpdateEvent, UpdateReport, UpdateRequest, ZoomRange,
+    SourcesPolicy, StylePackEvent, StylePackRequest, SupplementalDataset, UpdateEvent,
+    UpdateReport, UpdateRequest, ZoomRange,
     archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
-    kib, resolve_languages, update_extract, write_building_levels_cancellable,
+    kib, maplibre_style, resolve_languages, update_extract, write_building_levels_cancellable,
+    write_style_pack,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -25,16 +27,10 @@ const NAME: &str = "osm-tile-compiler";
 const SCRATCH_MARKER: &str = ".osm-tile-compiler-scratch";
 /// The updated PBF `compile --changes` writes in the scratch directory.
 const UPDATED_PBF: &str = ".osm-tile-compiler-updated.osm.pbf";
-/// OSM Bright, adapted to the archives `compile` writes (`style/LICENSE.md`).
-/// `style` replaces its three URLs, each one JSON string in the template.
-const STYLE: &str = include_str!("../style/osm-bright.json");
-const STYLE_ARCHIVE: &str = "pmtiles://basemap.pmtiles";
 /// Names the Geofabrik index `--area` reads instead of
 /// [`osm_tile_compiler::GEOFABRIK_INDEX_URL`]: a mirror, or the
 /// local server the tests run.
 const GEOFABRIK_INDEX_VAR: &str = "OSM_TILE_COMPILER_GEOFABRIK_INDEX";
-const STYLE_GLYPHS: &str = "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf";
-const STYLE_SPRITE: &str = "https://openmaptiles.github.io/osm-bright-gl-style/sprite";
 
 const USAGE: &str = "\
 Usage:
@@ -42,7 +38,7 @@ Usage:
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
-  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
+  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
@@ -60,7 +56,7 @@ Usage:
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
-  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
+  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
@@ -79,7 +75,8 @@ Commands:
                    water-polygons-split-3857.zip
   style            Print a MapLibre style (OSM Bright) for an archive that
                    MapLibre loads from ARCHIVE_URL through the PMTiles protocol;
-                   'pmtiles://' is prepended unless present
+                   'pmtiles://' is prepended unless present. With --offline,
+                   write it to a directory with its fonts and icons instead
   inspect          Describe a PMTiles archive: header, metadata, tile sizes per
                    zoom and the largest tiles, and any problems 'verify' finds
   verify           Check a PMTiles archive's layout and every tile's MVT
@@ -210,6 +207,22 @@ Style options:
                         [default: https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf]
   --sprite <URL>        Icon sprite, without its extension
                         [default: https://openmaptiles.github.io/osm-bright-gl-style/sprite]
+  --offline <DIR>       Write an offline style pack to DIR, which must not exist:
+                        style.json, the glyph ranges of the three Noto Sans
+                        fonts under fonts/, the sprite and LICENSE.md. The
+                        glyphs and sprite are fetched once from --glyphs and
+                        --sprite (URLs, file:// URLs or local paths), and the
+                        style points at them with relative URLs
+  --archive-file <FILE> With --offline: also write every glyph range the
+                        archive's labels use, read from this local copy of it
+                        [default: ARCHIVE_URL, when it is a local file]. The
+                        Latin ranges are always written, enough for name:latin
+  --languages <A,B,...> With --offline: also write glyphs for these languages'
+                        scripts, as compile's --languages reads them ('uk' for
+                        Cyrillic, 'default' for every script)
+  --base-url <URL>      With --offline: put URL before the style's glyph and
+                        sprite paths, for hosts that need absolute URLs
+                        (MapLibre Native: file://, asset:// or https://)
 
 Layers: {LAYERS}
 Languages: {LANGUAGES}
@@ -340,6 +353,10 @@ struct StyleArgs {
     archive: String,
     glyphs: Option<String>,
     sprite: Option<String>,
+    offline: Option<PathBuf>,
+    archive_file: Option<PathBuf>,
+    languages: Option<Vec<String>>,
+    base_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -393,10 +410,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::Compile(args) => compile(*args),
         Command::BuildingLevels(args) => building_levels(args),
         Command::FetchSources(directory) => fetch_sources(&directory),
-        Command::Style(args) => {
-            print!("{}", style(args));
-            Ok(())
-        }
+        Command::Style(args) => style(args),
         Command::Inspect { archive, json } => inspect(&archive, json),
         Command::Verify { archive, json } => verify(&archive, json),
         Command::Diff(args) => diff(args),
@@ -938,6 +952,10 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
     let mut archive = None;
     let mut glyphs = None;
     let mut sprite = None;
+    let mut offline = None;
+    let mut archive_file = None;
+    let mut languages = None;
+    let mut base_url = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -962,13 +980,38 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
                 glyphs = Some(url);
             }
             "--sprite" => sprite = Some(value(&mut args, &flag)?.to_string_lossy().into_owned()),
+            "--offline" => offline = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--archive-file" => archive_file = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--languages" => {
+                let list = list(value(&mut args, &flag)?);
+                resolve_languages(&list).map_err(|e| format!("--languages: {}", e.message()))?;
+                languages = Some(list);
+            }
+            "--base-url" => {
+                base_url = Some(value(&mut args, &flag)?.to_string_lossy().into_owned());
+            }
             _ => return Err(format!("unknown style option '{flag}'")),
+        }
+    }
+    if offline.is_none() {
+        for (given, flag) in [
+            (languages.is_some(), "--languages"),
+            (archive_file.is_some(), "--archive-file"),
+            (base_url.is_some(), "--base-url"),
+        ] {
+            if given {
+                return Err(format!("{flag} needs --offline"));
+            }
         }
     }
     Ok(Command::Style(StyleArgs {
         archive: archive.ok_or("style needs an archive URL")?,
         glyphs,
         sprite,
+        offline,
+        archive_file,
+        languages,
+        base_url,
     }))
 }
 
@@ -1077,25 +1120,82 @@ fn fetch_sources(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The style template with the archive, and any glyph or sprite URL given,
-/// substituted; replacing the JSON strings keeps the template's layout.
-fn style(args: StyleArgs) -> String {
-    let archive = if args.archive.starts_with("pmtiles://") {
-        args.archive
-    } else {
-        format!("pmtiles://{}", args.archive)
+/// Prints the style for the archive, or with `--offline` writes the pack.
+fn style(args: StyleArgs) -> Result<(), String> {
+    let Some(directory) = args.offline else {
+        print!(
+            "{}",
+            maplibre_style(
+                &args.archive,
+                args.glyphs.as_deref(),
+                args.sprite.as_deref()
+            )
+        );
+        return Ok(());
     };
-    let quoted = |url: &str| serde_json::Value::from(url).to_string();
-    [
-        (STYLE_ARCHIVE, Some(archive)),
-        (STYLE_GLYPHS, args.glyphs),
-        (STYLE_SPRITE, args.sprite),
-    ]
-    .into_iter()
-    .fold(STYLE.to_owned(), |style, (default, url)| match url {
-        Some(url) => style.replacen(&quoted(default), &quoted(&url), 1),
-        None => style,
-    })
+    let _cooperating = interrupt::cooperate();
+    let mut status = Status::new();
+    // ARCHIVE_URL may name the archive on this machine.
+    let local = args
+        .archive
+        .strip_prefix("pmtiles://")
+        .unwrap_or(&args.archive);
+    let local = Path::new(local.strip_prefix("file://").unwrap_or(local));
+    let archive_file = args
+        .archive_file
+        .or_else(|| local.is_file().then(|| local.to_owned()));
+    if archive_file.is_none() {
+        status.line(&format!(
+            "{} is not a local file: writing the Latin glyph ranges{}, not \
+             necessarily every one the labels use; --archive-file reads them",
+            args.archive,
+            if args.languages.is_some() {
+                " and --languages' scripts"
+            } else {
+                ""
+            }
+        ));
+    }
+    let mut request = StylePackRequest::new(&directory, args.archive);
+    request.archive_file = archive_file;
+    request.languages = args.languages;
+    request.base_url = args.base_url;
+    if let Some(glyphs) = args.glyphs {
+        request.glyphs = glyphs;
+    }
+    if let Some(sprite) = args.sprite {
+        request.sprite = sprite;
+    }
+    status.line(&format!(
+        "Writing an offline style pack to {}",
+        directory.display()
+    ));
+    let report = write_style_pack(
+        &request,
+        |event| match event {
+            StylePackEvent::ReadingArchive => {
+                status.update("Reading the archive's labels for the glyphs they use")
+            }
+            StylePackEvent::Fetched { done, total, bytes } => {
+                status.update(&format!("Fetched {done} of {total} files, {}", kib(bytes)))
+            }
+            _ => {}
+        },
+        interrupt::requested,
+    )
+    .map_err(|e| e.message().to_string())?;
+    for path in &report.missing {
+        status.line(&format!("Not at the source, left out: {path}"));
+    }
+    status.line(&format!(
+        "Wrote {}: style.json, {} glyph ranges of {} fonts, the sprite; {} files, {}",
+        report.directory.display(),
+        report.ranges.len(),
+        report.fontstacks.len(),
+        report.files,
+        kib(report.bytes)
+    ));
+    Ok(())
 }
 
 fn pbf_bounds(input: &Path) -> Result<CompileBounds, String> {
