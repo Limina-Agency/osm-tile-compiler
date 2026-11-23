@@ -250,11 +250,24 @@ mean of two runs, interleaved; peak RSS is `ru_maxrss`, peak anonymous is
 | | sized from the input | 30 s | 495 MiB | 339 MiB | 68 |
 
 - main's buffers grow with the compile, each to about half of what its
-  worker has spilled; on Poland (five times this input, 2 threads, on a
-  laptop) the whole compile peaked at 6.5 GiB against 0.1.3's 2.5 GiB.
-  Sized from the input, the largest buffer was under 30 MiB here; it grows
-  with the input divided by the 96 runs aimed for, so Poland's should be
-  about 60 MiB (estimated, not measured: Poland can't be downloaded here).
+  worker has spilled. Sized from the input, the largest buffer was under
+  30 MiB here; it grows with the input divided by the 96 runs aimed for.
+
+Poland, the same container, one run each: the openstreetmap.fr extract of
+2026-11-23 (2.27 GiB; Geofabrik can't be reached from it), `--bounds 14.07
+48.99 24.16 55.04`, since that extract's header has no box. The branch's
+archives are byte-identical to main's. About 1.6 GiB of each peak RSS is
+the memory-mapped extract and the program.
+
+| Compile | Build | Time | Peak RSS | Peak anonymous | Most runs at once |
+|---|---|---|---|---|---|
+| Poland, 2 threads | 0.1.3 | 487 s | 2994 MiB | 1413 MiB | 741 |
+| | main | 392 s | 4790 MiB | 3209 MiB | 75 |
+| | sized from the input | 385 s | 2865 MiB | 1283 MiB | 84 |
+| Poland, 4 threads | 0.1.3 | 278 s | 3124 MiB | 1544 MiB | 741 |
+| | main | 224 s | 5962 MiB | 4381 MiB | 83 |
+| | sized from the input | 223 s | 3278 MiB | 1696 MiB | 86 |
+
 - The extra runs cost nothing measurable: 90 runs still merge in one pass.
 - Małopolskie spills fewer runs than the buffers need to grow for, so it is
   unchanged.
