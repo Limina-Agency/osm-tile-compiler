@@ -1,4 +1,4 @@
-//! Stands: where an extract's woods, scrub and orchards are, as a grid of cells a tile, for a
+//! Stands: where an extract's woods, scrub, orchards, grass, heath and fields are, as a grid of cells a tile, for a
 //! renderer to grow trees in (`trees.rs` writes them). A cell holds what its middle lies in,
 //! the smaller area over the larger, and nothing where a road, water, a building or a cleared
 //! strip runs, so that no tree is grown there.
@@ -29,7 +29,8 @@ const CLEAR_OF_TREE: f64 = 2.5;
 /// What grows in an area. 0 is unknown but in `cover`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Stand {
-    /// 1 wood or forest, 2 scrub, 3 orchard, 4 swamp.
+    /// 1 wood or forest, 2 scrub, 3 orchard, 4 swamp, 5 grass (meadow, grassland), 6 heath, 7 field
+    /// (farmland).
     pub cover: u8,
     /// As a tree's.
     pub kind: u8,
@@ -64,6 +65,12 @@ fn what<'a>(get: impl Fn(&str) -> Option<&'a str>, closed: bool) -> Option<What>
             3
         } else if is("wetland", &["swamp"]) {
             4
+        } else if is("landuse", &["meadow", "grass"]) || is("natural", &["grassland"]) {
+            5
+        } else if is("natural", &["heath"]) {
+            6
+        } else if is("landuse", &["farmland"]) {
+            7
         } else {
             0
         };
@@ -91,10 +98,7 @@ fn what<'a>(get: impl Fn(&str) -> Option<&'a str>, closed: bool) -> Option<What>
         {
             return Some(What::Clear);
         }
-        if is("landuse", &["meadow", "farmland", "grass"])
-            || is("natural", &["grassland", "heath"])
-            || is("wetland", &["bog", "marsh", "fen", "reedbed"])
-        {
+        if is("wetland", &["bog", "marsh", "fen", "reedbed"]) {
             return Some(What::Open);
         }
     }
@@ -734,7 +738,15 @@ mod tests {
         );
         assert_eq!(told(&[("building", "yes")], true), Some(What::Clear));
         assert_eq!(told(&[("building", "no")], true), None);
-        assert_eq!(told(&[("landuse", "meadow")], true), Some(What::Open));
+        let cover = |tags: &[(&str, &str)]| match told(tags, true) {
+            Some(What::Stand(s)) => s.cover,
+            _ => 0,
+        };
+        assert_eq!(cover(&[("landuse", "meadow")]), 5);
+        assert_eq!(cover(&[("natural", "grassland")]), 5);
+        assert_eq!(cover(&[("natural", "heath")]), 6);
+        assert_eq!(cover(&[("landuse", "farmland")]), 7);
+        assert_eq!(told(&[("wetland", "marsh")], true), Some(What::Open));
         assert_eq!(told(&[("natural", "wood")], false), None);
         assert!(matches!(told(&[("highway", "track")], false), Some(What::Strip(m)) if m < 3.0));
         assert_eq!(
