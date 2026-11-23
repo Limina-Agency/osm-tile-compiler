@@ -140,6 +140,48 @@ The style is OSM Bright from OpenMapTiles, adapted to this compiler's layers.
 It credits OpenMapTiles and OpenStreetMap in the map's corner, as their
 licenses require.
 
+### Offline style pack
+
+The printed style loads its fonts and icons from the network. For a device
+without one, write an offline style pack instead:
+
+```sh
+osm-tile-compiler style berlin.pmtiles --offline berlin-style
+```
+
+`berlin-style/` then holds `style.json`, the glyphs of the three Noto Sans
+fonts the style uses under `fonts/`, the icon sprite (`sprite.json`,
+`sprite.png` and their `@2x` pair) and `LICENSE.md`. The glyphs and sprite are
+fetched once, from `--glyphs` and `--sprite` (URLs, `file://` URLs or local
+paths, so a mirror works too); the pack needs no network afterwards. A pack
+with the Latin glyphs alone is about 2 MB.
+
+Which glyph ranges it holds:
+
+- The Latin ranges, with punctuation and symbols, always: every `name:latin`
+  label.
+- Every range the archive's labels use, read from the archive when
+  `ARCHIVE_URL` is a local file, or from `--archive-file FILE`. This is the
+  way to be sure of every label: MapLibre Native fails to draw a view that
+  needs a range it cannot load, and Berlin's `name:nonlatin` labels need
+  Cyrillic, Arabic, Han and Hangul ranges (27 ranges, 11 MB in all).
+- The scripts of `--languages` (as `compile --languages` reads them: `uk`
+  for Cyrillic, `default` for every script the schema's languages use).
+
+`style.json` names the glyphs and sprite relative to itself. MapLibre GL JS
+resolves the glyph URL against the page but wants an absolute sprite URL, and
+MapLibre Native wants absolute URLs throughout, so give the pack's final
+location with `--base-url`:
+
+```sh
+osm-tile-compiler style "pmtiles://file:///sdcard/maps/berlin.pmtiles" \
+  --offline berlin-style --archive-file berlin.pmtiles \
+  --base-url file:///sdcard/maps/berlin-style
+```
+
+From a native app, the C ABI's `write_style_pack` job does the same
+([`docs/c-abi.md`](docs/c-abi.md)).
+
 ## Choosing what to compile
 
 ### Area
@@ -491,7 +533,9 @@ each supplemental dataset carries its own license.
 By default the style loads fonts from the MapLibre demo server and icons
 from OSM Bright's GitHub Pages site, neither meant for production. Host your
 own with `style --glyphs URL --sprite URL` (the style uses Noto Sans Regular,
-Bold and Italic). The sprite lacks icons for some POI classes, which then
+Bold and Italic), or bundle them with `style --offline DIR`. A pack's
+`LICENSE.md` carries the style's and sprite's license and names the fonts'
+(SIL Open Font License 1.1). The sprite lacks icons for some POI classes, which then
 show only their names.
 
 ## Development

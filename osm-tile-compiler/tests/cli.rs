@@ -8,6 +8,7 @@ mod common;
 use common::{monaco_pbf, synthetic_sources};
 use pmtiles::{AsyncPmTilesReader, TileType};
 use std::ffi::OsStr;
+use std::path::Path;
 use std::process::{Command, Output};
 
 fn run<I, S>(args: I) -> Output
@@ -214,6 +215,22 @@ fn usage_errors_exit_with_2() {
             "{fontstack} and {range}",
         ),
         (&["style", "a", "--sprite"], "--sprite needs a value"),
+        (
+            &["style", "a", "--languages", "uk"],
+            "--languages needs --offline",
+        ),
+        (
+            &["style", "a", "--base-url", "x"],
+            "--base-url needs --offline",
+        ),
+        (
+            &["style", "a", "--archive-file", "a"],
+            "--archive-file needs --offline",
+        ),
+        (
+            &["style", "a", "--offline", "d", "--languages", "xx"],
+            "--languages: unknown language 'xx'",
+        ),
         (
             &["compile", "in.pbf", "--layers", "water,roads"],
             "--layers: unknown layer 'roads'; the layers are water, waterway,",
@@ -523,6 +540,29 @@ async fn compiles_monaco_into_a_valid_archive() {
             );
         }
     }
+
+    // An offline pack reads the archive's labels for the glyph ranges.
+    let mirror = temp.path().join("mirror");
+    style_mirror(&mirror);
+    let pack = temp.path().join("pack");
+    let output = run([
+        "style".as_ref(),
+        archive.as_os_str(),
+        "--offline".as_ref(),
+        pack.as_os_str(),
+        "--glyphs".as_ref(),
+        mirror.join("{fontstack}/{range}.pbf").as_os_str(),
+        "--sprite".as_ref(),
+        mirror.join("sprite").as_os_str(),
+    ]);
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("not a local file"), "{stderr}");
+    assert!(stderr.contains("glyph ranges of 3 fonts"), "{stderr}");
+    let style: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(pack.join("style.json")).unwrap()).unwrap();
+    assert_eq!(style["glyphs"], "fonts/{fontstack}/{range}.pbf");
+    assert!(pack.join("fonts/Noto Sans Bold/0-255.pbf").is_file());
 
     // A selection writes only its layers and languages, and verifies.
     let selected = temp.path().join("out/selected.pmtiles");
@@ -964,6 +1004,66 @@ fn change_files_update_an_extract_and_a_compile() {
         std::fs::read(&rebuilt).unwrap(),
         std::fs::read(&new).unwrap()
     );
+}
+
+/// A glyph and sprite mirror holding only the first Latin range.
+fn style_mirror(mirror: &Path) {
+    for font in ["Noto Sans Regular", "Noto Sans Bold", "Noto Sans Italic"] {
+        std::fs::create_dir_all(mirror.join(font)).unwrap();
+        std::fs::write(mirror.join(font).join("0-255.pbf"), b"glyphs").unwrap();
+    }
+    std::fs::write(mirror.join("sprite.json"), b"{}").unwrap();
+    std::fs::write(mirror.join("sprite.png"), b"png").unwrap();
+}
+
+#[test]
+fn an_offline_style_pack_for_a_remote_archive_has_the_latin_glyphs() {
+    let temp = tempfile::tempdir().unwrap();
+    let mirror = temp.path().join("mirror");
+    style_mirror(&mirror);
+    let pack = temp.path().join("pack");
+    let output = run([
+        "style".as_ref(),
+        "https://example.com/region.pmtiles".as_ref(),
+        "--offline".as_ref(),
+        pack.as_os_str(),
+        "--glyphs".as_ref(),
+        mirror.join("{fontstack}/{range}.pbf").as_os_str(),
+        "--sprite".as_ref(),
+        mirror.join("sprite").as_os_str(),
+        "--base-url".as_ref(),
+        "file:///sdcard/maps/pack".as_ref(),
+    ]);
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("not a local file"), "{stderr}");
+    assert!(
+        stderr.contains("left out: fonts/Noto Sans Bold/256-511.pbf"),
+        "{stderr}"
+    );
+    let style: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(pack.join("style.json")).unwrap()).unwrap();
+    assert_eq!(
+        style["sources"]["openmaptiles"]["url"],
+        "pmtiles://https://example.com/region.pmtiles"
+    );
+    assert_eq!(
+        style["glyphs"],
+        "file:///sdcard/maps/pack/fonts/{fontstack}/{range}.pbf"
+    );
+    assert_eq!(style["sprite"], "file:///sdcard/maps/pack/sprite");
+    assert!(pack.join("LICENSE.md").is_file());
+
+    // The pack is not overwritten.
+    let again = run([
+        "style".as_ref(),
+        "a.pmtiles".as_ref(),
+        "--offline".as_ref(),
+        pack.as_os_str(),
+    ]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(text(&again.stderr).contains("already exists"));
 }
 
 #[test]

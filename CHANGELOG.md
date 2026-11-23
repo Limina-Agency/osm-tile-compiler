@@ -20,6 +20,17 @@
   the tiles within `--bounds`, `--polygon` and `--min-zoom`/`--max-zoom`,
   copied byte for byte, at the positions a compile limited to the same area
   writes. From Rust, `archive::extract` with an `ExtractRequest`.
+- Offline style pack: `style --offline DIR` writes `style.json` with the
+  glyphs of its three Noto Sans fonts and its icon sprite as local files,
+  fetched once from `--glyphs` and `--sprite` (URLs, `file://` URLs or
+  local paths), so that labels and icons draw with no network. It holds the
+  Latin glyph ranges, every range the archive's labels use (read from a
+  local archive, or `--archive-file`) and the scripts of `--languages`.
+  The style names them relative to itself, or under `--base-url`. From Rust,
+  `write_style_pack` (`StylePackRequest`, `StylePackReport`), and
+  `maplibre_style` prints the plain style; from C, the `write_style_pack`
+  job kind.
+
 - Experimental merge cache for recompiles after an update: `compile
   --merge-cache` writes `<NAME>.merge-cache` beside the archive, and
   `--reuse-from OLD.pmtiles` takes every tile layer whose input records are

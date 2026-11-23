@@ -369,6 +369,83 @@ fn packed(bytes: &[u8]) -> Result<Vec<u64>, String> {
     Ok(values)
 }
 
+/// The 256-code-point glyph ranges, by their first code point, that the
+/// string values of the tags named `keys` use across every tile of a
+/// PMTiles archive. Code points past U+FFFF, which MapLibre draws from no
+/// glyph range, are left out. `should_cancel` is asked before each tile.
+pub(crate) fn glyph_ranges_used(
+    path: &Path,
+    keys: &[String],
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<BTreeSet<u32>, String> {
+    let mut reader = ArchiveReader::open(path)?;
+    let compression = reader.header.tile_compression;
+    let mut ranges = BTreeSet::new();
+    reader.visit_entries(|reader, entry| {
+        if should_cancel() {
+            return Err(crate::control::CANCELLED.into());
+        }
+        let tile = decompress(&reader.tile(&entry)?, compression)?;
+        tile_glyph_ranges(&tile, keys, &mut ranges)
+            .map_err(|e| format!("tile {}: {e}", entry.tile_id))
+    })?;
+    Ok(ranges)
+}
+
+fn tile_glyph_ranges(
+    tile: &[u8],
+    keys: &[String],
+    ranges: &mut BTreeSet<u32>,
+) -> Result<(), String> {
+    for (number, wire, _, layer) in fields(tile)? {
+        if (number, wire) != (3, 2) {
+            continue;
+        }
+        let (mut wanted, mut values, mut features) = (Vec::new(), Vec::new(), Vec::new());
+        for (number, wire, _, payload) in fields(layer)? {
+            match (number, wire) {
+                (2, 2) => features.push(payload),
+                (3, 2) => wanted.push(keys.iter().any(|key| key.as_bytes() == payload)),
+                (4, 2) => values.push(payload),
+                _ => {}
+            }
+        }
+        if !wanted.contains(&true) {
+            continue;
+        }
+        let mut used = vec![false; values.len()];
+        for feature in features {
+            for (number, wire, _, payload) in fields(feature)? {
+                if (number, wire) != (2, 2) {
+                    continue;
+                }
+                for [key, value] in packed(payload)?.as_chunks::<2>().0 {
+                    if wanted.get(*key as usize) == Some(&true)
+                        && let Some(used) = used.get_mut(*value as usize)
+                    {
+                        *used = true;
+                    }
+                }
+            }
+        }
+        for (value, _) in values.iter().zip(used).filter(|(_, used)| *used) {
+            for (number, wire, _, text) in fields(value)? {
+                if (number, wire) == (1, 2)
+                    && let Ok(text) = std::str::from_utf8(text)
+                {
+                    ranges.extend(
+                        text.chars()
+                            .map(u32::from)
+                            .filter(|&c| c < 0x10000)
+                            .map(|c| c / 256 * 256),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checks an uncompressed MVT tile against the spec (version 2) and returns
 /// each layer's name and encoded size in tile order.
 fn check_mvt(
@@ -625,6 +702,24 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn glyph_ranges_come_from_the_label_keys_only() {
+        let mut feature = MvtLayerBuilder::new("place")
+            .unwrap()
+            .feature_of(MvtGeomType::Point);
+        feature.tag_string("name:latin", "Kyiv").unwrap();
+        feature.tag_string("name:nonlatin", "Київ").unwrap();
+        feature.tag_string("name:zh", "基辅").unwrap();
+        feature.tag_string("class", "Ωmega").unwrap();
+        feature.points([MvtCoord { x: 5, y: 5 }]).unwrap();
+        let tile = feature.end().encode();
+        let keys = ["name:latin".to_string(), "name:nonlatin".to_string()];
+        let mut ranges = BTreeSet::new();
+        tile_glyph_ranges(&tile, &keys, &mut ranges).unwrap();
+        assert_eq!(ranges, BTreeSet::from([0, 1024]));
+        assert!(tile_glyph_ranges(&tile[..tile.len() - 1], &keys, &mut ranges).is_err());
     }
 
     #[test]

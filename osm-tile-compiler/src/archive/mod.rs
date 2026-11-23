@@ -13,6 +13,7 @@ mod reader;
 mod tile_patch;
 
 pub use check::ArchiveReport;
+pub(crate) use check::glyph_ranges_used;
 #[doc(hidden)]
 pub use delta::partial_path;
 pub use delta::{

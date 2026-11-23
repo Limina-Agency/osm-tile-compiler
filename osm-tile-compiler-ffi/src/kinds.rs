@@ -11,7 +11,8 @@
 use crate::job::{JobError, Progress, Work};
 use osm_tile_compiler::{
     ArchiveCenter, Area, AreaPolygon, BasemapRequest, CompileBounds, CompileError, LayerSelection,
-    OutputFormat, ReadScope, SourcesPolicy, SupplementalDataset, ZoomRange, compile_basemap,
+    OutputFormat, ReadScope, SourcesPolicy, StylePackEvent, StylePackRequest, SupplementalDataset,
+    ZoomRange, compile_basemap, write_style_pack,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -32,7 +33,7 @@ struct Envelope {
 }
 
 /// The kinds this library runs, in the order the docs list them.
-pub const KINDS: &[&str] = &["compile_basemap"];
+pub const KINDS: &[&str] = &["compile_basemap", "write_style_pack"];
 
 /// Parses an envelope and its request: the kind and the work to run.
 pub fn parse(json: &str) -> Result<(&'static str, Work), JobError> {
@@ -47,6 +48,7 @@ pub fn parse(json: &str) -> Result<(&'static str, Work), JobError> {
     }
     match envelope.kind.as_str() {
         "compile_basemap" => Ok(("compile_basemap", compile_basemap_work(envelope.request)?)),
+        "write_style_pack" => Ok(("write_style_pack", write_style_pack_work(envelope.request)?)),
         other => Err(JobError::invalid_request(format!(
             "Unknown request kind '{other}'; this library runs: {}",
             KINDS.join(", ")
@@ -271,6 +273,67 @@ fn compile_basemap_work(request: Value) -> Result<Work, JobError> {
     }))
 }
 
+/// `write_style_pack`'s request, a mirror of
+/// `osm_tile_compiler::StylePackRequest`. Only `directory` and `archiveUrl`
+/// are required.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StylePackJson {
+    directory: PathBuf,
+    archive_url: String,
+    archive_file: Option<PathBuf>,
+    languages: Option<Vec<String>>,
+    glyphs: Option<String>,
+    sprite: Option<String>,
+    base_url: Option<String>,
+}
+
+fn style_pack_request(request: Value) -> Result<StylePackRequest, JobError> {
+    let json: StylePackJson = serde_json::from_value(request)
+        .map_err(|e| JobError::invalid_request(format!("Invalid write_style_pack request: {e}")))?;
+    let mut request = StylePackRequest::new(json.directory, json.archive_url);
+    request.archive_file = json.archive_file;
+    request.languages = json.languages;
+    request.base_url = json.base_url;
+    if let Some(glyphs) = json.glyphs {
+        request.glyphs = glyphs;
+    }
+    if let Some(sprite) = json.sprite {
+        request.sprite = sprite;
+    }
+    request.validate()?;
+    Ok(request)
+}
+
+fn write_style_pack_work(request: Value) -> Result<Work, JobError> {
+    let request = style_pack_request(request)?;
+    Ok(Box::new(move |reporter| {
+        let report = write_style_pack(
+            &request,
+            |event| match event {
+                StylePackEvent::ReadingArchive => reporter.report(Progress {
+                    stage: None,
+                    message: "Reading the archive's labels".into(),
+                    fraction: None,
+                    overall: Some(0.0),
+                }),
+                StylePackEvent::Fetched { done, total, .. } => {
+                    let fraction = done as f64 / total.max(1) as f64;
+                    reporter.report(Progress {
+                        stage: None,
+                        message: format!("Fetched {done} of {total} files"),
+                        fraction: Some(fraction),
+                        overall: Some(fraction),
+                    })
+                }
+                _ => {}
+            },
+            || reporter.is_cancelled(),
+        )?;
+        serde_json::to_value(report).map_err(|e| JobError::internal(e.to_string()))
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +406,32 @@ mod tests {
         assert_eq!(request.archive.gzip_level, 6);
         assert_eq!(request.languages, Some(vec!["en".to_string()]));
         assert!(request.building_levels);
+    }
+
+    #[test]
+    fn style_pack_requests_map_onto_style_pack_request() {
+        let request = style_pack_request(json!({
+            "directory": "/nowhere/pack",
+            "archiveUrl": "asset://berlin.pmtiles",
+            "languages": ["uk"],
+            "glyphs": "https://example.com/{fontstack}/{range}.pbf",
+            "baseUrl": "asset://pack",
+        }))
+        .unwrap();
+        assert_eq!(request.directory, PathBuf::from("/nowhere/pack"));
+        assert_eq!(request.languages, Some(vec!["uk".to_string()]));
+        assert_eq!(request.base_url.as_deref(), Some("asset://pack"));
+        assert_eq!(request.sprite, osm_tile_compiler::DEFAULT_SPRITE_URL);
+        let refused = |request: Value| style_pack_request(request).unwrap_err().message;
+        assert!(refused(json!({"directory": "/x"})).contains("archiveUrl"));
+        assert!(
+            refused(json!({"directory": "/x", "archiveUrl": "a", "languages": ["xx"]}))
+                .contains("unknown language 'xx'")
+        );
+        assert!(
+            refused(json!({"directory": "/x", "archiveUrl": "a", "glyphs": "g.pbf"}))
+                .contains("{fontstack}")
+        );
     }
 
     #[test]
