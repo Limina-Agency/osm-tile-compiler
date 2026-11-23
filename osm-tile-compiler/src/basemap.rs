@@ -36,6 +36,16 @@ pub enum SourcesPolicy {
 pub struct BasemapRequest {
     /// The `.osm.pbf` extract, read in place.
     pub input_pbf: PathBuf,
+    /// More extracts to compile together with `input_pbf`, for an area that
+    /// crosses an extract's edge (the Tatras lie in Poland and Slovakia)
+    /// [default: none]. They are merged first into one file in the scratch
+    /// directory (the `MergeExtracts` stage), which needs about as much
+    /// scratch space as the extracts take; objects they share are read once,
+    /// from the extract with the newest replication timestamp. Every extract
+    /// must be sorted by type then id, as Geofabrik's are. Without
+    /// [`Area::bounds`], the area is the box around every extract's header
+    /// box; the archive's OSM data timestamp is the oldest extract's.
+    pub extra_inputs: Vec<PathBuf>,
     /// The archive to write; it must not exist yet. Building levels, when
     /// asked for, go beside it ([`building_levels_path`]).
     pub output: PathBuf,
@@ -66,8 +76,14 @@ pub struct BasemapRequest {
     /// their own as well, so up to about twice as many are busy at a time
     /// while the PBF is read.
     pub threads: usize,
-    /// The layers to write [default: all].
+    /// The layers to write [default: every OpenMapTiles layer].
     pub layers: LayerSelection,
+    /// Whether to also write the opt-in search-and-rescue layer,
+    /// [`SAR_LAYER`](crate::SAR_LAYER), into the archive [default: no]. Its
+    /// schema is in `docs/sar.md`; the OpenMapTiles layers are the same with
+    /// or without it. `layers` may still leave it out, and
+    /// [`LayerSelection::Only`] naming it writes it too.
+    pub sar: bool,
     /// The `name:<lang>` languages to write, as [`resolve_languages`] takes
     /// them [default: all of [`OMT_LANGUAGES`]]. `name`, `name_en`,
     /// `name_de`, `name_int`, `name:latin` and `name:nonlatin` are written
@@ -100,6 +116,13 @@ pub struct BasemapRequest {
 }
 
 impl BasemapRequest {
+    /// `input_pbf` and then `extra_inputs`.
+    fn inputs(&self) -> Vec<&Path> {
+        std::iter::once(self.input_pbf.as_path())
+            .chain(self.extra_inputs.iter().map(PathBuf::as_path))
+            .collect()
+    }
+
     /// A full compile at zooms 0 to 14 on every core, with the supplemental
     /// datasets `sources` holds, and no building levels.
     pub fn new(
@@ -110,6 +133,7 @@ impl BasemapRequest {
     ) -> Self {
         Self {
             input_pbf: input_pbf.into(),
+            extra_inputs: Vec::new(),
             output: output.into(),
             format: None,
             sources: sources.into(),
@@ -122,6 +146,7 @@ impl BasemapRequest {
             zoom: ZoomRange::default(),
             threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
             layers: LayerSelection::All,
+            sar: false,
             languages: None,
             building_levels: false,
             sort_memory: None,
@@ -158,7 +183,7 @@ impl BasemapRequest {
     /// takes them.
     fn check(&self) -> Result<Option<Vec<String>>, CompileError> {
         let invalid = CompileError::InvalidRequest;
-        let layers = self.layers.names().map_err(invalid)?;
+        let layers = self.layers.names(self.sar).map_err(invalid)?;
         if let Some(languages) = &self.languages {
             omt::resolve_languages(languages).map_err(invalid)?;
         }
@@ -332,7 +357,8 @@ fn compile(
 ) -> Result<BasemapOutput, String> {
     let bounds = match request.area.bounds {
         Some(bounds) => bounds,
-        None => read_pbf_bounds(&request.input_pbf)?,
+        None if request.extra_inputs.is_empty() => read_pbf_bounds(&request.input_pbf)?,
+        None => union_bounds(&request.inputs())?,
     };
     let area = request
         .area
@@ -377,6 +403,9 @@ fn compile(
     }
     let scratch = Scratch::create(&request.temp_dir)?;
     compile_request.temp_dir = scratch.path.clone();
+    if !request.extra_inputs.is_empty() {
+        compile_request.input_pbf = merge_extracts(&request.inputs(), &scratch.path, control)?;
+    }
     // The archive is moved into place only when complete; it and the
     // levels are removed again if a later step fails or is cancelled.
     let archive_guard = RemoveOnDrop::file(request.output.clone());
@@ -417,6 +446,61 @@ fn compile(
             .filter(|dataset| request.omit_sources.contains(dataset))
             .collect(),
     })
+}
+
+/// Merges `inputs` into one sorted PBF in `scratch`, in the `MergeExtracts`
+/// stage, newest extract first so that its copy of a shared object wins.
+fn merge_extracts(inputs: &[&Path], scratch: &Path, control: &Control) -> Result<PathBuf, String> {
+    use osm_pbf_ingest::changes::{BaseIndex, MergeOptions, merge_files_with_progress};
+    let message = format!("Merging {} extracts", inputs.len());
+    control.stage(CompileStage::MergeExtracts, &message)?;
+    let stage = crate::stage_profile::Stage::start("merge_extracts");
+    let mut indexes = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        control.check()?;
+        indexes
+            .push(BaseIndex::scan(input, false).map_err(|e| format!("{}: {e}", input.display()))?);
+    }
+    // Newest first; an extract without a timestamp counts as oldest. The
+    // sort is stable, so ties keep the request's order.
+    indexes.sort_by_key(|index| std::cmp::Reverse(index.header().replication_timestamp));
+    let order: Vec<&BaseIndex> = indexes.iter().collect();
+    let output = scratch.join("merged.osm.pbf");
+    let options = MergeOptions {
+        writing_program: Some(omt::GENERATOR.to_string()),
+    };
+    merge_files_with_progress(&order, &output, &options, |done, total| {
+        control.set_total(total as u64);
+        control.set_done(done as u64);
+        control.check()
+    })?;
+    drop(stage);
+    Ok(output)
+}
+
+/// The box around the header boxes of `inputs`, which must not cross the
+/// antimeridian.
+fn union_bounds(inputs: &[&Path]) -> Result<CompileBounds, String> {
+    let mut union: Option<CompileBounds> = None;
+    for input in inputs {
+        let b = read_pbf_bounds(input)?;
+        if b.west > b.east {
+            return Err(format!(
+                "{}'s header box crosses the antimeridian; give the area's bounds",
+                input.display()
+            ));
+        }
+        union = Some(match union {
+            None => b,
+            Some(u) => CompileBounds::new(
+                u.north.max(b.north),
+                u.south.min(b.south),
+                u.east.max(b.east),
+                u.west.min(b.west),
+            ),
+        });
+    }
+    union.ok_or_else(|| "no input extracts".to_string())
 }
 
 /// Fetches the datasets as the request's policy says, in the

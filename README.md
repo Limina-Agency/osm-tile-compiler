@@ -57,6 +57,14 @@ accepted exceptions.
 
 A compile runs in stages, each reported as progress:
 
+0. **Merging extracts** (`merge_extracts`), only when several are given. An
+   area that crosses an extract's edge, such as the Tatras on the Polish and
+   Slovak border, can be compiled from both: `compile poland.osm.pbf
+   slovakia.osm.pbf --bounds …` merges them into one sorted file in the
+   scratch directory first, as `osmium merge` would, keeping each shared
+   object once. That takes about as much scratch space as the extracts.
+   Without `--bounds` the area is the box around both extracts. Change files
+   apply to one extract, so update each one first.
 1. **Supplemental datasets** (`read_sources`). OpenMapTiles takes the sea
    from OSM's water polygons, and low zooms and label ranks from Natural
    Earth; lake labels follow lake centerlines. `fetch-sources` downloads these
@@ -140,6 +148,48 @@ The style is OSM Bright from OpenMapTiles, adapted to this compiler's layers.
 It credits OpenMapTiles and OpenStreetMap in the map's corner, as their
 licenses require.
 
+### Offline style pack
+
+The printed style loads its fonts and icons from the network. For a device
+without one, write an offline style pack instead:
+
+```sh
+osm-tile-compiler style berlin.pmtiles --offline berlin-style
+```
+
+`berlin-style/` then holds `style.json`, the glyphs of the three Noto Sans
+fonts the style uses under `fonts/`, the icon sprite (`sprite.json`,
+`sprite.png` and their `@2x` pair) and `LICENSE.md`. The glyphs and sprite are
+fetched once, from `--glyphs` and `--sprite` (URLs, `file://` URLs or local
+paths, so a mirror works too); the pack needs no network afterwards. A pack
+with the Latin glyphs alone is about 2 MB.
+
+Which glyph ranges it holds:
+
+- The Latin ranges, with punctuation and symbols, always: every `name:latin`
+  label.
+- Every range the archive's labels use, read from the archive when
+  `ARCHIVE_URL` is a local file, or from `--archive-file FILE`. This is the
+  way to be sure of every label: MapLibre Native fails to draw a view that
+  needs a range it cannot load, and Berlin's `name:nonlatin` labels need
+  Cyrillic, Arabic, Han and Hangul ranges (27 ranges, 11 MB in all).
+- The scripts of `--languages` (as `compile --languages` reads them: `uk`
+  for Cyrillic, `default` for every script the schema's languages use).
+
+`style.json` names the glyphs and sprite relative to itself. MapLibre GL JS
+resolves the glyph URL against the page but wants an absolute sprite URL, and
+MapLibre Native wants absolute URLs throughout, so give the pack's final
+location with `--base-url`:
+
+```sh
+osm-tile-compiler style "pmtiles://file:///sdcard/maps/berlin.pmtiles" \
+  --offline berlin-style --archive-file berlin.pmtiles \
+  --base-url file:///sdcard/maps/berlin-style
+```
+
+From a native app, the C ABI's `write_style_pack` job does the same
+([`docs/c-abi.md`](docs/c-abi.md)).
+
 ## Choosing what to compile
 
 ### Area
@@ -215,6 +265,12 @@ gives these sentences for an app to show.
 
 `--name`, `--description` and `--attribution` set the archive's metadata;
 the attribution must keep crediting OpenMapTiles and OpenStreetMap.
+The metadata also says what made the archive and how current its data is,
+so an app can show "map data as of" and pick the newest of several
+archives: `generator` (`osm-tile-compiler 0.3.0`), and from the extract's
+header `osm_data_timestamp` (RFC 3339, UTC), `osm_replication_sequence` and
+`osm_replication_url`. Those three are left out when the header doesn't give
+them. `inspect` prints them, and `CompileResult::osm_data` has the same.
 `--gzip-level` trades compile time for size, `--threads` sets the worker
 threads (every core by default), and `--temp-dir` the scratch space
 (`<output>.tmp` by default, removed afterwards, also when Ctrl-C stops
@@ -229,7 +285,7 @@ archive (gzip-compressed MVT, `format` `pbf`), and the metadata the same
 fields, with `vector_layers` in the `json` row. As in Planetiler's compact
 MBTiles, `tiles` is a view over `map` and `images`, so that identical small
 tiles (open sea, solid land) are stored once. Building levels, `--delta-from`,
-`inspect`, `verify`, `diff` and `apply` work on PMTiles only.
+`inspect`, `verify`, `extract`, `diff` and `apply` work on PMTiles only.
 
 ## Building levels
 
@@ -244,6 +300,17 @@ existing basemap:
 osm-tile-compiler building-levels monaco.pmtiles monaco-buildings.pmtiles
 ```
 
+## The search-and-rescue layer
+
+`compile --sar` also writes `sar`, a layer for search teams with what
+OpenMapTiles leaves out or thins out: huts and shelters, springs and
+drinking water, emergency points (mountain rescue, access points with their
+numbers, phones, defibrillators), helicopter landing sites, hazards (power
+lines, cliffs, caves, mine shafts) and trails graded by `sac_scale`, at zooms
+10 to 14 with no label grid dropping any. The OpenMapTiles layers are the
+same with or without it, and the metadata says `"sar_schema": 1`. `style
+--sar` draws it above the basemap. Its schema is in [docs/sar.md](docs/sar.md).
+
 ## Checking archives
 
 ```sh
@@ -255,6 +322,25 @@ Both read any PMTiles v3 archive. `verify` checks the layout (sections,
 directories, entry order, clustering, the header's counts) and decodes every
 tile, checking its MVT encoding and that its layers are declared in the
 metadata. Tiles over 1 MiB compressed produce a warning at compile time.
+
+## Cutting an area out of an archive
+
+```sh
+# The Tatras from a Małopolskie (or Poland) archive
+osm-tile-compiler extract malopolskie.pmtiles --output tatras.pmtiles --bounds 19.70 49.15 20.25 49.35
+# A search area drawn as a polygon, without the street-level zoom
+osm-tile-compiler extract poland.pmtiles --output search.pmtiles --polygon area.geojson --max-zoom 13
+```
+
+`extract` writes a new archive holding the tiles of an existing one within
+a box (`--bounds`), a polygon (`--polygon`, GeoJSON or `.poly`) and zooms
+(`--min-zoom`, `--max-zoom`), copied byte for byte: nothing is decoded or
+encoded again, so a small area takes well under a second from a country
+archive. The tiles kept are the ones a compile limited to the same box or
+polygon writes, and they are not cut: features keep their full geometry, as
+in the source. The header and metadata get the new bounds, center and zooms;
+everything else in the metadata is kept. It reads any PMTiles v3 archive.
+From Rust, `archive::extract` takes an `ExtractRequest`.
 
 ## Keeping an extract fresh (experimental)
 
@@ -276,7 +362,11 @@ server's URL, or `header` for the server the PBF's header names (Geofabrik
 extracts name their `-updates` server). Where to start comes from the
 header's sequence number on its own server, otherwise from its timestamp, and
 the updated file's header records where it ended, so the next `update`
-continues from there.
+continues from there. Change files given on the command line move the
+header's timestamp too when each has its state file beside it
+(`124347.osc.gz` and `124347.state.txt`, as Osmosis names them); the sequence
+number and server stay as they were, since a state file doesn't name its
+server.
 
 Only the PBF blocks a change touches are decoded and written again; the rest
 are copied as they are. On a 4-core cloud VM, bringing Małopolskie forward by
@@ -462,7 +552,9 @@ each supplemental dataset carries its own license.
 By default the style loads fonts from the MapLibre demo server and icons
 from OSM Bright's GitHub Pages site, neither meant for production. Host your
 own with `style --glyphs URL --sprite URL` (the style uses Noto Sans Regular,
-Bold and Italic). The sprite lacks icons for some POI classes, which then
+Bold and Italic), or bundle them with `style --offline DIR`. A pack's
+`LICENSE.md` carries the style's and sprite's license and names the fonts'
+(SIL Open Font License 1.1). The sprite lacks icons for some POI classes, which then
 show only their names.
 
 ## Development

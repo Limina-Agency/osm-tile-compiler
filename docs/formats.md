@@ -18,6 +18,7 @@ they don't know. Note every bump in `CHANGELOG.md`.
 | C ABI | `osm-tile-compiler-ffi`: the header's functions and `OTC_*` numbers, and the envelope (`abiVersion`), progress, result and error JSON; see `docs/c-abi.md` | 1 | `ABI_VERSION` (`osm-tile-compiler-ffi/src/lib.rs`), `OTC_ABI_VERSION` (the header) | `osm-tile-compiler-ffi/tests/header.rs` |
 | Basemap manifest | `BasemapOutput::manifest()`, written by the worker to the request's `manifestPath`; `format` is `basemap-manifest` | `formatVersion` 1 | `MANIFEST_FORMAT`, `MANIFEST_VERSION` | `tests/formats.rs`, `tests/embedding.rs` |
 | Building-level archives | The PMTiles metadata `{"format":"building-levels","version":1,"source_layer":"building"}` | 1 | `BUILDING_LEVELS_FORMAT`, `BUILDING_LEVELS_VERSION` | `tests/formats.rs`, `src/building_levels.rs`, `tests/building_levels.rs` |
+| SAR layer schema | The `sar` layer's classes, subclasses, attributes and zooms (`docs/sar.md`), and `sar_schema` in the metadata of an archive that has it | 1 | `SAR_SCHEMA_VERSION` (`src/omt/sar.rs`) | `tests/sar.rs`, `src/omt/sar.rs` |
 | Delta archives (experimental) | The files `diff` writes and `apply` reads: the magic `OTCDELTA`, a `u32` version, a JSON manifest whose `format` is `osm-tile-compiler-delta`, then copy, literal and tile patch operations (`src/archive/delta.rs`, `src/archive/tile_patch.rs`) | 1 | `DELTA_FORMAT`, `DELTA_VERSION` | `tests/formats.rs` |
 | Merge caches (experimental) | `<NAME>.merge-cache` beside an archive compiled with `--merge-cache`: the magic `OTCMRGC1` (its version), the build's code fingerprint, the gzip level, the archive's length and header, then a zstd stream of tile entries (`src/omt/merge_cache.rs`). An index from another build is ignored with a warning, so the fingerprint stands in for a version | `OTCMRGC1` | `MAGIC`, `FINGERPRINT` (`src/omt/merge_cache.rs`) | `tests/cli.rs` |
 | Supplemental caches | `<sources>/.extracted/<archive>/.complete` and `<database>.geometry-counts`, each led by a stamp `v<version> <size> <mtime-ns>` | 1 | `CACHE_VERSION` (`src/omt/supplements.rs`) | its unit test |
@@ -45,6 +46,8 @@ These belong to other projects and follow them:
 |---|---|---|
 | OpenMapTiles schema | 3.16.0 | `OMT_SCHEMA_VERSION`; written as the archive metadata's `version` and the manifest's `version`, as OpenMapTiles does |
 | Planetiler OpenMapTiles profile | commit `91516fdf` | `omt::PROFILE_REVISION`; written as `planetiler_openmaptiles_profile_commit` |
+| This crate | its version | written as the archive metadata's `generator`, `osm-tile-compiler <version>`; `tests/monaco.rs` records it as `osm-tile-compiler <version>` so a release doesn't change the fingerprint |
+| OSM replication | the extract's header | written as `osm_data_timestamp` (RFC 3339, UTC), `osm_replication_sequence` and `osm_replication_url` when the header gives them |
 | Planetiler (comparison) | 0.10.2 | `benchmarks/compiler-parity/` |
 | PMTiles | specification v3 | the archive header |
 | MBTiles | specification 1.3 | `application_id` 0x4d504258 and the `metadata` table of `--format mbtiles` archives |

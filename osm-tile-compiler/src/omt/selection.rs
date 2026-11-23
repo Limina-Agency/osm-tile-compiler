@@ -6,30 +6,57 @@
 //! feature only once it is evaluated, before it is rendered: a feature
 //! belongs to one layer and the tile encoder post-processes each layer on its
 //! own, so a selected layer comes out as it would in a full build.
-use super::{LANGUAGES, LAYERS, types::Feature};
+use super::{LANGUAGES, LAYERS, sar, types::Feature};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Default)]
+/// How many layers a compile can write: the OpenMapTiles layers, then the
+/// opt-in `sar` layer.
+const KNOWN: usize = LAYERS.len() + 1;
+
+/// The layer at a position of the selection: `LAYERS`, then `sar`.
+fn known(index: usize) -> &'static str {
+    LAYERS.get(index).copied().unwrap_or(sar::LAYER)
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct Selection {
-    /// The selected layers' positions in `LAYERS`; `None` selects all.
-    layers: Option<[bool; LAYERS.len()]>,
+    /// The selected layers, `LAYERS` then `sar`.
+    layers: [bool; KNOWN],
     /// `name:<lang>` attributes left out; empty when every language is kept.
     dropped_names: BTreeSet<String>,
 }
 
+/// Every OpenMapTiles layer, without `sar`.
+fn default_layers() -> [bool; KNOWN] {
+    let mut layers = [true; KNOWN];
+    layers[LAYERS.len()] = false;
+    layers
+}
+
+impl Default for Selection {
+    fn default() -> Self {
+        Self {
+            layers: default_layers(),
+            dropped_names: BTreeSet::new(),
+        }
+    }
+}
+
 impl Selection {
+    /// `layers` lists the layers to write, `sar` among them when it is
+    /// written [default: every OpenMapTiles layer, without `sar`].
     pub fn new(layers: Option<&[String]>, languages: Option<&[String]>) -> Result<Self, String> {
         let layers = match layers {
-            None => None,
+            None => default_layers(),
             Some(names) => {
-                let mut selected = [false; LAYERS.len()];
+                let mut selected = [false; KNOWN];
                 for name in names {
                     selected[layer_index(name)?] = true;
                 }
                 if !selected.contains(&true) {
                     return Err("no layer is left to write".into());
                 }
-                Some(selected)
+                selected
             }
         };
         let dropped_names = match languages {
@@ -49,23 +76,20 @@ impl Selection {
         })
     }
 
-    /// The layers written, in `LAYERS` order.
+    /// The layers written, in `LAYERS` order, then `sar`.
     pub fn layers(&self) -> Vec<&'static str> {
-        LAYERS
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| self.layers.is_none_or(|selected| selected[*index]))
-            .map(|(_, layer)| *layer)
+        (0..KNOWN)
+            .filter(|index| self.layers[*index])
+            .map(known)
             .collect()
     }
 
     pub fn has_layer(&self, layer: &str) -> bool {
-        match &self.layers {
-            None => true,
-            Some(selected) => LAYERS
-                .iter()
-                .position(|known| *known == layer)
-                .is_some_and(|index| selected[index]),
+        match layer_index(layer) {
+            Ok(index) => self.layers[index],
+            // As before `sar`, a full build passes on any other name, so a
+            // feature that cannot be encoded still fails the compile.
+            Err(_) => self.layers == default_layers(),
         }
     }
 
@@ -82,39 +106,46 @@ impl Selection {
 }
 
 fn layer_index(name: &str) -> Result<usize, String> {
-    LAYERS
-        .iter()
-        .position(|layer| *layer == name)
+    (0..KNOWN)
+        .find(|index| known(*index) == name)
         .ok_or_else(|| {
             format!(
-                "unknown layer '{name}'; the layers are {}",
-                LAYERS.join(", ")
+                "unknown layer '{name}'; the layers are {} (and {}, written only when asked for)",
+                LAYERS.join(", "),
+                sar::LAYER
             )
         })
 }
 
-/// The layers to write, in `LAYERS` order, given either the layers to write
-/// or the layers to leave out; `None` when neither is given (every layer).
-/// Every name must be one of [`LAYERS`], and at least one layer must remain.
+/// The layers to write, in `LAYERS` order then `sar`, given either the layers
+/// to write or the layers to leave out; `None` when neither is given and
+/// `sar` is not asked for (every OpenMapTiles layer). `sar` asks for the
+/// opt-in `sar` layer beside the others; naming `sar` among the layers to
+/// write asks for it too, and naming it among those to leave out drops it.
+/// Every name must be one of [`LAYERS`] or `sar`, and at least one layer must
+/// remain.
 pub fn select_layers(
     only: Option<&[String]>,
     excluded: Option<&[String]>,
+    sar: bool,
 ) -> Result<Option<Vec<String>>, String> {
     let selected = match (only, excluded) {
-        (None, None) => return Ok(None),
+        (None, None) if !sar => return Ok(None),
         (Some(_), Some(_)) => {
             return Err("give either the layers to write or those to leave out, not both".into());
         }
         (Some(names), None) => {
-            let mut selected = [false; LAYERS.len()];
+            let mut selected = [false; KNOWN];
             for name in names {
                 selected[layer_index(name)?] = true;
             }
+            selected[LAYERS.len()] |= sar;
             selected
         }
-        (None, Some(names)) => {
-            let mut selected = [true; LAYERS.len()];
-            for name in names {
+        (None, excluded) => {
+            let mut selected = default_layers();
+            selected[LAYERS.len()] = sar;
+            for name in excluded.unwrap_or_default() {
                 selected[layer_index(name)?] = false;
             }
             selected
@@ -124,11 +155,9 @@ pub fn select_layers(
         return Err("no layer is left to write".into());
     }
     Ok(Some(
-        LAYERS
-            .iter()
-            .zip(selected)
-            .filter(|(_, keep)| *keep)
-            .map(|(layer, _)| layer.to_string())
+        (0..KNOWN)
+            .filter(|index| selected[*index])
+            .map(|index| known(index).to_string())
             .collect(),
     ))
 }
@@ -211,6 +240,7 @@ mod tests {
             select_layers(
                 only.map(strings).as_deref(),
                 excluded.map(strings).as_deref(),
+                false,
             )
         };
         assert_eq!(select(None, None).unwrap(), None);
@@ -237,6 +267,49 @@ mod tests {
         assert_eq!(selection.layers(), ["water", "poi"]);
         assert!(selection.has_layer("water") && !selection.has_layer("place"));
         assert_eq!(Selection::default().layers(), LAYERS);
+        assert!(!Selection::default().has_layer("sar"));
+    }
+
+    #[test]
+    fn sar_is_written_only_when_asked_for() {
+        let select = |only: Option<&[&str]>, excluded: Option<&[&str]>, sar| {
+            select_layers(
+                only.map(strings).as_deref(),
+                excluded.map(strings).as_deref(),
+                sar,
+            )
+        };
+        let mut all = LAYERS.to_vec();
+        all.push("sar");
+        assert_eq!(select(None, None, true).unwrap().unwrap(), all);
+        assert_eq!(
+            select(Some(&["sar", "water"]), None, false)
+                .unwrap()
+                .unwrap(),
+            ["water", "sar"]
+        );
+        assert_eq!(
+            select(Some(&["water"]), None, true).unwrap().unwrap(),
+            ["water", "sar"]
+        );
+        let without_poi = select(None, Some(&["poi"]), true).unwrap().unwrap();
+        assert_eq!(without_poi.len(), LAYERS.len());
+        assert_eq!(without_poi.last().unwrap(), "sar");
+        // Leaving out a layer that is not written anyway is no error.
+        let plain = select(None, Some(&["sar"]), false).unwrap().unwrap();
+        assert_eq!(plain, LAYERS);
+        assert_eq!(select(None, Some(&["sar"]), true).unwrap().unwrap(), LAYERS);
+        assert!(select(Some(&["sar"]), Some(&["sar"]), true).is_err());
+
+        let selection = Selection::new(Some(&strings(&["sar"])), None).unwrap();
+        assert_eq!(selection.layers(), ["sar"]);
+        assert!(selection.has_layer("sar") && !selection.has_layer("poi"));
+        let selection = Selection::new(
+            Some(&all.iter().map(|l| l.to_string()).collect::<Vec<_>>()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(selection.layers(), all);
     }
 
     #[test]

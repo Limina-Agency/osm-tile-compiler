@@ -139,6 +139,12 @@ pub enum CompileStage {
     /// checked or received over the bytes expected; it only runs when the
     /// request asks to fetch.
     FetchSources,
+    /// Merging the extracts into one sorted file, when the request gives more
+    /// than one ([`BasemapRequest::extra_inputs`]). Its fraction counts the
+    /// PBF blocks read; like `FetchSources`, it is not part of `overall`.
+    ///
+    /// [`BasemapRequest::extra_inputs`]: crate::BasemapRequest::extra_inputs
+    MergeExtracts,
     /// Extracting (once; later compiles reuse it) and reading the
     /// supplemental datasets. Its fraction counts the datasets read.
     ReadSources,
@@ -159,8 +165,9 @@ pub enum CompileStage {
 
 impl CompileStage {
     /// Every stage, in order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::FetchSources,
+        Self::MergeExtracts,
         Self::ReadSources,
         Self::IndexOsm,
         Self::ReadOsm,
@@ -168,11 +175,13 @@ impl CompileStage {
         Self::BuildingLevels,
     ];
 
-    /// A stable identifier: `fetch_sources`, `read_sources`, `index_osm`,
-    /// `read_osm`, `write_tiles` or `building_levels`.
+    /// A stable identifier: `fetch_sources`, `merge_extracts`,
+    /// `read_sources`, `index_osm`, `read_osm`, `write_tiles` or
+    /// `building_levels`.
     pub fn id(self) -> &'static str {
         match self {
             Self::FetchSources => "fetch_sources",
+            Self::MergeExtracts => "merge_extracts",
             Self::ReadSources => "read_sources",
             Self::IndexOsm => "index_osm",
             Self::ReadOsm => "read_osm",
@@ -182,11 +191,12 @@ impl CompileStage {
     }
 
     /// The share of a compile's time the stage typically takes, without
-    /// downloads; the weights of all but `FetchSources` add up to 1. Set
-    /// from a Małopolskie compile (200 MB of PBF) on 4 threads.
+    /// downloads or merging; the weights of all but `FetchSources` and
+    /// `MergeExtracts` add up to 1. Set from a Małopolskie compile (200 MB of
+    /// PBF) on 4 threads.
     pub fn weight(self) -> f64 {
         match self {
-            Self::FetchSources => 0.0,
+            Self::FetchSources | Self::MergeExtracts => 0.0,
             Self::ReadSources => 0.05,
             Self::IndexOsm => 0.05,
             Self::ReadOsm => 0.47,

@@ -112,6 +112,7 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
 ```json
 {
   "inputPbf": "/…/monaco.osm.pbf",
+  "extraInputs": ["/…/more.osm.pbf"],
   "output": "/…/monaco.pmtiles",
   "format": "pmtiles",
   "sources": "/…/omt-sources",
@@ -129,7 +130,8 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
   "languages": ["en", "pl"],
   "archive": { "name": "Monaco", "description": "…", "attribution": "…", "gzipLevel": 6 },
   "threads": 2,
-  "buildingLevels": false
+  "buildingLevels": false,
+  "sar": false
 }
 ```
 
@@ -141,7 +143,9 @@ languages, the datasets present in `sources`). `sourcesPolicy` is
 default) or `near_area`, which reads only the OSM data in and near the area.
 `format` is `pmtiles` or `mbtiles`; without it, an `output` ending in
 `.mbtiles` is MBTiles and anything else PMTiles. Building levels need
-PMTiles.
+PMTiles. `sar` also writes the search-and-rescue layer
+([sar.md](sar.md)); `layers` may still leave it out, and `{"only": [...]}`
+naming `sar` writes it too.
 
 The result is the basemap manifest the worker writes (`format`,
 `formatVersion`, `schema`, `version`, `result`, `supplementalInputs`,
@@ -160,6 +164,47 @@ without bounds or a polygon, an output that already exists. What needs
 reading (a PBF or polygon that cannot be opened, missing datasets) fails the
 job instead, with `error.kind` `invalid_request`. Once the request types get
 serde support with these names (roadmap item A9), the mapping goes away.
+
+### `write_style_pack`
+
+```json
+{
+  "directory": "/…/maps/berlin-style",
+  "archiveUrl": "pmtiles://file:///…/maps/berlin.pmtiles",
+  "archiveFile": "/…/maps/berlin.pmtiles",
+  "languages": ["uk"],
+  "glyphs": "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+  "sprite": "https://openmaptiles.github.io/osm-bright-gl-style/sprite",
+  "baseUrl": "file:///…/maps/berlin-style"
+}
+```
+
+Writes an offline style pack (see the README): `style.json` pointing at
+`archiveUrl`, the glyph ranges its labels need under `fonts/`, the sprite and
+`LICENSE.md`. Only `directory` (which must not exist) and `archiveUrl` are
+required. `archiveFile` is a local copy of the archive whose labels decide
+the glyph ranges beyond Latin; `languages` adds their scripts. `glyphs` and
+`sprite` say where to fetch from (URLs, `file://` URLs or local paths) and
+default to the servers above; `baseUrl` goes before the style's glyph and
+sprite paths, which MapLibre Native needs; `sar: true` also draws the
+opt-in `sar` layer, for an archive compiled with it. Progress reports `Fetched N of M
+files` with a fraction and no stage. The result is the `StylePackReport`:
+
+```json
+{
+  "directory": "/…/maps/berlin-style",
+  "style": "/…/maps/berlin-style/style.json",
+  "fontstacks": ["Noto Sans Regular", "Noto Sans Bold", "Noto Sans Italic"],
+  "ranges": ["0-255", "256-511", "…"],
+  "files": 87,
+  "bytes": 11631298,
+  "missing": []
+}
+```
+
+`missing` lists files the source lacked (a glyph range, or the `@2x`
+sprite), which are left out; a missing 1x sprite fails the job with
+`download`. A failed or cancelled job leaves no directory behind.
 
 ## Versioning
 

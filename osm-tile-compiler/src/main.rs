@@ -45,6 +45,9 @@ static CANCELLED: AtomicBool = AtomicBool::new(false);
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompilerProcessRequest {
     input_pbf_path: PathBuf,
+    /// More extracts to merge with `inputPbfPath` [default: none].
+    #[serde(default)]
+    extra_input_pbf_paths: Vec<PathBuf>,
     sources_dir: PathBuf,
     output_pmtiles_path: PathBuf,
     temp_dir: PathBuf,
@@ -73,6 +76,10 @@ struct CompilerProcessRequest {
     /// [default: no].
     #[serde(default)]
     building_levels: bool,
+    /// Whether to also write the search-and-rescue layer `sar`
+    /// [default: no].
+    #[serde(default)]
+    sar: bool,
 }
 
 fn emit(event: serde_json::Value) -> Result<(), String> {
@@ -186,6 +193,7 @@ fn run() -> Result<(), WorkerError> {
         request.sources_dir,
         request.temp_dir,
     );
+    compile.extra_inputs = request.extra_input_pbf_paths;
     compile.sources_policy = SourcesPolicy::FetchAndVerify;
     compile.omit_sources = omit_sources;
     // `areaOnly` without a polygon reads the whole extract, as before.
@@ -208,6 +216,7 @@ fn run() -> Result<(), WorkerError> {
     };
     compile.languages = request.languages;
     compile.building_levels = request.building_levels;
+    compile.sar = request.sar;
     // Each stage is reported once, as before; downloads also with their
     // fraction.
     let mut last = None;

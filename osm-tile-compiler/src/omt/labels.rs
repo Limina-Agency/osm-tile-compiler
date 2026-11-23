@@ -536,7 +536,7 @@ fn world_area(source: &Source) -> f64 {
     }
 }
 
-fn elevation_meters(source: &Source) -> Option<f64> {
+pub(super) fn elevation_meters(source: &Source) -> Option<f64> {
     // For example OSM way 93759497 has ele="241,4"; the reference finds the
     // trailing "4", not 241.4.
     java_meters(source.tag("ele")).filter(|value| value.is_finite())
@@ -579,7 +579,7 @@ fn point_feature(source: &Source, layer: &str, minzoom: u8) -> Option<Feature> {
     }
 }
 
-fn centroid_label_feature(source: &Source, layer: &str, minzoom: u8) -> Option<Feature> {
+pub(super) fn centroid_label_feature(source: &Source, layer: &str, minzoom: u8) -> Option<Feature> {
     if quantize_label_source(source) {
         let world =
             super::interior_point::osm_point_then_centroid_if_convex_world(&source.geometry)?;

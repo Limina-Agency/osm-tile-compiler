@@ -94,7 +94,8 @@ Parts of the source are ported from Planetiler (Apache-2.0) and from JTS
 (Eclipse Distribution License 1.0, BSD-style). Their license texts ship in
 the crate at `src/omt/LICENSE.planetiler` and `src/omt/LICENSE.jts-edl-1.0.txt`;
 the OpenMapTiles code license is in `src/omt/LICENSE.openmaptiles.md`. The
-style that `osm-tile-compiler style` prints is adapted from OSM Bright
+style that `osm-tile-compiler style` prints (or writes, with `--offline`,
+as a pack with its fonts and icons) is adapted from OSM Bright
 (BSD 3-Clause code, CC-BY 4.0 design); its license is in `style/LICENSE.md`.
 
 ## License

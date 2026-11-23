@@ -1,21 +1,25 @@
 //! The PMTiles archive a compile writes: options for its metadata and tile
-//! compression, a reader that inspects and verifies finished archives, and
-//! delta archives that update one archive to a newer one.
+//! compression, a reader that inspects and verifies finished archives, delta
+//! archives that update one archive to a newer one, and extracts that cut an
+//! area out of one.
 use crate::CompileError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 mod check;
 mod delta;
+mod extract;
 mod reader;
 mod tile_patch;
 
 pub use check::ArchiveReport;
+pub(crate) use check::glyph_ranges_used;
 #[doc(hidden)]
 pub use delta::partial_path;
 pub use delta::{
     ApplyReport, ArchiveDigest, DELTA_FORMAT, DELTA_VERSION, DeltaManifest, DiffReport, TileChanges,
 };
+pub use extract::{ExtractReport, ExtractRequest, extract};
 #[doc(hidden)]
 pub use reader::{ArchiveReader, Entry, Header};
 
