@@ -344,6 +344,20 @@ impl<R: Read> RunReader<R> {
         Ok(true)
     }
 
+    /// The records of the next block, in order, or none at the end of the
+    /// run.
+    pub(super) fn next_block_records(&mut self) -> Result<Vec<EncodedRecord>, String> {
+        let mut records = vec![];
+        if let Some(first) = self.next()? {
+            records.reserve_exact(self.records as usize + 1);
+            records.push(first);
+            while self.records > 0 {
+                records.extend(self.next()?);
+            }
+        }
+        Ok(records)
+    }
+
     /// The next record, or `None` at the end of the run.
     pub(super) fn next(&mut self) -> Result<Option<EncodedRecord>, String> {
         if self.records == 0 {

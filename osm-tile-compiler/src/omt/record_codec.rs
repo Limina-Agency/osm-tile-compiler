@@ -5,9 +5,11 @@
 //! varint deltas, and attributes whose keys are one-byte ids from a static
 //! table. Ids never reach the output: they decode back to the exact strings,
 //! and keys outside the table are stored verbatim.
-use super::{render::Record, store::AttrValue};
+use super::{
+    render::Record,
+    store::{AttrKey, AttrMap, AttrValue},
+};
 use crate::tile_geometry::{TileGeometry, TilePoint, TileRingGroup};
-use std::collections::BTreeMap;
 
 /// The OMT layer names in byte order, so an index orders like its name.
 pub(super) const LAYER_NAMES: [&str; 16] = [
@@ -409,12 +411,12 @@ fn put_geometry(out: &mut Vec<u8>, geometry: &TileGeometry) {
 // The name variants of a feature (`name`, `name:latin`, `name_en`, ...) mostly
 // share one value, so a string equal to one of the last few string values of
 // the record is stored as the distance back to it.
-fn put_attrs(out: &mut Vec<u8>, attrs: &BTreeMap<String, AttrValue>) {
+fn put_attrs(out: &mut Vec<u8>, attrs: &AttrMap) {
     put_varint(out, attrs.len() as u64);
     let mut recent = [""; REPEAT_WINDOW];
     let mut strings = 0;
     for (key, value) in attrs {
-        match ATTR_KEYS.binary_search(&key.as_str()) {
+        match ATTR_KEYS.binary_search(&&**key) {
             Ok(index) => out.push(index as u8 + 1),
             Err(_) => {
                 out.push(KEY_VERBATIM);
@@ -460,7 +462,7 @@ fn put_attrs(out: &mut Vec<u8>, attrs: &BTreeMap<String, AttrValue>) {
 pub(super) fn decode_payload(
     bytes: &[u8],
     tile_id: u64,
-    layer: &str,
+    layer: AttrKey,
     sort_key: i64,
     id: u64,
 ) -> Result<Record, String> {
@@ -495,7 +497,7 @@ pub(super) fn decode_payload(
         tile_id,
         zoom,
         id,
-        layer: layer.to_owned(),
+        layer,
         geometry,
         attrs,
         sort_key,
@@ -540,16 +542,18 @@ fn read_geometry(reader: &mut Reader) -> Result<TileGeometry, String> {
     })
 }
 
-fn read_attrs(reader: &mut Reader) -> Result<BTreeMap<String, AttrValue>, String> {
+fn read_attrs(reader: &mut Reader) -> Result<AttrMap, String> {
     let count = reader.length()?;
     let mut attrs = Vec::with_capacity(count);
     for _ in 0..count {
         let key = match reader.u8()? {
-            KEY_VERBATIM => reader.str()?,
-            id => ATTR_KEYS
-                .get(usize::from(id) - 1)
-                .copied()
-                .ok_or("Unknown OMT record attribute key")?,
+            KEY_VERBATIM => AttrKey::Owned(reader.str()?.to_owned()),
+            id => AttrKey::Borrowed(
+                ATTR_KEYS
+                    .get(usize::from(id) - 1)
+                    .copied()
+                    .ok_or("Unknown OMT record attribute key")?,
+            ),
         };
         let value = match reader.u8()? {
             VALUE_STRING => AttrValue::String(reader.str()?.to_owned()),
@@ -575,7 +579,7 @@ fn read_attrs(reader: &mut Reader) -> Result<BTreeMap<String, AttrValue>, String
             VALUE_TRUE => AttrValue::Bool(true),
             _ => return Err("Unknown OMT record attribute value".into()),
         };
-        attrs.push((key.to_owned(), value));
+        attrs.push((key, value));
     }
     // Encoded in key order, so this is a bulk build of an already sorted map.
     Ok(attrs.into_iter().collect())
@@ -908,12 +912,12 @@ pub(super) mod tests {
             }
         }
         pub(in crate::omt) fn record(&mut self) -> Record {
-            let mut attrs = BTreeMap::new();
+            let mut attrs = AttrMap::new();
             for _ in 0..self.below(8) {
-                let key = if self.below(3) == 0 {
-                    self.word()
+                let key: AttrKey = if self.below(3) == 0 {
+                    self.word().into()
                 } else {
-                    ATTR_KEYS[self.below(ATTR_KEYS.len() as u64) as usize].to_owned()
+                    ATTR_KEYS[self.below(ATTR_KEYS.len() as u64) as usize].into()
                 };
                 attrs.insert(key, self.value());
             }
@@ -922,9 +926,9 @@ pub(super) mod tests {
                 zoom: self.below(256) as u8,
                 id: self.next() << 11 | self.next(),
                 layer: if self.below(4) == 0 {
-                    self.word()
+                    self.word().into()
                 } else {
-                    LAYER_NAMES[self.below(16) as usize].to_owned()
+                    LAYER_NAMES[self.below(16) as usize].into()
                 },
                 geometry: self.geometry(),
                 attrs,
@@ -970,7 +974,7 @@ pub(super) mod tests {
         let decoded = decode_payload(
             &bytes,
             record.tile_id,
-            &record.layer,
+            record.layer.clone(),
             record.sort_key,
             record.id,
         )
@@ -1058,7 +1062,7 @@ pub(super) mod tests {
             roundtrip(&record);
         }
         record.attrs.clear();
-        record.attrs.insert(String::new(), AttrValue::Bool(true));
+        record.attrs.insert("".into(), AttrValue::Bool(true));
         record
             .attrs
             .insert("name".into(), AttrValue::String(String::new()));
@@ -1074,9 +1078,9 @@ pub(super) mod tests {
                 .to_vec(),
             holes: vec![],
         }]);
-        record.attrs = BTreeMap::from([
-            ("render_height".to_owned(), AttrValue::Int(9)),
-            ("class".to_owned(), AttrValue::String("building".into())),
+        record.attrs = AttrMap::from([
+            ("render_height".into(), AttrValue::Int(9)),
+            ("class".into(), AttrValue::String("building".into())),
         ]);
         record.grid_size = 0.0;
         record.grid_limit = 0;
@@ -1088,7 +1092,7 @@ pub(super) mod tests {
         let mut record = Lcg(1).record();
         record.attrs = ["name", "name:latin", "name_en", "name_int"]
             .into_iter()
-            .map(|key| (key.to_owned(), AttrValue::String("Kraków".into())))
+            .map(|key| (key.into(), AttrValue::String("Kraków".into())))
             .collect();
         let repeated = roundtrip(&record);
         record
@@ -1099,7 +1103,7 @@ pub(super) mod tests {
         record.attrs = (0..12)
             .map(|i| {
                 (
-                    format!("k{i:02}"),
+                    format!("k{i:02}").into(),
                     AttrValue::String(format!("value {}", i % 10)),
                 )
             })
@@ -1124,7 +1128,7 @@ pub(super) mod tests {
                 decode_payload(
                     bytes,
                     record.tile_id,
-                    &record.layer,
+                    record.layer.clone(),
                     record.sort_key,
                     record.id,
                 )
@@ -1139,7 +1143,7 @@ pub(super) mod tests {
         let huge = [
             0, 0, 0, 1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
         ];
-        assert!(decode_payload(&huge, 0, "poi", 0, 0).is_err());
+        assert!(decode_payload(&huge, 0, "poi".into(), 0, 0).is_err());
     }
 
     #[test]
