@@ -122,14 +122,14 @@ pub use extracts::{
 pub use omt::{
     CompileResult, LANGUAGES as OMT_LANGUAGES, LAYERS as OMT_LAYERS, MergeCacheOptions,
     MergeCacheStats, OMT_SCHEMA_VERSION, OsmDataInfo, PROFILE_REVISION as OMT_PROFILE_REVISION,
-    merge_cache_path,
+    SAR_LAYER, SAR_SCHEMA_VERSION, merge_cache_path,
 };
 pub use output::OutputFormat;
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
 pub use style_pack::{
     DEFAULT_GLYPHS_URL, DEFAULT_SPRITE_URL, STYLE_FONTSTACKS, StylePackEvent, StylePackReport,
-    StylePackRequest, maplibre_style, write_style_pack,
+    StylePackRequest, maplibre_style, with_sar_layers, write_style_pack,
 };
 pub use tile_stats::{LayerStats, TILE_WARNING_BYTES, TileSize, TileStats, ZoomStats};
 pub use updates::{

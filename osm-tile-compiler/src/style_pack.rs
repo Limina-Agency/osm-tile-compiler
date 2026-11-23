@@ -31,6 +31,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const STYLE: &str = include_str!("../style/osm-bright.json");
 const STYLE_LICENSE: &str = include_str!("../style/LICENSE.md");
 const STYLE_ARCHIVE: &str = "pmtiles://basemap.pmtiles";
+/// The style layers that draw the opt-in `sar` layer (docs/sar.md), which
+/// [`with_sar_layers`] appends.
+const SAR_STYLE: &str = include_str!("../style/sar-layers.json");
 
 /// Where the style loads its font glyphs from unless told otherwise: the
 /// MapLibre demo server, not meant for production.
@@ -73,6 +76,20 @@ pub fn maplibre_style(archive_url: &str, glyphs: Option<&str>, sprite: Option<&s
     })
 }
 
+/// `style` with the layers that draw the opt-in `sar` layer appended after
+/// the basemap's, so that they draw above it: the style for an archive
+/// compiled with `sar`. The result is pretty-printed JSON.
+pub fn with_sar_layers(style: &str) -> String {
+    let mut style: serde_json::Value = serde_json::from_str(style).expect("the style is JSON");
+    let sar: Vec<serde_json::Value> =
+        serde_json::from_str(SAR_STYLE).expect("the bundled SAR style is JSON");
+    style["layers"]
+        .as_array_mut()
+        .expect("the style has layers")
+        .extend(sar);
+    serde_json::to_string_pretty(&style).expect("a style serializes")
+}
+
 /// What [`write_style_pack`] writes, and where it fetches from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -106,6 +123,9 @@ pub struct StylePackRequest {
     /// `file://`, `asset://` or `http(s)://` URLs). A `/` is added unless it
     /// ends with one.
     pub base_url: Option<String>,
+    /// Also draw the opt-in `sar` layer, for an archive compiled with it
+    /// (see [`with_sar_layers`]).
+    pub sar: bool,
 }
 
 impl StylePackRequest {
@@ -120,6 +140,7 @@ impl StylePackRequest {
             glyphs: DEFAULT_GLYPHS_URL.into(),
             sprite: DEFAULT_SPRITE_URL.into(),
             base_url: None,
+            sar: false,
         }
     }
 
@@ -380,6 +401,11 @@ fn write_pack(
         Some(&format!("{base}{PACK_GLYPHS}")),
         Some(&format!("{base}{PACK_SPRITE}")),
     );
+    let style = if request.sar {
+        with_sar_layers(&style)
+    } else {
+        style
+    };
     let license = license(request);
     for (name, contents) in [("style.json", &style), ("LICENSE.md", &license)] {
         fs::write(partial.join(name), contents)
@@ -597,6 +623,20 @@ mod tests {
         values.iter().map(|v| v.to_string()).collect()
     }
 
+    #[test]
+    fn sar_layers_go_after_the_basemap_layers() {
+        let style = maplibre_style("region.pmtiles", None, None);
+        let layers = |style: &str| {
+            let style: serde_json::Value = serde_json::from_str(style).unwrap();
+            style["layers"].as_array().unwrap().clone()
+        };
+        let (basemap, with_sar) = (layers(&style), layers(&with_sar_layers(&style)));
+        assert!(with_sar.len() > basemap.len());
+        assert_eq!(with_sar[..basemap.len()], basemap[..]);
+        for layer in &with_sar[basemap.len()..] {
+            assert_eq!(layer["source-layer"], "sar", "{layer}");
+        }
+    }
     #[test]
     fn latin_ranges_are_always_written() {
         let latin = glyph_ranges(None).unwrap();

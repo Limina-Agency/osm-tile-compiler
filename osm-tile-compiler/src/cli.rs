@@ -13,8 +13,8 @@ use osm_tile_compiler::{
     UpdateReport, UpdateRequest, ZoomRange,
     archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
-    kib, maplibre_style, resolve_languages, update_extract, write_building_levels_cancellable,
-    write_style_pack,
+    kib, maplibre_style, resolve_languages, update_extract, with_sar_layers,
+    write_building_levels_cancellable, write_style_pack,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -38,7 +38,7 @@ Usage:
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
-  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>]
+  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
@@ -57,7 +57,7 @@ Usage:
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
-  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>]
+  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
@@ -132,6 +132,10 @@ Compile options:
   --fetch               Download any supplemental dataset missing from --sources
   --building-levels     Also write the building levels beside the archive, as
                         <NAME>-buildings.pmtiles
+  --sar                 Also write the search-and-rescue layer 'sar' into the
+                        archive: shelters, water, emergency points, landing
+                        sites, hazards and graded trails (docs/sar.md). The
+                        OpenMapTiles layers stay the same
   --omit-sources <A,B,...>
                         Compile without these supplemental datasets:
                         water_polygons, natural_earth, lake_centerlines, or
@@ -146,7 +150,8 @@ Compile options:
                         OpenMapTiles and OpenStreetMap [default: both]
   --gzip-level <N>      Tile compression, 0 (none) to 9 (smallest) [default: 6]
   --layers <A,B,...>    Write only these layers [default: all]; each is the
-                        same as in a full build
+                        same as in a full build. Naming sar writes it, as
+                        --sar does
   --exclude-layers <A,B,...>
                         Write every layer but these
   --languages <A,B,...> Write name:<lang> attributes for these languages only
@@ -242,8 +247,10 @@ Style options:
   --base-url <URL>      With --offline: put URL before the style's glyph and
                         sprite paths, for hosts that need absolute URLs
                         (MapLibre Native: file://, asset:// or https://)
+  --sar                 Also draw the 'sar' layer, above the basemap, for an
+                        archive compiled with --sar
 
-Layers: {LAYERS}
+Layers: {LAYERS}; and sar, only when asked for
 Languages: {LANGUAGES}
 
 Progress goes to stderr. Exit status: 0 on success, 1 on failure, 2 on a usage
@@ -274,6 +281,7 @@ struct CompileArgs {
     temp_dir: Option<PathBuf>,
     fetch: bool,
     building_levels: bool,
+    sar: bool,
     json: bool,
     profile: Option<PathBuf>,
     layers: LayerSelection,
@@ -378,6 +386,7 @@ struct StyleArgs {
     archive_file: Option<PathBuf>,
     languages: Option<Vec<String>>,
     base_url: Option<String>,
+    sar: bool,
 }
 
 #[derive(Debug)]
@@ -584,6 +593,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut temp_dir = None;
     let mut fetch = false;
     let mut building_levels = false;
+    let mut sar = false;
     let mut omit_sources = Vec::new();
     let mut json = false;
     let mut profile = None;
@@ -672,6 +682,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
             }
             "--fetch" => fetch = true,
             "--building-levels" => building_levels = true,
+            "--sar" => sar = true,
             "--omit-sources" => {
                 omit_sources.clear();
                 for id in list(value(&mut args, &flag)?) {
@@ -807,6 +818,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         temp_dir,
         fetch,
         building_levels,
+        sar,
         json,
         profile,
         layers,
@@ -1049,6 +1061,7 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
     let mut archive_file = None;
     let mut languages = None;
     let mut base_url = None;
+    let mut sar = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -1083,6 +1096,7 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
             "--base-url" => {
                 base_url = Some(value(&mut args, &flag)?.to_string_lossy().into_owned());
             }
+            "--sar" => sar = true,
             _ => return Err(format!("unknown style option '{flag}'")),
         }
     }
@@ -1105,6 +1119,7 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
         archive_file,
         languages,
         base_url,
+        sar,
     }))
 }
 
@@ -1216,14 +1231,16 @@ fn fetch_sources(directory: &Path) -> Result<(), String> {
 /// Prints the style for the archive, or with `--offline` writes the pack.
 fn style(args: StyleArgs) -> Result<(), String> {
     let Some(directory) = args.offline else {
-        print!(
-            "{}",
-            maplibre_style(
-                &args.archive,
-                args.glyphs.as_deref(),
-                args.sprite.as_deref()
-            )
+        let style = maplibre_style(
+            &args.archive,
+            args.glyphs.as_deref(),
+            args.sprite.as_deref(),
         );
+        if args.sar {
+            print!("{}", with_sar_layers(&style));
+        } else {
+            print!("{style}");
+        }
         return Ok(());
     };
     let _cooperating = interrupt::cooperate();
@@ -1253,6 +1270,7 @@ fn style(args: StyleArgs) -> Result<(), String> {
     request.archive_file = archive_file;
     request.languages = args.languages;
     request.base_url = args.base_url;
+    request.sar = args.sar;
     if let Some(glyphs) = args.glyphs {
         request.glyphs = glyphs;
     }
@@ -1676,6 +1694,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.layers = args.layers;
     request.languages = args.languages;
     request.building_levels = args.building_levels;
+    request.sar = args.sar;
     request.sort_memory = args.sort_memory;
     request.merge_cache = args.merge_cache;
     if args.profile.is_some() {

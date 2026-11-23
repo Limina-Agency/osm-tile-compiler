@@ -130,7 +130,8 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
   "languages": ["en", "pl"],
   "archive": { "name": "Monaco", "description": "…", "attribution": "…", "gzipLevel": 6 },
   "threads": 2,
-  "buildingLevels": false
+  "buildingLevels": false,
+  "sar": false
 }
 ```
 
@@ -142,7 +143,9 @@ languages, the datasets present in `sources`). `sourcesPolicy` is
 default) or `near_area`, which reads only the OSM data in and near the area.
 `format` is `pmtiles` or `mbtiles`; without it, an `output` ending in
 `.mbtiles` is MBTiles and anything else PMTiles. Building levels need
-PMTiles.
+PMTiles. `sar` also writes the search-and-rescue layer
+([sar.md](sar.md)); `layers` may still leave it out, and `{"only": [...]}`
+naming `sar` writes it too.
 
 The result is the basemap manifest the worker writes (`format`,
 `formatVersion`, `schema`, `version`, `result`, `supplementalInputs`,
@@ -183,7 +186,8 @@ required. `archiveFile` is a local copy of the archive whose labels decide
 the glyph ranges beyond Latin; `languages` adds their scripts. `glyphs` and
 `sprite` say where to fetch from (URLs, `file://` URLs or local paths) and
 default to the servers above; `baseUrl` goes before the style's glyph and
-sprite paths, which MapLibre Native needs. Progress reports `Fetched N of M
+sprite paths, which MapLibre Native needs; `sar: true` also draws the
+opt-in `sar` layer, for an archive compiled with it. Progress reports `Fetched N of M
 files` with a fraction and no stage. The result is the `StylePackReport`:
 
 ```json

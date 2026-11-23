@@ -76,8 +76,14 @@ pub struct BasemapRequest {
     /// their own as well, so up to about twice as many are busy at a time
     /// while the PBF is read.
     pub threads: usize,
-    /// The layers to write [default: all].
+    /// The layers to write [default: every OpenMapTiles layer].
     pub layers: LayerSelection,
+    /// Whether to also write the opt-in search-and-rescue layer,
+    /// [`SAR_LAYER`](crate::SAR_LAYER), into the archive [default: no]. Its
+    /// schema is in `docs/sar.md`; the OpenMapTiles layers are the same with
+    /// or without it. `layers` may still leave it out, and
+    /// [`LayerSelection::Only`] naming it writes it too.
+    pub sar: bool,
     /// The `name:<lang>` languages to write, as [`resolve_languages`] takes
     /// them [default: all of [`OMT_LANGUAGES`]]. `name`, `name_en`,
     /// `name_de`, `name_int`, `name:latin` and `name:nonlatin` are written
@@ -140,6 +146,7 @@ impl BasemapRequest {
             zoom: ZoomRange::default(),
             threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
             layers: LayerSelection::All,
+            sar: false,
             languages: None,
             building_levels: false,
             sort_memory: None,
@@ -176,7 +183,7 @@ impl BasemapRequest {
     /// takes them.
     fn check(&self) -> Result<Option<Vec<String>>, CompileError> {
         let invalid = CompileError::InvalidRequest;
-        let layers = self.layers.names().map_err(invalid)?;
+        let layers = self.layers.names(self.sar).map_err(invalid)?;
         if let Some(languages) = &self.languages {
             omt::resolve_languages(languages).map_err(invalid)?;
         }
