@@ -140,27 +140,34 @@ impl LayerSelection {
         Self::Except(layers.into_iter().map(Into::into).collect())
     }
 
-    /// The layers written, in the profile's order. Every name must be one of
-    /// [`OMT_LAYERS`](crate::OMT_LAYERS), and at least one layer must remain;
-    /// otherwise [`CompileError::InvalidRequest`].
+    /// The layers written, in the profile's order, when the opt-in
+    /// [`SAR_LAYER`](crate::SAR_LAYER) is not asked for otherwise
+    /// ([`BasemapRequest::sar`](crate::BasemapRequest::sar)). Every name must
+    /// be one of [`OMT_LAYERS`](crate::OMT_LAYERS) or `sar`, and at least one
+    /// layer must remain; otherwise [`CompileError::InvalidRequest`].
+    /// [`LayerSelection::Only`] naming `sar` writes it.
     pub fn resolve(&self) -> Result<Vec<LayerName>, CompileError> {
-        Ok(match self.names().map_err(CompileError::InvalidRequest)? {
-            Some(names) => names.into_iter().map(LayerName::from).collect(),
-            None => crate::omt::LAYERS
-                .into_iter()
-                .map(LayerName::from)
-                .collect(),
-        })
+        Ok(
+            match self.names(false).map_err(CompileError::InvalidRequest)? {
+                Some(names) => names.into_iter().map(LayerName::from).collect(),
+                None => crate::omt::LAYERS
+                    .into_iter()
+                    .map(LayerName::from)
+                    .collect(),
+            },
+        )
     }
 
-    /// The layers written, as the profile takes them: `None` for all.
-    pub(crate) fn names(&self) -> Result<Option<Vec<String>>, String> {
+    /// The layers written, as the profile takes them: `None` for every
+    /// OpenMapTiles layer. `sar` adds the opt-in `sar` layer unless the
+    /// selection leaves it out.
+    pub(crate) fn names(&self, sar: bool) -> Result<Option<Vec<String>>, String> {
         let strings =
             |names: &[LayerName]| names.iter().map(|n| n.0.clone()).collect::<Vec<String>>();
         match self {
-            Self::All => Ok(None),
-            Self::Only(names) => crate::omt::select_layers(Some(&strings(names)), None),
-            Self::Except(names) => crate::omt::select_layers(None, Some(&strings(names))),
+            Self::All => crate::omt::select_layers(None, None, sar),
+            Self::Only(names) => crate::omt::select_layers(Some(&strings(names)), None, sar),
+            Self::Except(names) => crate::omt::select_layers(None, Some(&strings(names)), sar),
         }
     }
 }

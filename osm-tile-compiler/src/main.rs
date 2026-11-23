@@ -73,6 +73,10 @@ struct CompilerProcessRequest {
     /// [default: no].
     #[serde(default)]
     building_levels: bool,
+    /// Whether to also write the search-and-rescue layer `sar`
+    /// [default: no].
+    #[serde(default)]
+    sar: bool,
 }
 
 fn emit(event: serde_json::Value) -> Result<(), String> {
@@ -208,6 +212,7 @@ fn run() -> Result<(), WorkerError> {
     };
     compile.languages = request.languages;
     compile.building_levels = request.building_levels;
+    compile.sar = request.sar;
     // Each stage is reported once, as before; downloads also with their
     // fraction.
     let mut last = None;

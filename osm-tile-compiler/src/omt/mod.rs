@@ -21,6 +21,7 @@ mod polygon_validity;
 mod record_codec;
 mod render;
 mod repair;
+mod sar;
 mod selection;
 mod simplify;
 mod snap_round;
@@ -42,6 +43,7 @@ use std::path::PathBuf;
 use std::{sync::Arc, time::Instant};
 
 pub use labels::LANGUAGES;
+pub use sar::{LAYER as SAR_LAYER, SCHEMA_VERSION as SAR_SCHEMA_VERSION};
 pub(crate) use selection::{resolve_languages, select_layers};
 
 /// The OpenMapTiles schema version the archives follow, written as the
@@ -242,6 +244,9 @@ struct Profile {
     water: water::State,
     labels: labels::State,
     transport: transport::State,
+    /// Whether the opt-in `sar` layer is written; when it is not, its rules
+    /// are not evaluated at all.
+    sar: bool,
 }
 
 #[derive(Default)]
@@ -264,10 +269,13 @@ impl Profile {
         transport::process(source, features);
         self.water.process(source, features);
         self.labels.process(source, features);
+        if self.sar {
+            sar::process(source, features);
+        }
     }
 
     /// Evaluates an OSM source; the layers append in the order land, transport,
-    /// water, labels.
+    /// water, labels, then `sar` when it is written.
     fn evaluate(
         &self,
         source: &types::Source,
@@ -280,6 +288,9 @@ impl Profile {
             .evaluate(source, features, &mut contribution.water);
         self.labels
             .evaluate(source, features, &mut contribution.labels);
+        if self.sar {
+            sar::process(source, features);
+        }
     }
 
     /// Replays one source's contribution; call in source order.
@@ -434,7 +445,10 @@ pub(crate) fn compile(
         Arc::new(selection.clone()),
         control.flag(),
     )?;
-    let mut profile = Profile::default();
+    let mut profile = Profile {
+        sar: selection.has_layer(SAR_LAYER),
+        ..Profile::default()
+    };
     let mut sources_processed = 0;
     let mut profile_features = 0;
     // Supplement sources run here, in order, because they fill the state that

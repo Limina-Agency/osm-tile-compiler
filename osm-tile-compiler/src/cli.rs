@@ -28,6 +28,8 @@ const UPDATED_PBF: &str = ".osm-tile-compiler-updated.osm.pbf";
 /// OSM Bright, adapted to the archives `compile` writes (`style/LICENSE.md`).
 /// `style` replaces its three URLs, each one JSON string in the template.
 const STYLE: &str = include_str!("../style/osm-bright.json");
+/// The style layers that draw `sar`, appended to `STYLE` by `style --sar`.
+const SAR_STYLE: &str = include_str!("../style/sar-layers.json");
 const STYLE_ARCHIVE: &str = "pmtiles://basemap.pmtiles";
 /// Names the Geofabrik index `--area` reads instead of
 /// [`osm_tile_compiler::GEOFABRIK_INDEX_URL`]: a mirror, or the
@@ -42,7 +44,7 @@ Usage:
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
-  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
+  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
@@ -60,7 +62,7 @@ Usage:
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
-  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
+  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
@@ -129,6 +131,10 @@ Compile options:
   --fetch               Download any supplemental dataset missing from --sources
   --building-levels     Also write the building levels beside the archive, as
                         <NAME>-buildings.pmtiles
+  --sar                 Also write the search-and-rescue layer 'sar' into the
+                        archive: shelters, water, emergency points, landing
+                        sites, hazards and graded trails (docs/sar.md). The
+                        OpenMapTiles layers stay the same
   --omit-sources <A,B,...>
                         Compile without these supplemental datasets:
                         water_polygons, natural_earth, lake_centerlines, or
@@ -143,7 +149,8 @@ Compile options:
                         OpenMapTiles and OpenStreetMap [default: both]
   --gzip-level <N>      Tile compression, 0 (none) to 9 (smallest) [default: 6]
   --layers <A,B,...>    Write only these layers [default: all]; each is the
-                        same as in a full build
+                        same as in a full build. Naming sar writes it, as
+                        --sar does
   --exclude-layers <A,B,...>
                         Write every layer but these
   --languages <A,B,...> Write name:<lang> attributes for these languages only
@@ -210,8 +217,10 @@ Style options:
                         [default: https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf]
   --sprite <URL>        Icon sprite, without its extension
                         [default: https://openmaptiles.github.io/osm-bright-gl-style/sprite]
+  --sar                 Also draw the 'sar' layer, above the basemap, for an
+                        archive compiled with --sar
 
-Layers: {LAYERS}
+Layers: {LAYERS}; and sar, only when asked for
 Languages: {LANGUAGES}
 
 Progress goes to stderr. Exit status: 0 on success, 1 on failure, 2 on a usage
@@ -240,6 +249,7 @@ struct CompileArgs {
     temp_dir: Option<PathBuf>,
     fetch: bool,
     building_levels: bool,
+    sar: bool,
     json: bool,
     profile: Option<PathBuf>,
     layers: LayerSelection,
@@ -340,6 +350,7 @@ struct StyleArgs {
     archive: String,
     glyphs: Option<String>,
     sprite: Option<String>,
+    sar: bool,
 }
 
 #[derive(Debug)]
@@ -534,6 +545,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut temp_dir = None;
     let mut fetch = false;
     let mut building_levels = false;
+    let mut sar = false;
     let mut omit_sources = Vec::new();
     let mut json = false;
     let mut profile = None;
@@ -623,6 +635,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
             }
             "--fetch" => fetch = true,
             "--building-levels" => building_levels = true,
+            "--sar" => sar = true,
             "--omit-sources" => {
                 omit_sources.clear();
                 for id in list(value(&mut args, &flag)?) {
@@ -751,6 +764,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         temp_dir,
         fetch,
         building_levels,
+        sar,
         json,
         profile,
         layers,
@@ -938,6 +952,7 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
     let mut archive = None;
     let mut glyphs = None;
     let mut sprite = None;
+    let mut sar = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -962,6 +977,7 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
                 glyphs = Some(url);
             }
             "--sprite" => sprite = Some(value(&mut args, &flag)?.to_string_lossy().into_owned()),
+            "--sar" => sar = true,
             _ => return Err(format!("unknown style option '{flag}'")),
         }
     }
@@ -969,6 +985,7 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
         archive: archive.ok_or("style needs an archive URL")?,
         glyphs,
         sprite,
+        sar,
     }))
 }
 
@@ -1086,7 +1103,7 @@ fn style(args: StyleArgs) -> String {
         format!("pmtiles://{}", args.archive)
     };
     let quoted = |url: &str| serde_json::Value::from(url).to_string();
-    [
+    let style = [
         (STYLE_ARCHIVE, Some(archive)),
         (STYLE_GLYPHS, args.glyphs),
         (STYLE_SPRITE, args.sprite),
@@ -1095,7 +1112,20 @@ fn style(args: StyleArgs) -> String {
     .fold(STYLE.to_owned(), |style, (default, url)| match url {
         Some(url) => style.replacen(&quoted(default), &quoted(&url), 1),
         None => style,
-    })
+    });
+    if !args.sar {
+        return style;
+    }
+    // The SAR layers go after the basemap's, so they draw above it.
+    let mut style: serde_json::Value =
+        serde_json::from_str(&style).expect("the bundled style is JSON");
+    let sar: Vec<serde_json::Value> =
+        serde_json::from_str(SAR_STYLE).expect("the bundled SAR style is JSON");
+    style["layers"]
+        .as_array_mut()
+        .expect("the bundled style has layers")
+        .extend(sar);
+    serde_json::to_string_pretty(&style).expect("a style serializes")
 }
 
 fn pbf_bounds(input: &Path) -> Result<CompileBounds, String> {
@@ -1465,6 +1495,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.layers = args.layers;
     request.languages = args.languages;
     request.building_levels = args.building_levels;
+    request.sar = args.sar;
     request.sort_memory = args.sort_memory;
     request.merge_cache = args.merge_cache;
     if args.profile.is_some() {

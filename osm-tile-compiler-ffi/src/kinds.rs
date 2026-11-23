@@ -169,6 +169,9 @@ struct CompileBasemapJson {
     languages: Option<Vec<String>>,
     #[serde(default)]
     building_levels: bool,
+    /// Whether to also write the search-and-rescue layer `sar`.
+    #[serde(default)]
+    sar: bool,
 }
 
 fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
@@ -236,6 +239,7 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
     };
     request.languages = json.languages;
     request.building_levels = json.building_levels;
+    request.sar = json.sar;
     // Everything that needs no reading or network fails the start, not the job.
     request.validate()?;
     Ok(request)
@@ -326,6 +330,7 @@ mod tests {
             "archive": { "name": "Test" },
             "languages": ["en"],
             "buildingLevels": true,
+            "sar": true,
         }))
         .unwrap();
         assert_eq!(request.input_pbf, PathBuf::from("/in.osm.pbf"));
@@ -343,6 +348,7 @@ mod tests {
         assert_eq!(request.archive.gzip_level, 6);
         assert_eq!(request.languages, Some(vec!["en".to_string()]));
         assert!(request.building_levels);
+        assert!(request.sar);
     }
 
     #[test]

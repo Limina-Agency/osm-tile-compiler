@@ -129,7 +129,8 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
   "languages": ["en", "pl"],
   "archive": { "name": "Monaco", "description": "…", "attribution": "…", "gzipLevel": 6 },
   "threads": 2,
-  "buildingLevels": false
+  "buildingLevels": false,
+  "sar": false
 }
 ```
 
@@ -141,7 +142,9 @@ languages, the datasets present in `sources`). `sourcesPolicy` is
 default) or `near_area`, which reads only the OSM data in and near the area.
 `format` is `pmtiles` or `mbtiles`; without it, an `output` ending in
 `.mbtiles` is MBTiles and anything else PMTiles. Building levels need
-PMTiles.
+PMTiles. `sar` also writes the search-and-rescue layer
+([sar.md](sar.md)); `layers` may still leave it out, and `{"only": [...]}`
+naming `sar` writes it too.
 
 The result is the basemap manifest the worker writes (`format`,
 `formatVersion`, `schema`, `version`, `result`, `supplementalInputs`,

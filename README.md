@@ -250,6 +250,17 @@ existing basemap:
 osm-tile-compiler building-levels monaco.pmtiles monaco-buildings.pmtiles
 ```
 
+## The search-and-rescue layer
+
+`compile --sar` also writes `sar`, a layer for search teams with what
+OpenMapTiles leaves out or thins out: huts and shelters, springs and
+drinking water, emergency points (mountain rescue, access points with their
+numbers, phones, defibrillators), helicopter landing sites, hazards (power
+lines, cliffs, caves, mine shafts) and trails graded by `sac_scale`, at zooms
+10 to 14 with no label grid dropping any. The OpenMapTiles layers are the
+same with or without it, and the metadata says `"sar_schema": 1`. `style
+--sar` draws it above the basemap. Its schema is in [docs/sar.md](docs/sar.md).
+
 ## Checking archives
 
 ```sh

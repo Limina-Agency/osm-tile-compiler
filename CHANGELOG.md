@@ -16,6 +16,15 @@
   from the state files beside them (`124347.osc.gz` and
   `124347.state.txt`), so an extract brought forward from downloaded diffs
   says how current it is. Before, its header kept the base extract's time.
+- Opt-in search-and-rescue layer `sar` (schema version 1, `docs/sar.md`):
+  shelters, water, emergency points, landing sites, hazards (power lines,
+  cliffs, caves, mine shafts) and trails graded by `sac_scale`,
+  `trail_visibility` and `via_ferrata_scale`, at zooms 10 to 14 without a
+  label grid. `compile --sar`, `BasemapRequest::sar` or `"sar": true` in the
+  C ABI request write it into the archive, and the metadata then carries
+  `"sar_schema": 1`; `--layers`/`--exclude-layers` take `sar` too. The
+  OpenMapTiles layers are byte-identical with or without it. `style --sar`
+  adds layers that draw it. `SAR_LAYER` and `SAR_SCHEMA_VERSION` are public.
 
 - Experimental merge cache for recompiles after an update: `compile
   --merge-cache` writes `<NAME>.merge-cache` beside the archive, and

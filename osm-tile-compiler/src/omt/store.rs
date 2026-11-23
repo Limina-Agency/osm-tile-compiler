@@ -1584,6 +1584,7 @@ fn metadata(
     omitted_sources: &[&str],
     osm_data: &super::OsmDataInfo,
 ) -> String {
+    let layers_written = layers;
     let layers = layers
         .iter()
         .map(|id| {
@@ -1623,6 +1624,10 @@ fn metadata(
     // a full build's metadata is as before.
     if !omitted_sources.is_empty() {
         metadata["omitted_sources"] = serde_json::json!(omitted_sources);
+    }
+    // Likewise only an archive with the opt-in layer names its schema.
+    if layers_written.contains(&super::sar::LAYER) {
+        metadata["sar_schema"] = serde_json::json!(super::sar::SCHEMA_VERSION);
     }
     metadata.to_string()
 }
@@ -2012,7 +2017,7 @@ fn merge_geometries_controlled(
             TileGeometry::Line { .. } => {
                 matches!(
                     &*record.layer,
-                    "transportation" | "transportation_name" | "boundary"
+                    "transportation" | "transportation_name" | "boundary" | "sar"
                 ) || (record.layer == "waterway" && (6..=11).contains(&record.zoom))
             }
             TileGeometry::Point(_) => record.layer == "housenumber",
@@ -2747,6 +2752,9 @@ fn line_merge_policy(layer: &str, zoom: u8, attrs: &AttrMap) -> Option<(f64, f64
             4.,
         )),
         "boundary" => Some((1. / 16., 4.)),
+        // Trails, power lines and cliffs with the same attributes join into
+        // one line, as roads do at zoom 8 and above.
+        "sar" => Some((0., 4.)),
         "transportation_name" => {
             let minimum = match zoom {
                 6 | 7 => pixels(20_000.),

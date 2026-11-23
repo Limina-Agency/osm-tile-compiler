@@ -562,6 +562,55 @@ async fn compiles_monaco_into_a_valid_archive() {
         );
     }
 
+    // --sar adds the search-and-rescue layer, last, and `style --sar` draws
+    // only layers the archive declares.
+    let with_sar = temp.path().join("out/sar.pmtiles");
+    let output = run::<[&OsStr; 11], _>([
+        "compile".as_ref(),
+        pbf.as_os_str(),
+        "--output".as_ref(),
+        with_sar.as_os_str(),
+        "--sources".as_ref(),
+        sources.as_os_str(),
+        "--threads".as_ref(),
+        "2".as_ref(),
+        "--layers".as_ref(),
+        "place".as_ref(),
+        "--sar".as_ref(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let verified = run(["verify".as_ref(), with_sar.as_os_str()]);
+    assert!(verified.status.success(), "{}", text(&verified.stdout));
+    let reader = AsyncPmTilesReader::new_with_path(&with_sar).await.unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(&reader.get_metadata().await.unwrap()).unwrap();
+    let ids = metadata["vector_layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|layer| layer["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["place", "sar"]);
+    assert_eq!(metadata["sar_schema"], 1);
+    let style: serde_json::Value =
+        serde_json::from_slice(&run(["style", "sar.pmtiles", "--sar"]).stdout).unwrap();
+    let sar_layers = style["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|layer| layer["source-layer"] == "sar")
+        .count();
+    assert!(sar_layers >= 4, "{style}");
+    for layer in style["layers"].as_array().unwrap() {
+        if let Some(source_layer) = layer["source-layer"].as_str() {
+            assert!(
+                declared.contains(&source_layer) || source_layer == "sar",
+                "{} draws {source_layer}",
+                layer["id"]
+            );
+        }
+    }
+
     // The archive is never replaced.
     let again = run(args);
     assert_eq!(again.status.code(), Some(1));
