@@ -82,6 +82,15 @@ pub struct BasemapRequest {
     ///
     /// [`write_building_levels`]: crate::write_building_levels
     pub building_levels: bool,
+    /// The memory, in bytes, the tile sort may hold in its buffers before it
+    /// writes them to scratch runs [default: half of what the machine has
+    /// available when rendering starts]. The buffers start at 8 MiB per
+    /// thread and grow only once a compile has written enough runs that
+    /// merging them would take extra passes over the scratch disk; they
+    /// never go below 8 MiB per thread. On Android, iOS and other systems
+    /// whose available memory isn't read, the default keeps 8 MiB per
+    /// thread; an app that compiles large extracts there can set this.
+    pub sort_memory: Option<u64>,
     /// Whether to write a merge cache index beside the archive, and an
     /// earlier archive to reuse unchanged tile layers from [default:
     /// neither]. Experimental. Reuse makes a compile after an OSM update
@@ -115,6 +124,7 @@ impl BasemapRequest {
             layers: LayerSelection::All,
             languages: None,
             building_levels: false,
+            sort_memory: None,
             merge_cache: crate::MergeCacheOptions::default(),
         }
     }
@@ -346,6 +356,7 @@ fn compile(
         languages: request.languages.clone(),
         omit_sources: request.omit_sources.clone(),
         area_only: request.area.read == ReadScope::NearArea,
+        sort_memory: request.sort_memory,
         format: request.output_format(),
         merge_cache: request.merge_cache.clone(),
     };

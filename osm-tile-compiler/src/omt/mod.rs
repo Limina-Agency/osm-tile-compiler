@@ -113,6 +113,9 @@ pub(crate) struct OpenMapTilesRequest {
     /// seconds. The tiles at `max_zoom` keep the content a full read gives
     /// them; lower zooms show only what lies near the area.
     pub area_only: bool,
+    /// The memory the tile sort may hold [default: half of what is available
+    /// when rendering starts]; see [`crate::BasemapRequest::sort_memory`].
+    pub sort_memory: Option<u64>,
     /// The archive format to write.
     pub format: crate::OutputFormat,
     /// The merge cache to write and reuse.
@@ -364,9 +367,9 @@ pub(crate) fn compile(
     let mut pipeline = pipeline::Pipeline::new(
         &store,
         request.threads,
+        pipeline::sort_memory(request.sort_memory),
         region,
-        request.min_zoom,
-        request.max_zoom,
+        (request.min_zoom, request.max_zoom),
         Arc::new(selection.clone()),
         control.flag(),
     )?;
