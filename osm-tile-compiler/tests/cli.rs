@@ -1,7 +1,7 @@
 //! Runs the built `osm-tile-compiler` binary: the command line's usage
 //! handling, a real `compile` of `fixtures/monaco.osm.pbf` against synthetic
 //! supplemental inputs, the `style` it is drawn with, a delta between two
-//! compiles, and the desktop worker protocol's argument errors.
+//! compiles, an area cut out of a compile, and the desktop worker protocol's argument errors.
 
 mod common;
 
@@ -56,6 +56,19 @@ fn usage_errors_exit_with_2() {
         (&["frobnicate"], "unknown command 'frobnicate'"),
         (&["--bogus"], "unknown command '--bogus'"),
         (&["compile"], "compile needs an input PBF"),
+        (
+            &["extract", "a.pmtiles", "--output", "b.pmtiles"],
+            "extract needs --bounds, --polygon, --min-zoom or --max-zoom",
+        ),
+        (&["extract", "--max-zoom", "8"], "extract needs an archive"),
+        (
+            &["extract", "a.pmtiles", "--max-zoom", "8"],
+            "extract needs --output",
+        ),
+        (
+            &["extract", "a.pmtiles", "--min-zoom", "9", "--max-zoom", "8"],
+            "--min-zoom must not exceed --max-zoom",
+        ),
         (
             &["compile", "in.pbf", "--area", "monaco"],
             "an input PBF or --area, not both",
@@ -684,6 +697,170 @@ fn diff_and_apply_rebuild_a_compiled_archive() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(text(&output.stderr).contains("is not the archive this delta applies to"));
     assert!(!wrong.exists());
+}
+
+/// Every tile of a PMTiles archive: tile ID and stored bytes.
+fn stored_tiles(path: &std::path::Path) -> std::collections::BTreeMap<u64, Vec<u8>> {
+    let mut reader = osm_tile_compiler::archive::ArchiveReader::open(path).unwrap();
+    let mut tiles = std::collections::BTreeMap::new();
+    reader
+        .visit_entries(|reader, entry| {
+            let bytes = reader.tile(&entry)?;
+            for i in 0..u64::from(entry.run_length) {
+                tiles.insert(entry.tile_id + i, bytes.clone());
+            }
+            Ok(())
+        })
+        .unwrap();
+    tiles
+}
+
+#[tokio::test]
+async fn extract_cuts_the_tiles_a_bounded_compile_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    let pbf = monaco_pbf();
+    let compile = |output: &std::path::Path, extra: &[&str]| {
+        let mut args = vec![
+            "compile".as_ref(),
+            pbf.as_os_str(),
+            "--output".as_ref(),
+            output.as_os_str(),
+            "--omit-sources".as_ref(),
+            "all".as_ref(),
+            "--max-zoom".as_ref(),
+            "14".as_ref(),
+        ];
+        args.extend(extra.iter().map(OsStr::new));
+        let output = run(args);
+        assert!(output.status.success(), "{output:?}");
+    };
+    let extract = |output: &std::path::Path, extra: &[&str]| {
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "extract".into(),
+            path("full.pmtiles").into_os_string(),
+            "--output".into(),
+            output.as_os_str().to_owned(),
+            "--json".into(),
+        ];
+        args.extend(extra.iter().map(Into::into));
+        run(args)
+    };
+    let verify = |archive: &std::path::Path| {
+        let output = run(["verify".as_ref(), archive.as_os_str()]);
+        assert!(output.status.success(), "{output:?}");
+    };
+    compile(&path("full.pmtiles"), &[]);
+    let full = stored_tiles(&path("full.pmtiles"));
+
+    // The port and the old town: a box well inside the extract.
+    let bounds = ["7.418", "43.728", "7.426", "43.735"];
+    let mut boxed_args = vec!["--bounds"];
+    boxed_args.extend(bounds);
+    compile(&path("boxed.pmtiles"), &boxed_args);
+    let output = extract(&path("cut.pmtiles"), &boxed_args);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    verify(&path("cut.pmtiles"));
+    let cut = stored_tiles(&path("cut.pmtiles"));
+    assert_eq!(report["tiles"], cut.len() as u64);
+    assert_eq!(report["source_tiles"], full.len() as u64);
+    assert!(cut.len() < full.len(), "{} of {}", cut.len(), full.len());
+    // A subset of the source, byte for byte...
+    for (id, bytes) in &cut {
+        assert_eq!(
+            full.get(id),
+            Some(bytes),
+            "tile {id} differs from the source"
+        );
+    }
+    // ...at the positions a compile limited to the box writes.
+    let boxed = stored_tiles(&path("boxed.pmtiles"));
+    assert_eq!(
+        cut.keys().collect::<Vec<_>>(),
+        boxed.keys().collect::<Vec<_>>()
+    );
+    let reader = AsyncPmTilesReader::new_with_path(path("cut.pmtiles"))
+        .await
+        .unwrap();
+    let header = reader.get_header();
+    assert_eq!((header.min_longitude, header.max_latitude), (7.418, 43.735));
+    assert_eq!(header.tile_type, TileType::Mvt);
+
+    // A polygon, and the zooms: the tiles of a compile with --polygon.
+    let polygon = path("port.geojson");
+    std::fs::write(
+        &polygon,
+        r#"{"type":"Polygon","coordinates":[[[7.419,43.731],[7.428,43.733],[7.423,43.738],[7.419,43.731]]]}"#,
+    )
+    .unwrap();
+    let polygon = polygon.to_str().unwrap();
+    compile(
+        &path("polygon.pmtiles"),
+        &["--polygon", polygon, "--min-zoom", "10"],
+    );
+    let output = extract(
+        &path("polygon-cut.pmtiles"),
+        &["--polygon", polygon, "--min-zoom", "10"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    verify(&path("polygon-cut.pmtiles"));
+    let cut = stored_tiles(&path("polygon-cut.pmtiles"));
+    let compiled = stored_tiles(&path("polygon.pmtiles"));
+    assert_eq!(
+        cut.keys().collect::<Vec<_>>(),
+        compiled.keys().collect::<Vec<_>>()
+    );
+    let metadata: serde_json::Value = serde_json::from_str(
+        &AsyncPmTilesReader::new_with_path(path("polygon-cut.pmtiles"))
+            .await
+            .unwrap()
+            .get_metadata()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (&metadata["minzoom"], &metadata["maxzoom"]),
+        (&10.into(), &14.into())
+    );
+
+    // Zooms alone.
+    let output = extract(&path("low.pmtiles"), &["--max-zoom", "8"]);
+    assert!(output.status.success(), "{output:?}");
+    verify(&path("low.pmtiles"));
+    let low = stored_tiles(&path("low.pmtiles"));
+    let expected = full
+        .iter()
+        .filter(|(id, _)| pmtiles::TileCoord::from(pmtiles::TileId::new(**id).unwrap()).z() <= 8)
+        .map(|(id, bytes)| (*id, bytes.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(low, expected);
+
+    // A box the archive does not reach, or an existing output: an error,
+    // and nothing written.
+    let output = extract(
+        &path("nowhere.pmtiles"),
+        &["--bounds", "10", "50", "11", "51"],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("does not overlap"),
+        "{output:?}"
+    );
+    assert!(!path("nowhere.pmtiles").exists());
+    let output = extract(&path("cut.pmtiles"), &boxed_args);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("refusing to replace"),
+        "{output:?}"
+    );
+    let leftovers = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains("partial"))
+        .count();
+    assert_eq!(leftovers, 0);
 }
 
 /// Two planet-style changes: a motorway drawn in Monaco, which the update

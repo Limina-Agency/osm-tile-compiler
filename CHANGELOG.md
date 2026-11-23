@@ -16,7 +16,10 @@
   from the state files beside them (`124347.osc.gz` and
   `124347.state.txt`), so an extract brought forward from downloaded diffs
   says how current it is. Before, its header kept the base extract's time.
-
+- `extract` cuts an area out of an existing PMTiles archive into a new one:
+  the tiles within `--bounds`, `--polygon` and `--min-zoom`/`--max-zoom`,
+  copied byte for byte, at the positions a compile limited to the same area
+  writes. From Rust, `archive::extract` with an `ExtractRequest`.
 - Experimental merge cache for recompiles after an update: `compile
   --merge-cache` writes `<NAME>.merge-cache` beside the archive, and
   `--reuse-from OLD.pmtiles` takes every tile layer whose input records are
