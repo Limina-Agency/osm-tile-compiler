@@ -1,8 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-23)
 
-### Added
+### Breaking
+
+- `CompileStage` has a new `MergeExtracts` stage, between `FetchSources`
+  and `ReadSources`, and `CompileStage::ALL` lists seven stages. Hosts that
+  match on stages or index progress by them need the new one; like
+  `FetchSources` it is not part of `overall`.
+- The archive metadata gains `generator`, `osm_data_timestamp`,
+  `osm_replication_sequence` and `osm_replication_url` (see below), so
+  archives of the same data are no longer byte-identical to 0.2.0's. Every
+  tile is the same.
+
+### New
 
 - The archive metadata records what made the archive and how current its
   OSM data is: `generator` (`osm-tile-compiler` and its version), and from
@@ -12,20 +23,25 @@
   them, and `CompileResult::osm_data` (`OsmDataInfo`) carries them, so the
   manifest's `result` does too. The Monaco fingerprint changes for these
   keys only; every tile is the same.
-- Several extracts compile as one (osm-pbf-ingest 0.6.0): `compile a.osm.pbf b.osm.pbf` (and
-  `BasemapRequest::extra_inputs`, `extraInputs` in the C ABI request,
-  `extraInputPbfPaths` in the worker request) merges them into one sorted
+- `update` with change files on the command line takes the newest timestamp
+  from the state files beside them (`124347.osc.gz` and
+  `124347.state.txt`), so an extract brought forward from downloaded diffs
+  says how current it is. Before, its header kept the base extract's time.
+- Several extracts compile as one (osm-pbf-ingest 0.6.0): `compile
+  a.osm.pbf b.osm.pbf` (and `BasemapRequest::extra_inputs`, `extraInputs` in
+  the C ABI request, `extraInputPbfPaths` in the worker request) merges them into one sorted
   file in the scratch directory first, with osm-pbf-ingest's `merge_files`,
   in a new `merge_extracts` stage (`CompileStage::MergeExtracts`, between
   `fetch_sources` and `read_sources`; like `fetch_sources`, not part of
   `overall`). Shared objects are read once, from the extract with the newest
   replication timestamp. Compiling Małopolskie and Pomorskie this way gives
-  the same tiles as compiling the file `osmium merge` writes. Breaking:
-  `CompileStage::ALL` has seven stages.
-- `update` with change files on the command line takes the newest timestamp
-  from the state files beside them (`124347.osc.gz` and
-  `124347.state.txt`), so an extract brought forward from downloaded diffs
-  says how current it is. Before, its header kept the base extract's time.
+  the same tiles as compiling the file `osmium merge` writes.
+- MBTiles output: a compile writes MBTiles 1.3 when `--output` ends in
+  `.mbtiles` or `--format mbtiles` is given (`BasemapRequest::format`,
+  `"format"` in the C ABI request), and PMTiles otherwise. The tiles and
+  metadata are the same as the PMTiles archive's, and identical tiles of up
+  to 1 KiB are stored once. Building levels, `--delta-from` and the merge
+  cache need PMTiles and refuse MBTiles.
 - `extract` cuts an area out of an existing PMTiles archive into a new one:
   the tiles within `--bounds`, `--polygon` and `--min-zoom`/`--max-zoom`,
   copied byte for byte, at the positions a compile limited to the same area
@@ -48,8 +64,9 @@
   C ABI request write it into the archive, and the metadata then carries
   `"sar_schema": 1`; `--layers`/`--exclude-layers` take `sar` too. The
   OpenMapTiles layers are byte-identical with or without it. `style --sar`
-  adds layers that draw it. `SAR_LAYER` and `SAR_SCHEMA_VERSION` are public.
-
+  (also with `--offline`, `StylePackRequest::sar`) adds layers that draw it,
+  and `with_sar_layers` adds them to a style from Rust. `SAR_LAYER` and
+  `SAR_SCHEMA_VERSION` are public.
 - Experimental merge cache for recompiles after an update: `compile
   --merge-cache` writes `<NAME>.merge-cache` beside the archive, and
   `--reuse-from OLD.pmtiles` takes every tile layer whose input records are
@@ -57,8 +74,15 @@
   archive is byte-identical to an uncached compile. From Rust,
   `BasemapRequest::merge_cache` (`MergeCacheOptions`), and
   `CompileResult::merge_cache` reports what was reused.
+- `compile --profile FILE.json` and `building-levels --profile` measure each
+  stage's wall time and CPU time, and on Linux CPU per thread group and peak
+  RSS, plus timed work inside stages (render, queue waits, spills, tile
+  encoding, archive writes). The report is printed as a table and written as
+  JSON; library users get it from `stage_profile::start` and `finish`.
+  Nothing is measured unless a profile runs. `docs/performance.md` has the
+  first profiles.
 
-### Changed
+### Performance
 
 - Large compiles spill far fewer sort runs and skip most intermediate merge
   passes. The render workers' sort buffers start at 8 MiB and grow, from the
@@ -68,6 +92,28 @@
   cap. An intermediate pass merges only the smallest runs needed. Regional
   extracts are unchanged; three regions merged into one 369 MiB PBF peak at
   728 MiB with 2 threads, against 876 MiB in 0.1.3.
+- The final merge decodes sort runs ahead of the merge on up to `threads`
+  worker threads, so the merging thread only orders records. With the
+  encoders stubbed out, merging Małopolskie's runs takes 1.6 s instead of
+  6.4 s on four threads; with real encoding the phase gains 3 to 12%.
+- Merging nearby buildings is cheaper: proximity uses an early-exit segment
+  scan (4.5 to 5 times faster, same answers as geo), records decode without
+  owned string maps, the JTS port's noding allocates less, and clusters the
+  area filter is bound to drop skip the union, unbuffer and buffering. Encode
+  CPU is 10 to 23% lower on Berlin, Pomorskie and Małopolskie, and merge CPU
+  6 to 13% lower, with byte-identical archives.
+- Way and relation rendering: relation rings nest by one vertex when their
+  boundaries are apart, line merging uses hash maps and compares edges in
+  place, and a feature's attributes are converted once and encoded once per
+  zoom instead of per tile.
+
+### Fixed
+
+- `--polygon` rejects a ring that encloses no area, naming it. Before, a
+  ring whose points lie on one line next to a hole tripped an assertion in
+  geo in debug builds and was accepted silently in release builds.
+- Geofabrik's index gives some ISO codes as a plain string rather than a
+  list, which made every `compile --area` fail; both forms are read now.
 
 ## 0.2.0 (2026-11-19)
 

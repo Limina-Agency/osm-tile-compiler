@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "osm-tile-compiler"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bincode",
  "crossbeam-channel",
@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "osm-tile-compiler-ffi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "osm-tile-compiler",
  "serde",
