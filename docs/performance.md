@@ -185,15 +185,26 @@ runs at once. A planet spills about 240 GB of records, which at 8 MiB is
 some 30,000 runs, and those used to be merged twice in full (30,000 to 235
 to 2) before the final merge.
 
-Once the workers have spilled 64 runs between them, each worker's next
-buffer is as large as everything it has spilled so far, up to its share of
-the sort memory: half of what is available when rendering starts (Linux:
-`MemAvailable` and cgroup limits; Windows: available physical memory;
-macOS: half the installed memory; elsewhere the buffers stay at 8 MiB).
-`--sort-memory <MIB>` or `BasemapRequest::sort_memory` sets it instead. An
-intermediate pass then merges only the smallest runs needed to leave 128,
-which are the small early ones. Extracts that spill fewer than 64 runs
-(Berlin, Pomorskie and Małopolskie spill 30 to 67) are unchanged.
+The buffers grow only as far as the compile needs to end with about 96
+runs. The compile expects to spill three times its input PBF's size (2.5 to
+2.9 for the extracts measured here); once the workers have spilled 16 runs
+between them, each worker's next buffer holds the bytes still expected,
+spread over the runs left to 96. Near and past the estimate, a quarter of
+what was spilled is taken to be still to come. A buffer at most doubles at
+once and never exceeds its share of the sort memory: half of what is
+available when rendering starts (Linux: `MemAvailable` and cgroup limits;
+Windows: available physical memory; macOS: half the installed memory;
+elsewhere the buffers stay at 8 MiB). `--sort-memory <MIB>` or
+`BasemapRequest::sort_memory` sets it instead. When memory caps the
+buffers, as on a planet, an intermediate pass merges only the smallest runs
+needed to leave 128, which are the small early ones. Extracts that spill
+less than 96 runs at 8 MiB (Berlin, Pomorskie and Małopolskie spill 30 to
+67) are unchanged.
+
+Before that, from 2026-11-21, each buffer grew past 64 runs to everything
+its worker had spilled so far, so half the compile's records were in memory
+at the end. A Poland compile with 2 threads peaked at 6.5 GiB against
+0.1.3's 2.5 GiB; see "Sizing sort runs from the input" below.
 
 Measured on 2026-11-21 in a cloud container (4 cores, 15 GiB, Linux), 4
 threads, `--omit-sources all`, Geofabrik extracts of 2026-11-18. Every
@@ -216,6 +227,37 @@ machine with four times the memory per worker.
 | main | 30,032 | 7.4 s | 40.1 s | 452 MiB |
 | memory-sized, `--sort-memory 16` | 314 | 3.4 s | 34.5 s | 461 MiB |
 | memory-sized, `--sort-memory 64` | 148 | 0.0 s | 29.3 s | 502 MiB |
+
+### Sizing sort runs from the input
+
+Measured on 2026-11-23 in a cloud container (4 cores, 15 GiB, Linux),
+`--omit-sources all`, Geofabrik extracts of 2026-11-18. "Three regions" is
+Berlin, Pomorskie and Małopolskie merged into one 369 MiB PBF with
+`osm-pbf-ingest`'s `merge_pbf` example, a fifth of Poland. Each figure is the
+mean of two runs, interleaved; peak RSS is `ru_maxrss`, peak anonymous is
+`RssAnon` sampled every 0.1 s. Every archive is byte-identical to main's.
+
+| Compile | Build | Time | Peak RSS | Peak anonymous | Most runs at once |
+|---|---|---|---|---|---|
+| Three regions, 2 threads | 0.1.3 | 141 s | 876 MiB | 575 MiB | 137 |
+| | main | 105 s | 1555 MiB | 1246 MiB | 69 |
+| | sized from the input | 105 s | 728 MiB | 424 MiB | 90 |
+| Three regions, 4 threads | 0.1.3 | 81 s | 991 MiB | 690 MiB | 139 |
+| | main | 61 s | 1655 MiB | 1341 MiB | 74 |
+| | sized from the input | 58 s | 853 MiB | 551 MiB | 92 |
+| Małopolskie, 4 threads | 0.1.3 | 34 s | 627 MiB | 471 MiB | 69 |
+| | main | 29 s | 495 MiB | 344 MiB | 68 |
+| | sized from the input | 30 s | 495 MiB | 339 MiB | 68 |
+
+- main's buffers grow with the compile, each to about half of what its
+  worker has spilled; on Poland (five times this input, 2 threads, on a
+  laptop) the whole compile peaked at 6.5 GiB against 0.1.3's 2.5 GiB.
+  Sized from the input, the largest buffer was under 30 MiB here; it grows
+  with the input divided by the 96 runs aimed for, so Poland's should be
+  about 60 MiB (estimated, not measured: Poland can't be downloaded here).
+- The extra runs cost nothing measurable: 90 runs still merge in one pass.
+- Małopolskie spills fewer runs than the buffers need to grow for, so it is
+  unchanged.
 
 ## Cost in an app's process
 

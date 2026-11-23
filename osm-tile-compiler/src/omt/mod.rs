@@ -367,7 +367,13 @@ pub(crate) fn compile(
     let mut pipeline = pipeline::Pipeline::new(
         &store,
         request.threads,
-        pipeline::sort_memory(request.sort_memory),
+        pipeline::sort_budget(
+            request.threads,
+            request.sort_memory,
+            std::fs::metadata(&request.input_pbf)
+                .ok()
+                .map(|metadata| metadata.len()),
+        ),
         region,
         (request.min_zoom, request.max_zoom),
         Arc::new(selection.clone()),
