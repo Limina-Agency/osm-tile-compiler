@@ -796,7 +796,13 @@ mod tests {
         request.sprite = temp.path().join("nowhere").display().to_string();
         let error = write_style_pack(&request, |_| {}, || false).unwrap_err();
         assert_eq!(error.kind(), "download", "{error}");
-        assert!(error.message().contains("nowhere.json"), "{error}");
+        // The sprite's files download at once: either required one may be
+        // the first to fail.
+        let message = error.message();
+        assert!(
+            message.contains("nowhere.json") || message.contains("nowhere.png"),
+            "{error}"
+        );
         request.sprite = sprite;
         let error = write_style_pack(&request, |_| {}, || true).unwrap_err();
         assert_eq!(error, CompileError::Cancelled);
