@@ -12,7 +12,7 @@ use osm_tile_compiler::{
     SupplementalDataset, UpdateEvent, UpdateReport, UpdateRequest, ZoomRange,
     archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
-    kib, resolve_languages, update_extract, write_building_levels_cancellable,
+    kib, resolve_languages, update_extract, write_building_levels_cancellable, write_trees,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -41,6 +41,7 @@ Usage:
   osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
+  osm-tile-compiler trees <INPUT.osm.pbf> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
@@ -59,6 +60,7 @@ Usage:
   osm-tile-compiler compile <INPUT.pbf> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
+  osm-tile-compiler trees <INPUT.osm.pbf> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
@@ -72,6 +74,8 @@ Usage:
 Commands:
   compile          Compile INPUT.pbf, or the Geofabrik extract of a region,
                    into a new PMTiles archive
+  trees            Write the trees mapped one by one in an extract to a new
+                   archive, for renderers that stand a model at each
   building-levels  Write the building levels of a compiled archive to a new
                    PMTiles archive: its buildings as boxes for far views
   fetch-sources    Download, or verify, the supplemental datasets into DIR:
@@ -306,7 +310,7 @@ enum Input {
 }
 
 #[derive(Debug)]
-struct BuildingLevelsArgs {
+struct DeriveArgs {
     input: PathBuf,
     output: PathBuf,
     threads: Option<usize>,
@@ -324,7 +328,8 @@ enum Command {
     Help,
     Version,
     Compile(Box<CompileArgs>),
-    BuildingLevels(BuildingLevelsArgs),
+    BuildingLevels(DeriveArgs),
+    Trees(DeriveArgs),
     FetchSources(PathBuf),
     Style(StyleArgs),
     Inspect { archive: PathBuf, json: bool },
@@ -369,6 +374,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         }
         Command::Compile(args) => compile(*args),
         Command::BuildingLevels(args) => building_levels(args),
+        Command::Trees(args) => trees(args),
         Command::FetchSources(directory) => fetch_sources(&directory),
         Command::Style(args) => {
             print!("{}", style(args));
@@ -402,7 +408,11 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some("--version" | "-V") => Ok(Command::Version),
         Some("compile") => parse_compile(rest),
-        Some("building-levels") => parse_building_levels(rest),
+        Some("building-levels") => Ok(parse_derive("building-levels", "input", rest)?
+            .map_or(Command::Help, Command::BuildingLevels)),
+        Some("trees") => Ok(
+            parse_derive("trees", "input .osm.pbf", rest)?.map_or(Command::Help, Command::Trees)
+        ),
         Some("fetch-sources") => parse_fetch_sources(rest),
         Some("style") => parse_style(rest),
         Some(name @ ("inspect" | "verify")) => parse_archive_command(name, rest),
@@ -742,7 +752,13 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
     })))
 }
 
-fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
+/// The arguments of `command`, which derives an archive from an `input`;
+/// `None` for help.
+fn parse_derive(
+    command: &str,
+    input: &str,
+    args: &[OsString],
+) -> Result<Option<DeriveArgs>, String> {
     let mut paths = Vec::new();
     let mut threads = None;
     let mut args = args.iter();
@@ -752,7 +768,7 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
             continue;
         };
         match flag.as_str() {
-            "--help" | "-h" => return Ok(Command::Help),
+            "--help" | "-h" => return Ok(None),
             "--threads" => {
                 let count: usize = number(value(&mut args, &flag)?, &flag)?;
                 if count == 0 {
@@ -760,21 +776,21 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
                 }
                 threads = Some(count);
             }
-            _ => return Err(format!("unknown building-levels option '{flag}'")),
+            _ => return Err(format!("unknown {command} option '{flag}'")),
         }
     }
     let mut paths = paths.into_iter();
     match (paths.next(), paths.next(), paths.next()) {
-        (Some(input), Some(output), None) => Ok(Command::BuildingLevels(BuildingLevelsArgs {
+        (Some(input), Some(output), None) => Ok(Some(DeriveArgs {
             input,
             output,
             threads,
         })),
         (_, _, Some(extra)) => Err(format!(
-            "unexpected argument '{}': building-levels takes two archives",
+            "unexpected argument '{}': {command} takes an input and an output",
             extra.display()
         )),
-        _ => Err("building-levels needs an input and an output archive".into()),
+        _ => Err(format!("{command} needs an {input} and an output archive")),
     }
 }
 
@@ -1136,7 +1152,7 @@ fn report_levels(status: &mut Status, path: &Path, report: &BuildingLevelsReport
     }
 }
 
-fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
+fn building_levels(args: DeriveArgs) -> Result<(), String> {
     let mut status = Status::new();
     let threads = args
         .threads
@@ -1156,6 +1172,40 @@ fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
                 error => error.to_string(),
             })?;
     report_levels(&mut status, &args.output, &report);
+    Ok(())
+}
+
+fn trees(args: DeriveArgs) -> Result<(), String> {
+    let mut status = Status::new();
+    let threads = args
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    status.line(&format!(
+        "Writing the mapped trees of {} into {} ({threads} threads)",
+        args.input.display(),
+        args.output.display()
+    ));
+    let _cooperating = interrupt::cooperate();
+    let report =
+        write_trees(&args.input, &args.output, threads, interrupt::requested).map_err(|error| {
+            match error {
+                CompileError::Cancelled => {
+                    format!("cancelled; {} was not written", args.output.display())
+                }
+                error => error.to_string(),
+            }
+        })?;
+    status.line(&format!(
+        "Wrote {} in {:.1} s: {} trees in {} tiles, {} with a leaf type or genus, {} with a height, {} raw, {} gzipped",
+        args.output.display(),
+        report.seconds,
+        report.trees,
+        report.tiles,
+        report.with_kind,
+        report.with_height,
+        megabytes(report.raw_bytes),
+        megabytes(report.gz_bytes)
+    ));
     Ok(())
 }
 

@@ -62,7 +62,8 @@
 //!
 //! Besides compiling, the crate fetches the inputs ([`fetch_sources`],
 //! [`fetch_extract`]), writes building levels for an archive
-//! ([`write_building_levels`]), and inspects, diffs and patches archives
+//! ([`write_building_levels`]) and the mapped trees of an extract
+//! ([`write_trees`]), and inspects, diffs and patches archives
 //! ([`archive`]).
 
 /// The message a panic was raised with, for errors that report a caught
@@ -96,6 +97,7 @@ mod sources;
 mod tile_geometry;
 mod tile_slicer;
 mod tile_stats;
+mod trees;
 mod updates;
 
 pub use basemap::{
@@ -121,6 +123,7 @@ pub use omt::{
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
 pub use tile_stats::{LayerStats, TILE_WARNING_BYTES, TileSize, TileStats, ZoomStats};
+pub use trees::{TREE_GENERA, TREES_FORMAT, TREES_VERSION, TreesReport, trees_path, write_trees};
 pub use updates::{
     ClipTo, DEFAULT_MAX_DIFFS, PLANET_REPLICATION, Replication, UpdateEvent, UpdateReport,
     UpdateRequest, update_extract,

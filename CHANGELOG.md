@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- `trees` (`write_trees`): the trees mapped one by one in an extract, as an
+  archive of their own.
+
 ## 0.2.0 (2026-11-19)
 
 ### Breaking: one entry point with a typed request

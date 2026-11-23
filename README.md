@@ -231,6 +231,17 @@ existing basemap:
 osm-tile-compiler building-levels monaco.pmtiles monaco-buildings.pmtiles
 ```
 
+## Trees
+
+The OpenMapTiles schema has no trees. `trees` writes those mapped one by one
+(`natural=tree` nodes) to an archive of their own, for renderers that stand a
+model at each: their places, and what their tags say of their height, crown,
+leaf type and cycle, and genus. Nothing is guessed.
+
+```sh
+osm-tile-compiler trees monaco-latest.osm.pbf monaco-trees.pmtiles
+```
+
 ## Checking archives
 
 ```sh
