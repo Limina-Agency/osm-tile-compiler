@@ -45,6 +45,9 @@ static CANCELLED: AtomicBool = AtomicBool::new(false);
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompilerProcessRequest {
     input_pbf_path: PathBuf,
+    /// More extracts to merge with `inputPbfPath` [default: none].
+    #[serde(default)]
+    extra_input_pbf_paths: Vec<PathBuf>,
     sources_dir: PathBuf,
     output_pmtiles_path: PathBuf,
     temp_dir: PathBuf,
@@ -186,6 +189,7 @@ fn run() -> Result<(), WorkerError> {
         request.sources_dir,
         request.temp_dir,
     );
+    compile.extra_inputs = request.extra_input_pbf_paths;
     compile.sources_policy = SourcesPolicy::FetchAndVerify;
     compile.omit_sources = omit_sources;
     // `areaOnly` without a polygon reads the whole extract, as before.

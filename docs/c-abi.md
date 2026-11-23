@@ -112,6 +112,7 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
 ```json
 {
   "inputPbf": "/…/monaco.osm.pbf",
+  "extraInputs": ["/…/more.osm.pbf"],
   "output": "/…/monaco.pmtiles",
   "format": "pmtiles",
   "sources": "/…/omt-sources",

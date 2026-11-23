@@ -57,6 +57,14 @@ accepted exceptions.
 
 A compile runs in stages, each reported as progress:
 
+0. **Merging extracts** (`merge_extracts`), only when several are given. An
+   area that crosses an extract's edge, such as the Tatras on the Polish and
+   Slovak border, can be compiled from both: `compile poland.osm.pbf
+   slovakia.osm.pbf --bounds …` merges them into one sorted file in the
+   scratch directory first, as `osmium merge` would, keeping each shared
+   object once. That takes about as much scratch space as the extracts.
+   Without `--bounds` the area is the box around both extracts. Change files
+   apply to one extract, so update each one first.
 1. **Supplemental datasets** (`read_sources`). OpenMapTiles takes the sea
    from OSM's water polygons, and low zooms and label ranks from Natural
    Earth; lake labels follow lake centerlines. `fetch-sources` downloads these

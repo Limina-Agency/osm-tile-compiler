@@ -95,6 +95,8 @@ fn compiles_monaco_reporting_every_stage() {
     let mut request = request(temp.path(), &sources, 2);
     // Every dataset is present, so nothing is downloaded, but the stage runs.
     request.sources_policy = SourcesPolicy::FetchMissing;
+    // A second extract, the same one, so that the merge runs too.
+    request.extra_inputs = vec![monaco_pbf()];
     let reports = RefCell::new(Vec::<CompileProgress>::new());
     let output = compile_basemap(
         &request,
@@ -158,6 +160,7 @@ fn cancelling_at_each_stage_stops_at_once_and_leaves_nothing() {
         let dir = temp.path().join(stage.id());
         let mut request = request(&dir, &sources, 2);
         request.sources_policy = SourcesPolicy::FetchMissing;
+        request.extra_inputs = vec![monaco_pbf()];
         let asked = Cell::new(None::<Instant>);
         let seen = RefCell::new(Vec::new());
         let result = compile_basemap(
@@ -181,6 +184,32 @@ fn cancelling_at_each_stage_stops_at_once_and_leaves_nothing() {
         assert_eq!(files(&dir), Vec::<PathBuf>::new(), "{stage:?}");
         assert_eq!(files(&sources), sources_before, "{stage:?}");
     }
+}
+
+#[test]
+fn an_extract_merged_with_itself_compiles_to_the_same_archive() {
+    let temp = tempfile::tempdir().unwrap();
+    let sources = temp.path().join("sources");
+    synthetic_sources(&sources);
+    let mut single = request(&temp.path().join("single"), &sources, 2);
+    single.building_levels = false;
+    compile_basemap(&single, |_| {}, || false).unwrap();
+    let mut merged = request(&temp.path().join("merged"), &sources, 2);
+    merged.building_levels = false;
+    merged.extra_inputs = vec![monaco_pbf(), monaco_pbf()];
+    let output = compile_basemap(&merged, |_| {}, || false).unwrap();
+    assert_eq!(output.bounds, single_bounds(&single));
+    assert_eq!(
+        std::fs::read(&single.output).unwrap(),
+        std::fs::read(&merged.output).unwrap()
+    );
+    // The merged file was scratch, removed with the rest.
+    assert!(!merged.temp_dir.exists());
+}
+
+/// The area a single-extract compile of `request` covers: its header box.
+fn single_bounds(request: &BasemapRequest) -> osm_tile_compiler::CompileBounds {
+    osm_tile_compiler::pbf_bounds(&request.input_pbf).unwrap()
 }
 
 #[test]
