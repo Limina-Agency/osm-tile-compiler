@@ -1,4 +1,5 @@
 //! Bounded external tile-record sort and OpenMapTiles MVT archive publication.
+use super::merge_cache::{self, LayerEntry, MergeCache, OldTile, TileEntry};
 use super::record_codec::{
     LAYER_NAMES, Reader, decode_payload, encode_payload, encode_varint, layer_id, zigzag,
 };
@@ -8,7 +9,7 @@ use crate::control::Control;
 use crate::{
     ArchiveCenter, CompileBounds,
     archive::ArchiveOptions,
-    chunk_store::PmtilesArchiveWriter,
+    output::{ArchiveSpec, ArchiveTarget},
     tile_geometry::{TileGeometry, TilePoint, TileRingGroup},
     tile_stats::{TILE_WARNING_BYTES, TileStats, TileStatsBuilder},
 };
@@ -16,22 +17,144 @@ use fast_mvt::{MvtLayerBuilder, MvtValueRef};
 use geo::algorithm::buffer::{BufferStyle, LineJoin};
 use geo::coordinate_position::CoordPos;
 use geo::dimensions::Dimensions;
-use geo::{Area, BoundingRect, Buffer, Distance, Euclidean, Relate, unary_union};
-use geo_types::{Coord, LineString, MultiPolygon, Polygon};
+use geo::{Area, BoundingRect, Buffer, Distance, Euclidean, Intersects, Relate, unary_union};
+use geo_types::{Coord, LineString, MultiPolygon, Polygon, Rect};
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
+use std::collections::binary_heap::PeekMut;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 const CHUNK_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TILE_BYTES: usize = 256 * 1024 * 1024;
 pub(super) const MERGE_FAN_IN: usize = 128;
+/// Blocks of each run the final merge's decoders keep decoded ahead of the
+/// merge, counting one being decoded.
+const BLOCKS_AHEAD: usize = 2;
+
+/// An attribute name: the profile's names are static, so records decoded at
+/// encode time borrow them instead of allocating a string per attribute.
+pub(super) type AttrKey = std::borrow::Cow<'static, str>;
+
+/// A record's attributes, sorted by name: a `BTreeMap`'s order and lookups
+/// over one vector, which a decoded record fills with a single allocation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct AttrMap(Vec<(AttrKey, AttrValue)>);
+
+impl AttrMap {
+    #[cfg(test)]
+    pub(super) fn new() -> Self {
+        Self(Vec::new())
+    }
+    fn find(&self, key: &str) -> Result<usize, usize> {
+        self.0.binary_search_by(|(k, _)| (**k).cmp(key))
+    }
+    pub(super) fn get(&self, key: &str) -> Option<&AttrValue> {
+        self.find(key).ok().map(|i| &self.0[i].1)
+    }
+    pub(super) fn contains_key(&self, key: &str) -> bool {
+        self.find(key).is_ok()
+    }
+    /// Sets `key` to `value` and returns the value it replaced.
+    pub(super) fn insert(&mut self, key: AttrKey, value: AttrValue) -> Option<AttrValue> {
+        match self.find(&key) {
+            Ok(i) => Some(std::mem::replace(&mut self.0[i].1, value)),
+            Err(i) => {
+                self.0.insert(i, (key, value));
+                None
+            }
+        }
+    }
+    pub(super) fn remove(&mut self, key: &str) -> Option<AttrValue> {
+        self.find(key).ok().map(|i| self.0.remove(i).1)
+    }
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&AttrKey, &mut AttrValue) -> bool) {
+        self.0.retain_mut(|(k, v)| keep(k, v));
+    }
+    pub(super) fn iter(&self) -> AttrIter<'_> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+    #[cfg(test)]
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+    }
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+type AttrIter<'a> = std::iter::Map<
+    std::slice::Iter<'a, (AttrKey, AttrValue)>,
+    fn(&'a (AttrKey, AttrValue)) -> (&'a AttrKey, &'a AttrValue),
+>;
+
+impl std::ops::Index<&str> for AttrMap {
+    type Output = AttrValue;
+    fn index(&self, key: &str) -> &AttrValue {
+        self.get(key).expect("no attribute of that name")
+    }
+}
+
+impl<'a> IntoIterator for &'a AttrMap {
+    type Item = (&'a AttrKey, &'a AttrValue);
+    type IntoIter = AttrIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for AttrMap {
+    type Item = (AttrKey, AttrValue);
+    type IntoIter = std::vec::IntoIter<(AttrKey, AttrValue)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl FromIterator<(AttrKey, AttrValue)> for AttrMap {
+    /// As `BTreeMap` collects: sorted by key, the last value of a repeated
+    /// key kept.
+    fn from_iter<I: IntoIterator<Item = (AttrKey, AttrValue)>>(iter: I) -> Self {
+        let mut entries: Vec<_> = iter.into_iter().collect();
+        if !entries.is_sorted_by(|a, b| a.0 < b.0) {
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut deduped: Vec<(AttrKey, AttrValue)> = Vec::with_capacity(entries.len());
+            for entry in entries {
+                match deduped.last_mut() {
+                    Some(last) if last.0 == entry.0 => *last = entry,
+                    _ => deduped.push(entry),
+                }
+            }
+            entries = deduped;
+        }
+        Self(entries)
+    }
+}
+
+impl<const N: usize> From<[(AttrKey, AttrValue); N]> for AttrMap {
+    fn from(entries: [(AttrKey, AttrValue); N]) -> Self {
+        entries.into_iter().collect()
+    }
+}
+
+impl Serialize for AttrMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for AttrMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        BTreeMap::<AttrKey, AttrValue>::deserialize(deserializer)
+            .map(|map| map.into_iter().collect())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) enum AttrValue {
@@ -119,8 +242,8 @@ pub(super) struct Seq {
 /// counts only when it precedes every explicit `rank` attribute.
 #[derive(Default)]
 pub(super) struct MetadataSummary {
-    fields: BTreeMap<String, BTreeMap<String, FieldSummary>>,
-    zooms: BTreeMap<String, (u8, u8)>,
+    fields: BTreeMap<AttrKey, BTreeMap<AttrKey, FieldSummary>>,
+    zooms: BTreeMap<AttrKey, (u8, u8)>,
 }
 #[derive(Default)]
 struct FieldSummary {
@@ -191,7 +314,7 @@ impl MetadataSummary {
         for (layer, (min, max)) in self.zooms {
             store
                 .zooms
-                .entry(layer)
+                .entry(layer.into_owned())
                 .and_modify(|range| {
                     range.0 = range.0.min(min);
                     range.1 = range.1.max(max);
@@ -199,7 +322,7 @@ impl MetadataSummary {
                 .or_insert((min, max));
         }
         for (layer, fields) in self.fields {
-            let target = store.fields.entry(layer).or_default();
+            let target = store.fields.entry(layer.into_owned()).or_default();
             for (key, field) in fields {
                 let mut kind = field.explicit;
                 if field
@@ -210,7 +333,7 @@ impl MetadataSummary {
                 }
                 if let Some(kind) = kind {
                     target
-                        .entry(key)
+                        .entry(key.into_owned())
                         .and_modify(|old| {
                             if old != kind {
                                 *old = "String".into();
@@ -255,6 +378,12 @@ impl Layer {
         match self {
             Self::Known(id) => LAYER_NAMES[usize::from(*id)],
             Self::Other(name) => name,
+        }
+    }
+    fn into_name(self) -> AttrKey {
+        match self {
+            Self::Known(id) => AttrKey::Borrowed(LAYER_NAMES[usize::from(id)]),
+            Self::Other(name) => AttrKey::Owned(name.into_string()),
         }
     }
 }
@@ -320,7 +449,7 @@ impl EncodedRecord {
         decode_payload(
             &self.payload,
             self.key.tile_id,
-            self.key.layer.name(),
+            self.key.layer.into_name(),
             self.key.sort_key,
             self.key.id,
         )
@@ -396,11 +525,80 @@ impl Header {
 pub(super) struct Sorter {
     directory: PathBuf,
     worker: usize,
+    /// Frame bytes this buffer holds before it spills; see `SortBudget`.
     budget: usize,
+    limits: Arc<SortBudget>,
     frames: Vec<u8>,
     entries: Vec<SortEntry>,
     runs: Vec<PathBuf>,
+    /// Frame bytes and records this sorter has spilled.
+    spilled_frames: u64,
+    spilled_records: u64,
     spilled: Arc<AtomicU64>,
+}
+
+// The largest frame buffer a worker grows to. Frame offsets are 32-bit, and
+// one sort of more than this takes long enough to stall the worker's share
+// of the rendering noticeably.
+const MAX_FRAME_BUDGET: usize = 2 << 30;
+// The workers keep their starting buffers until they have spilled this many
+// runs between them. Below it the final merge takes every run in one pass,
+// so larger buffers would only add memory; above it the compile is headed
+// for more runs than one merge takes.
+const GROW_AFTER_RUNS: usize = MERGE_FAN_IN / 2;
+
+/// How large the workers' sort buffers may grow.
+///
+/// Every worker starts with `floor` frame bytes. Once the workers have
+/// spilled `GROW_AFTER_RUNS` runs between them, each worker's next buffer
+/// is as large as everything it has spilled so far, up to its share of the
+/// sort memory: run sizes double until memory caps them. A small extract
+/// keeps the floor, its run count and its peak memory; a large one ends with
+/// a few dozen large runs per worker, and the merge combines the small early
+/// runs first (`Store::finish`), rather than every record twice or more.
+#[derive(Debug)]
+pub(super) struct SortBudget {
+    floor: usize,
+    /// Bytes each worker may hold in frames and sort entries together.
+    worker_memory: usize,
+    runs: AtomicUsize,
+}
+
+impl SortBudget {
+    /// `floor` frame bytes per worker, growing as far as `memory` bytes split
+    /// among `workers`; `memory` below the floors keeps the floor.
+    pub(super) fn new(floor: usize, memory: Option<u64>, workers: usize) -> Self {
+        let worker_memory = memory.map_or(0, |memory| {
+            usize::try_from(memory / workers.max(1) as u64).unwrap_or(usize::MAX)
+        });
+        Self {
+            floor: floor.max(1),
+            worker_memory,
+            runs: AtomicUsize::new(0),
+        }
+    }
+    /// A budget that stays at `bytes`.
+    #[cfg(test)]
+    pub(super) fn fixed(bytes: usize) -> Arc<Self> {
+        Arc::new(Self::new(bytes, None, 1))
+    }
+
+    /// The frame budget for a sorter's next run, after it spilled a run of
+    /// its own (`spilled_*` count all of them) on a budget of `current`.
+    fn after_spill(&self, current: usize, spilled_frames: u64, spilled_records: u64) -> usize {
+        let runs = self.runs.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        if runs < GROW_AFTER_RUNS || spilled_frames == 0 {
+            return current;
+        }
+        // A record costs its frame and its entry, and the entries' vector
+        // may hold as much spare capacity again once it has doubled.
+        let entry_bytes = 2 * spilled_records as u128 * size_of::<SortEntry>() as u128;
+        let frames = spilled_frames as u128;
+        let ceiling = self.worker_memory as u128 * frames / (frames + entry_bytes);
+        let ceiling = (ceiling.min(MAX_FRAME_BUDGET as u128) as usize).max(self.floor);
+        let doubled = usize::try_from(spilled_frames).unwrap_or(usize::MAX);
+        doubled.max(current).min(ceiling)
+    }
 }
 
 /// A buffered record's sort key, less what the frame at `offset` holds: the
@@ -498,6 +696,7 @@ impl Sorter {
         if self.frames.capacity() == 0 {
             // The buffer fills to the budget before it spills; reserving it
             // whole saves growing (and holding up to twice) as it fills.
+            // `spill` reserves budgets grown past this.
             self.frames.reserve(self.budget.min(MAX_RECORD_BYTES));
         }
         let offset = u32::try_from(self.frames.len())
@@ -523,6 +722,7 @@ impl Sorter {
             return Ok(());
         }
         let _phase = crate::profiling::Phase::start("omt_spill_sort_write");
+        let profiled = crate::stage_profile::enabled().then(std::time::Instant::now);
         // Keys are unique (they end in the insertion sequence).
         let frames = &self.frames;
         self.entries.sort_unstable_by(|a, b| a.cmp(b, frames));
@@ -539,8 +739,27 @@ impl Sorter {
         }
         let spilled = writer.finish()?;
         self.spilled.fetch_add(spilled, AtomicOrdering::Relaxed);
+        self.spilled_frames += self.frames.len() as u64;
+        self.spilled_records += self.entries.len() as u64;
+        if let Some(started) = profiled {
+            crate::stage_profile::add(
+                crate::stage_profile::Counter::SpillSortWrite,
+                started.elapsed(),
+                spilled,
+            );
+        }
         self.entries.clear();
         self.frames.clear();
+        let budget =
+            self.limits
+                .after_spill(self.budget, self.spilled_frames, self.spilled_records);
+        if budget > self.budget {
+            self.budget = budget;
+            // Free the old buffer before reserving the new one, so the two
+            // are never held together.
+            self.frames = Vec::new();
+            self.frames.reserve_exact(budget);
+        }
         Ok(())
     }
     /// Spills the remainder and hands the run files to the caller.
@@ -608,14 +827,17 @@ impl Store {
             zooms: BTreeMap::new(),
         })
     }
-    pub(super) fn sorter(&self, worker: usize, budget: usize) -> Sorter {
+    pub(super) fn sorter(&self, worker: usize, limits: &Arc<SortBudget>) -> Sorter {
         Sorter {
             directory: self.directory.clone(),
             worker,
-            budget,
+            budget: limits.floor,
+            limits: limits.clone(),
             frames: vec![],
             entries: vec![],
             runs: vec![],
+            spilled_frames: 0,
+            spilled_records: 0,
             spilled: self.spilled.clone(),
         }
     }
@@ -629,14 +851,27 @@ impl Store {
         self.sequence += 1;
         path
     }
-    /// Writes the archive into `archive`, an empty file the caller owns, and
-    /// returns the sizes of the tiles written.
+    /// Writes the archive into `archive`, an empty file or partial archive
+    /// the caller owns, and returns the sizes of the tiles written.
+    #[cfg(test)]
     pub fn finish(
-        mut self,
-        archive: &File,
+        self,
+        archive: &dyn ArchiveTarget,
         header: &ArchiveHeader,
         threads: usize,
         control: &Control,
+    ) -> Result<TileStats, String> {
+        self.finish_cached(archive, header, threads, control, None)
+    }
+    /// As `finish`, reusing layers from an earlier archive and writing a
+    /// cache index as `cache` says.
+    pub fn finish_cached(
+        mut self,
+        archive: &dyn ArchiveTarget,
+        header: &ArchiveHeader,
+        threads: usize,
+        control: &Control,
+        cache: Option<&mut MergeCache>,
     ) -> Result<TileStats, String> {
         let (bounds, center, options) = (&header.bounds, header.center, header.options);
         let (minzoom, maxzoom) = (header.min_zoom, header.max_zoom);
@@ -651,33 +886,47 @@ impl Store {
             "raw_bytes":self.spilled.load(AtomicOrdering::Relaxed),
             "bytes":self.runs.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum::<u64>()})
         );
-        // Every pass reads all the records once: the fraction is the bytes
-        // merged over the run bytes times the passes. Both count records as
-        // frames, before compression.
+        // The final merge reads every record once, and each intermediate pass
+        // the records of the runs it merges. Progress counts records as
+        // frames, before compression; a run's share of them is taken to be
+        // its share of the run files' bytes.
         let run_bytes = self.spilled.load(AtomicOrdering::Relaxed);
-        let mut passes = 1;
-        let mut runs = self.runs.len();
-        while runs > MERGE_FAN_IN {
-            runs = runs.div_ceil(MERGE_FAN_IN);
-            passes += 1;
+        let mut sizes = run_sizes(&self.runs)?;
+        let file_bytes = sizes.iter().sum::<u64>();
+        let mut intermediate = 0u64;
+        while sizes.len() > MERGE_FAN_IN {
+            let plan = merge_plan(&sizes);
+            let merged = plan.iter().map(|group| group_bytes(&sizes, group));
+            let merged = merged.collect::<Vec<_>>();
+            intermediate += merged.iter().sum::<u64>();
+            sizes = unmerged(sizes, &plan);
+            sizes.extend(merged);
         }
-        control.set_total(run_bytes * passes);
+        let intermediate = (u128::from(run_bytes) * u128::from(intermediate)
+            / u128::from(file_bytes.max(1))) as u64;
+        control.set_total(run_bytes.saturating_add(intermediate));
         let merge_phase = crate::profiling::Phase::start("omt_intermediate_merge");
+        let merge_stage = crate::stage_profile::Stage::start("intermediate_merge");
         while self.runs.len() > MERGE_FAN_IN {
-            let groups = self.runs.len().div_ceil(MERGE_FAN_IN);
-            let outputs = (0..groups).map(|_| self.next_path()).collect::<Vec<_>>();
+            let plan = merge_plan(&run_sizes(&self.runs)?);
+            let groups = plan
+                .iter()
+                .map(|group| group.iter().map(|&run| self.runs[run].clone()).collect())
+                .collect::<Vec<Vec<_>>>();
+            let outputs = groups.iter().map(|_| self.next_path()).collect::<Vec<_>>();
             // Keys are unique, so any grouping merges to the same record order.
-            if let Err(error) = merge_groups(&self.runs, &outputs, threads, control) {
+            if let Err(error) = merge_groups(&groups, &outputs, threads, control) {
                 for path in &outputs {
                     let _ = fs::remove_file(path);
                 }
                 return Err(error);
             }
-            for input in std::mem::replace(&mut self.runs, outputs) {
-                fs::remove_file(input).map_err(|e| e.to_string())?;
-            }
+            // `merge_groups` removed the merged runs.
+            self.runs = unmerged(std::mem::take(&mut self.runs), &plan);
+            self.runs.extend(outputs);
         }
         drop(merge_phase);
+        drop(merge_stage);
         let metadata = metadata(
             header.layers,
             (minzoom, maxzoom),
@@ -686,11 +935,27 @@ impl Store {
             options,
             header.omitted_sources,
         );
-        let mut archive =
-            PmtilesArchiveWriter::create(archive, bounds, center, &metadata, minzoom, maxzoom)?;
+        let mut archive = archive.open_writer(&ArchiveSpec {
+            bounds,
+            center,
+            metadata_json: &metadata,
+            min_zoom: minzoom,
+            max_zoom: maxzoom,
+        })?;
         let mut writing = crate::profiling::Accumulator::new("omt_archive_write");
         let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
         let final_merge = crate::profiling::Phase::start("omt_final_merge_encode_write");
+        let final_stage = crate::stage_profile::Stage::start("final_merge");
+        let (mut reuse, mut writer, counters) = match cache {
+            Some(cache) => (
+                cache.reuse.as_mut(),
+                cache.writer.as_mut(),
+                Some(&cache.counters),
+            ),
+            None => (None, None, None),
+        };
+        let hashing = reuse.is_some() || writer.is_some();
+        let old_archive = reuse.as_ref().map(|reuse| reuse.archive.clone());
         let encoded = encode_ordered(
             threads,
             threads.saturating_mul(TILE_WINDOW_PER_THREAD),
@@ -699,20 +964,36 @@ impl Store {
                 (
                     EncodeTimings::new(),
                     crate::profiling::Accumulator::new("omt_encode_tile_inclusive"),
+                    None::<File>,
                 )
             },
-            |(timings, inclusive), job: TileJob| {
+            |(timings, inclusive, old_file), job: TileJob| {
                 let id = job.id;
-                inclusive
-                    .measure(|| {
-                        let records = timings.decode.measure(|| job.decode())?;
-                        encode_tile(records, timings, options.gzip_level, control)
+                let reuse = old_archive.as_deref().map(|path| (path, old_file));
+                crate::stage_profile::time(crate::stage_profile::Counter::EncodeTile, || {
+                    inclusive.measure(|| {
+                        encode_job(
+                            job,
+                            hashing,
+                            reuse,
+                            counters,
+                            timings,
+                            options.gzip_level,
+                            control,
+                        )
                     })
-                    .map(|bytes| (id, bytes))
+                })
+                .map(|(bytes, entry)| (id, bytes, entry))
             },
-            |(id, tile): (u64, Option<EncodedTile>)| {
+            |(id, tile, entry): (u64, Option<EncodedTile>, Option<TileEntry>)| {
+                if let (Some(writer), Some(entry)) = (writer.as_deref_mut(), &entry) {
+                    writer.add(entry)?;
+                }
                 if let Some(tile) = tile {
-                    writing.measure(|| archive.write_tile(id, &tile.bytes))?;
+                    crate::stage_profile::time(
+                        crate::stage_profile::Counter::ArchiveWrite,
+                        || writing.measure(|| archive.write_tile(id, &tile.bytes)),
+                    )?;
                     let layers = tile
                         .layers
                         .iter()
@@ -726,11 +1007,16 @@ impl Store {
                 let mut tile_id = None;
                 let mut tile = vec![];
                 let mut tile_bytes = 0usize;
-                merge_controlled(&self.runs, control, |encoded| {
+                merge_prefetched(&self.runs, threads, control, |encoded| {
                     if tile_id.is_some_and(|id| id != encoded.key.tile_id) {
+                        let id = tile_id.unwrap();
                         let job = TileJob {
-                            id: tile_id.unwrap(),
+                            id,
                             records: std::mem::take(&mut tile),
+                            old: match reuse.as_deref_mut() {
+                                Some(reuse) => reuse.take(id)?,
+                                None => None,
+                            },
                         };
                         stream.send(job, tile_bytes)?;
                         tile_bytes = 0;
@@ -744,12 +1030,24 @@ impl Store {
                     Ok(())
                 })?;
                 if let Some(id) = tile_id {
-                    stream.send(TileJob { id, records: tile }, tile_bytes)?;
+                    let old = match reuse {
+                        Some(reuse) => reuse.take(id)?,
+                        None => None,
+                    };
+                    stream.send(
+                        TileJob {
+                            id,
+                            records: tile,
+                            old,
+                        },
+                        tile_bytes,
+                    )?;
                 }
                 Ok(())
             },
         );
         drop(final_merge);
+        drop(final_stage);
         if let Err(error) = encoded {
             for path in &self.runs {
                 let _ = fs::remove_file(path);
@@ -757,8 +1055,10 @@ impl Store {
             return Err(error);
         }
         let finalizing = crate::profiling::Phase::start("omt_archive_finalize");
+        let finalize_stage = crate::stage_profile::Stage::start("finalize_archive");
         archive.finalize()?;
         drop(finalizing);
+        drop(finalize_stage);
         for path in std::mem::take(&mut self.runs) {
             fs::remove_file(path).map_err(|e| e.to_string())?;
         }
@@ -767,20 +1067,79 @@ impl Store {
     }
 }
 
-/// Merges each `MERGE_FAN_IN`-sized group of `runs` into the matching path in
-/// `outputs`, at most `threads` groups at a time.
+/// The sizes of the run files at `runs`.
+fn run_sizes(runs: &[PathBuf]) -> Result<Vec<u64>, String> {
+    runs.iter()
+        .map(|run| {
+            fs::metadata(run)
+                .map(|metadata| metadata.len())
+                .map_err(|e| format!("Failed to read {}: {e}", run.display()))
+        })
+        .collect()
+}
+
+/// The runs, of these `sizes`, that the next intermediate pass merges, as
+/// groups of indexes: the fewest and smallest runs whose merging leaves at
+/// most `MERGE_FAN_IN` runs for the final merge, or all of them, in groups
+/// of at most `MERGE_FAN_IN`, when one pass can't get that far. Growing sort
+/// buffers (`SortBudget`) leave many small early runs and few large ones, so
+/// a pass usually rewrites a small part of the records rather than all.
+fn merge_plan(sizes: &[u64]) -> Vec<Vec<usize>> {
+    let (runs, fan_in) = (sizes.len(), MERGE_FAN_IN);
+    if runs <= fan_in {
+        return vec![];
+    }
+    // Each group of k runs turns into one, so g groups taking
+    // runs - fan_in + g runs between them leave exactly fan_in.
+    let groups = (runs - fan_in).div_ceil(fan_in - 1);
+    let (groups, merged) = if groups <= fan_in {
+        (groups, runs - fan_in + groups)
+    } else {
+        (runs.div_ceil(fan_in), runs)
+    };
+    let mut order = (0..runs).collect::<Vec<_>>();
+    order.sort_by_key(|&run| (sizes[run], run));
+    (0..groups)
+        .map(|group| order[group * merged / groups..(group + 1) * merged / groups].to_vec())
+        .collect()
+}
+
+fn group_bytes(sizes: &[u64], group: &[usize]) -> u64 {
+    group.iter().map(|&run| sizes[run]).sum()
+}
+
+/// The items of `items` that no group of `plan` takes, in their order.
+fn unmerged<T>(items: Vec<T>, plan: &[Vec<usize>]) -> Vec<T> {
+    let mut merged = vec![false; items.len()];
+    for &index in plan.iter().flatten() {
+        merged[index] = true;
+    }
+    items
+        .into_iter()
+        .zip(merged)
+        .filter_map(|(item, merged)| (!merged).then_some(item))
+        .collect()
+}
+
+/// Merges each group of runs into the matching path in `outputs`, at most
+/// `threads` groups at a time, and removes a group's runs once it is merged,
+/// so a pass needs scratch space for one group's records twice, not all.
 fn merge_groups(
-    runs: &[PathBuf],
+    groups: &[Vec<PathBuf>],
     outputs: &[PathBuf],
     threads: usize,
     control: &Control,
 ) -> Result<(), String> {
     let next = AtomicUsize::new(0);
     let merge_group = |group: usize| -> Result<(), String> {
-        let batch = &runs[group * MERGE_FAN_IN..((group + 1) * MERGE_FAN_IN).min(runs.len())];
+        let batch = &groups[group];
         let mut writer = RunWriter::create(&outputs[group])?;
         merge_controlled(batch, control, |record| writer.write(&record))?;
-        writer.finish().map(drop)
+        writer.finish()?;
+        for run in batch {
+            fs::remove_file(run).map_err(|e| format!("Failed to remove {}: {e}", run.display()))?;
+        }
+        Ok(())
     };
     let results = std::thread::scope(|scope| {
         let workers = (0..threads.min(outputs.len()))
@@ -830,8 +1189,11 @@ const TILE_WINDOW_PER_THREAD: usize = 8;
 struct TileJob {
     id: u64,
     records: Vec<EncodedRecord>,
+    /// The tile in the archive being reused, if any.
+    old: Option<OldTile>,
 }
 impl TileJob {
+    #[cfg(test)]
     fn decode(self) -> Result<Vec<Record>, String> {
         self.records
             .into_iter()
@@ -1003,6 +1365,140 @@ impl Ord for Head {
     }
 }
 
+/// A run's next decoded block and its records' size as frames: empty at the
+/// end of the run.
+type Block = Result<(Vec<EncodedRecord>, u64), String>;
+
+/// Merges sorted runs as `merge_controlled` does, record for record, while
+/// `decoders` threads read and decode the runs' blocks ahead of the merge,
+/// so that this thread only orders records. Each run has `BLOCKS_AHEAD`
+/// blocks requested at a time: the merge asks for another as it starts on
+/// one, so the blocks held decoded stay bounded by the runs, not their size.
+fn merge_prefetched(
+    paths: &[PathBuf],
+    decoders: usize,
+    control: &Control,
+    mut emit: impl FnMut(EncodedRecord) -> Result<(), String>,
+) -> Result<(), String> {
+    const REPORT_BYTES: u64 = 1 << 20;
+    let readers = paths
+        .iter()
+        .map(|p| RunReader::open(p).map(Mutex::new))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (block_senders, block_receivers): (Vec<_>, Vec<_>) = (0..paths.len())
+        .map(|_| crossbeam_channel::unbounded::<Block>())
+        .unzip();
+    let (requests, requested) = crossbeam_channel::unbounded::<usize>();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        // Dropped however this closure returns, which ends the decoders
+        // before the scope waits for them.
+        let requests = requests;
+        let _stop = StopOnDrop(&stop);
+        for worker in 0..decoders.max(1).min(paths.len()) {
+            let (requested, readers, block_senders, stop) =
+                (requested.clone(), &readers, &block_senders, &stop);
+            std::thread::Builder::new()
+                .name(format!("omt-run-decode-{worker}"))
+                .spawn_scoped(scope, move || {
+                    for run in requested {
+                        if stop.load(AtomicOrdering::Relaxed) {
+                            return;
+                        }
+                        let mut reader = readers[run].lock().unwrap_or_else(|e| e.into_inner());
+                        let block = catch_unwind(AssertUnwindSafe(|| {
+                            let records = reader.next_block_records()?;
+                            let bytes = records.iter().map(|r| r.frame_bytes() as u64).sum();
+                            Ok((records, bytes))
+                        }))
+                        .unwrap_or_else(|payload| {
+                            let message = crate::panic_message(&*payload);
+                            Err(format!("OMT run decoder panicked: {message}"))
+                        });
+                        // Sent while the run is locked, so its blocks arrive in order.
+                        if block_senders[run].send(block).is_err() {
+                            return;
+                        }
+                    }
+                })
+                .map_err(|e| format!("Start OMT run decoder: {e}"))?;
+        }
+        drop(requested);
+        for run in 0..paths.len() {
+            for _ in 0..BLOCKS_AHEAD {
+                requests
+                    .send(run)
+                    .map_err(|_| "OMT run decoders stopped unexpectedly")?;
+            }
+        }
+        let mut blocks = (0..paths.len())
+            .map(|_| Vec::new().into_iter())
+            .collect::<Vec<_>>();
+        let mut ended = vec![false; paths.len()];
+        // Progress counts a block's bytes as the merge starts on it.
+        let mut merged = 0;
+        let mut next = |run: usize| -> Result<Option<EncodedRecord>, String> {
+            loop {
+                if let Some(record) = blocks[run].next() {
+                    return Ok(Some(record));
+                }
+                if ended[run] {
+                    return Ok(None);
+                }
+                let (block, bytes) = block_receivers[run]
+                    .recv()
+                    .map_err(|_| "OMT run decoders stopped unexpectedly")??;
+                if block.is_empty() {
+                    ended[run] = true;
+                    return Ok(None);
+                }
+                requests
+                    .send(run)
+                    .map_err(|_| "OMT run decoders stopped unexpectedly")?;
+                merged += bytes;
+                if merged >= REPORT_BYTES {
+                    control.add_done(merged);
+                    merged = 0;
+                    control.check()?;
+                }
+                blocks[run] = block.into_iter();
+            }
+        };
+        let mut heap = BinaryHeap::new();
+        for reader in 0..paths.len() {
+            if let Some(record) = next(reader)? {
+                heap.push(Reverse(Head { record, reader }));
+            }
+        }
+        // The head's successor from the same run replaces it in place: one
+        // sift instead of a pop and a push.
+        while let Some(mut top) = heap.peek_mut() {
+            let reader = top.0.reader;
+            let record = match next(reader) {
+                Ok(Some(record)) => std::mem::replace(&mut top.0.record, record),
+                Ok(None) => PeekMut::pop(top).0.record,
+                // The head comes first in record order, and so does its error.
+                Err(error) => {
+                    emit(PeekMut::pop(top).0.record)?;
+                    return Err(error);
+                }
+            };
+            emit(record)?;
+        }
+        drop(next);
+        control.add_done(merged);
+        Ok(())
+    })
+}
+
+/// Raises its flag when dropped, so that threads still working stop early.
+struct StopOnDrop<'a>(&'a AtomicBool);
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, AtomicOrdering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 fn merge(
     paths: &[PathBuf],
@@ -1098,6 +1594,8 @@ struct EncodeTimings {
     geometry: crate::profiling::Accumulator,
     dictionaries: crate::profiling::Accumulator,
     protobuf_gzip: crate::profiling::Accumulator,
+    hash: crate::profiling::Accumulator,
+    reuse: crate::profiling::Accumulator,
 }
 impl EncodeTimings {
     fn new() -> Self {
@@ -1107,6 +1605,8 @@ impl EncodeTimings {
             geometry: crate::profiling::Accumulator::new("omt_merge_geometries"),
             dictionaries: crate::profiling::Accumulator::new("omt_mvt_geometry_dictionaries"),
             protobuf_gzip: crate::profiling::Accumulator::new("omt_protobuf_gzip"),
+            hash: crate::profiling::Accumulator::new("omt_merge_cache_hash"),
+            reuse: crate::profiling::Accumulator::new("omt_merge_cache_read"),
         }
     }
 }
@@ -1116,40 +1616,37 @@ struct EncodedTile {
     layers: Vec<(String, u64)>,
 }
 
-fn encode_tile(
-    records: Vec<Record>,
+/// A layer's records merged and encoded as a tile's layer field, or `None`
+/// when no feature is left.
+fn encode_layer_records(
+    name: &str,
+    mut records: Vec<Record>,
+    timings: &mut EncodeTimings,
+    control: &Control,
+) -> Result<Option<Vec<u8>>, String> {
+    control.check()?;
+    records.sort_by(order);
+    records = timings.density.measure(|| point_density(records));
+    records = timings
+        .geometry
+        .measure(|| merge_geometries_controlled(records, control))?;
+    let layer = timings
+        .dictionaries
+        .measure(|| encode_layer(name, &records))
+        .map_err(|e| format!("Failed to encode layer {name}: {e}"))?;
+    if layer.num_features() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(timings.protobuf_gzip.measure(|| layer.encode())))
+}
+
+/// Gzips a tile's layers; `None` when it has none.
+fn finish_tile(
+    tile: Vec<u8>,
+    sizes: Vec<(String, u64)>,
     timings: &mut EncodeTimings,
     gzip_level: u32,
-    control: &Control,
 ) -> Result<Option<EncodedTile>, String> {
-    let mut layers: BTreeMap<String, Vec<Record>> = BTreeMap::new();
-    for record in records {
-        layers.entry(record.layer.clone()).or_default().push(record);
-    }
-    // Each layer is encoded as a tile of its own; one after another they are
-    // the tile, since a tile is only its repeated layer field.
-    let mut tile = Vec::new();
-    let mut sizes = Vec::new();
-    for (name, mut records) in layers {
-        control.check()?;
-        records.sort_by(order);
-        records = timings.density.measure(|| point_density(records));
-        records = timings
-            .geometry
-            .measure(|| merge_geometries_controlled(records, control))?;
-        let layer = timings
-            .dictionaries
-            .measure(|| encode_layer(&name, &records))
-            .map_err(|e| format!("Failed to encode layer {name}: {e}"))?;
-        if layer.num_features() == 0 {
-            continue;
-        }
-        let start = tile.len();
-        timings
-            .protobuf_gzip
-            .measure(|| tile.extend_from_slice(&layer.encode()));
-        sizes.push((name, (tile.len() - start) as u64));
-    }
     if sizes.is_empty() {
         return Ok(None);
     }
@@ -1161,6 +1658,154 @@ fn encode_tile(
         bytes,
         layers: sizes,
     }))
+}
+
+/// Encodes a tile job. With `hashing`, also returns the tile's cache entry;
+/// with `reuse` (the old archive and this worker's handle on it), layers
+/// whose records match the old tile's are taken from it.
+fn encode_job(
+    job: TileJob,
+    hashing: bool,
+    reuse: Option<(&Path, &mut Option<File>)>,
+    counters: Option<&merge_cache::Counters>,
+    timings: &mut EncodeTimings,
+    gzip_level: u32,
+    control: &Control,
+) -> Result<(Option<EncodedTile>, Option<TileEntry>), String> {
+    let id = job.id;
+    // Records arrive sorted by layer, so each layer is one run of them.
+    let mut groups: Vec<(Layer, Vec<EncodedRecord>)> = Vec::new();
+    for record in job.records {
+        if record.key.tile_id != id {
+            return Err("OMT tile job contains a different tile".into());
+        }
+        match groups.last_mut() {
+            Some((layer, records)) if *layer == record.key.layer => records.push(record),
+            _ => groups.push((record.key.layer.clone(), vec![record])),
+        }
+    }
+    // Layers are encoded in name order, as a map by name would hold them.
+    groups.sort_by(|a, b| a.0.name().cmp(b.0.name()));
+    if groups.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err("OMT tile job holds a layer twice".into());
+    }
+    let keys = if hashing {
+        timings.hash.measure(|| {
+            groups
+                .iter()
+                .map(|(layer, records)| merge_cache::layer_key(id, layer.name(), records))
+                .collect::<Vec<_>>()
+        })
+    } else {
+        Vec::new()
+    };
+    let old = job.old.as_ref().filter(|_| hashing);
+    let count = |counter: fn(&merge_cache::Counters) -> &AtomicU64, n: usize| {
+        if let Some(counters) = counters {
+            merge_cache::Counters::add(counter(counters), n as u64);
+        }
+    };
+    let (path, mut file) = match reuse {
+        Some((path, file)) => (Some(path), Some(file)),
+        None => (None, None),
+    };
+    // Every layer the same as before: the old tile, as it is stored.
+    if let (Some(old), Some(path), Some(file)) = (old, path, file.as_deref_mut())
+        && old.copy
+        && old.entry.layers.len() == groups.len()
+        && old
+            .entry
+            .layers
+            .iter()
+            .zip(groups.iter().zip(&keys))
+            .all(|(entry, ((layer, _), key))| *entry.name == *layer.name() && entry.key == *key)
+    {
+        let tile = if old.entry.stored == 0 {
+            None
+        } else {
+            let bytes = timings
+                .reuse
+                .measure(|| merge_cache::read_stored(file, path, old))?;
+            Some(EncodedTile {
+                bytes,
+                layers: old
+                    .entry
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.size > 0)
+                    .map(|layer| (layer.name.to_string(), u64::from(layer.size)))
+                    .collect(),
+            })
+        };
+        count(|c| &c.tiles_reused, 1);
+        count(|c| &c.layers_reused, groups.len());
+        return Ok((tile, Some(old.entry.clone())));
+    }
+    let mut old_layers: Option<Vec<u8>> = None;
+    let mut tile = Vec::new();
+    let mut sizes = Vec::new();
+    let mut entries = Vec::with_capacity(if hashing { groups.len() } else { 0 });
+    for (index, (layer, records)) in groups.into_iter().enumerate() {
+        let name = layer.name();
+        // The same layer in the old tile, and where its bytes start there.
+        let hit = old.and_then(|old| {
+            let mut start = 0usize;
+            for entry in &old.entry.layers {
+                if *entry.name == *name {
+                    return (entry.key == keys[index]).then_some((old, start, entry.size));
+                }
+                start += entry.size as usize;
+            }
+            None
+        });
+        let bytes = match (hit, path, file.as_deref_mut()) {
+            (Some((old, start, size)), Some(path), Some(file)) => {
+                count(|c| &c.layers_reused, 1);
+                if size == 0 {
+                    None
+                } else {
+                    if old_layers.is_none() {
+                        old_layers = Some(
+                            timings
+                                .reuse
+                                .measure(|| merge_cache::read_layers(file, path, old))?,
+                        );
+                    }
+                    let all = old_layers.as_ref().expect("read above");
+                    Some(all[start..start + size as usize].to_vec())
+                }
+            }
+            _ => {
+                count(|c| &c.layers_encoded, 1);
+                let records = timings.decode.measure(|| {
+                    records
+                        .into_iter()
+                        .map(EncodedRecord::decode)
+                        .collect::<Result<Vec<_>, _>>()
+                })?;
+                encode_layer_records(name, records, timings, control)?
+            }
+        };
+        let size = bytes.as_ref().map_or(0, Vec::len);
+        if hashing {
+            entries.push(LayerEntry {
+                name: name.into(),
+                key: keys[index],
+                size: u32::try_from(size).map_err(|_| "OMT tile layer exceeds 4 GiB")?,
+            });
+        }
+        if let Some(bytes) = bytes {
+            tile.extend_from_slice(&bytes);
+            sizes.push((name.to_string(), size as u64));
+        }
+    }
+    let tile = finish_tile(tile, sizes, timings, gzip_level)?;
+    let entry = hashing.then(|| TileEntry {
+        tile_id: id,
+        stored: tile.as_ref().map_or(0, |tile| tile.bytes.len() as u32),
+        layers: entries,
+    });
+    Ok((tile, entry))
 }
 
 /// The layer's features, in `records` order. Attributes starting with `_` are
@@ -1251,7 +1896,7 @@ fn point_density(records: Vec<Record>) -> Vec<Record> {
             if record.grid_limit > 0 && record.grid_cell.is_some() && count > record.grid_limit {
                 continue;
             }
-            if (record.rank || matches!(record.layer.as_str(), "place" | "mountain_peak"))
+            if (record.rank || matches!(&*record.layer, "place" | "mountain_peak"))
                 && !record.attrs.contains_key("rank")
             {
                 record.attrs.insert(
@@ -1316,7 +1961,7 @@ fn merge_geometries_controlled(
             false
         };
         let merge = match &record.geometry {
-            TileGeometry::Polygon(_) => match record.layer.as_str() {
+            TileGeometry::Polygon(_) => match &*record.layer {
                 "water" | "building" => true,
                 "landcover" => cover_merge,
                 "landuse" => {
@@ -1327,7 +1972,7 @@ fn merge_geometries_controlled(
             },
             TileGeometry::Line { .. } => {
                 matches!(
-                    record.layer.as_str(),
+                    &*record.layer,
                     "transportation" | "transportation_name" | "boundary"
                 ) || (record.layer == "waterway" && (6..=11).contains(&record.zoom))
             }
@@ -1392,12 +2037,24 @@ fn merge_geometries_controlled(
                         min_hole_area,
                         distance,
                     } => {
+                        #[cfg(feature = "benchmark-profiling")]
+                        merge_dump::record(
+                            &first.layer,
+                            first.zoom,
+                            first.tile_id,
+                            distance,
+                            &originals,
+                        );
                         let mut result = Vec::new();
                         let mut cluster_ids = Vec::new();
-                        for (cluster_id, (members, merged, jts)) in
-                            merge_nearby(geometries, distance * 16.)
-                                .into_iter()
-                                .enumerate()
+                        // Experiment: clusters whose output the area filter
+                        // below is certain to drop skip union and unbuffer.
+                        if std::env::var_os("OTC_NO_DROP_BOUND").is_none() {
+                            DROP_BELOW.with(|d| d.set(min_area * 256.));
+                        }
+                        let clusters = merge_nearby(geometries, distance * 16.);
+                        DROP_BELOW.with(|d| d.set(0.));
+                        for (cluster_id, (members, merged, jts)) in clusters.into_iter().enumerate()
                         {
                             let rings = if members.len() == 1 {
                                 // Pinned FeatureMerge leaves singleton clusters
@@ -1458,7 +2115,7 @@ fn merge_geometries_controlled(
                 // Transportation, its name layer, and waterway use the same graph with their
                 // zoom-dependent loop, stub, and final length thresholds.
                 let full_graph = matches!(
-                    first.layer.as_str(),
+                    &*first.layer,
                     "boundary" | "transportation" | "transportation_name" | "waterway"
                 );
                 if !full_graph {
@@ -1698,6 +2355,12 @@ fn fill_square(area: f64, ring: &[TilePoint]) -> Option<Vec<TilePoint>> {
     ])
 }
 
+thread_local! {
+    /// The exterior area at or below which a merged cluster's polygons are
+    /// dropped by the caller; 0 disables the early-out.
+    static DROP_BELOW: std::cell::Cell<f64> = const { std::cell::Cell::new(0.) };
+}
+
 fn merge_nearby(
     geometries: Vec<MultiPolygon<f64>>,
     distance: f64,
@@ -1762,7 +2425,15 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
             {
                 *distance_tests += 1;
             }
-            if Euclidean.distance(&geometries[i], &geometries[j]) <= distance {
+            #[cfg(test)]
+            let near = if merge_replay::GEO_PROXIMITY.with(std::cell::Cell::get) {
+                Euclidean.distance(&geometries[i], &geometries[j]) <= distance
+            } else {
+                within_distance(&geometries[i], &geometries[j], distance)
+            };
+            #[cfg(not(test))]
+            let near = within_distance(&geometries[i], &geometries[j], distance);
+            if near {
                 parent[right] = left;
             }
         }
@@ -1786,12 +2457,21 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
             result.push((members, cluster.into_iter().next().unwrap(), false));
             continue;
         }
+        #[cfg(test)]
+        if merge_replay::COLLECT_ONLY.with(std::cell::Cell::get) {
+            result.push((members, MultiPolygon(vec![]), false));
+            continue;
+        }
         let merged = if distance > 0. {
             // FeatureMerge.bufferUnionUnbuffer, through the port of the
             // pinned JTS buffer and union; the integer overlay remains for
             // inputs outside the port's bounds.
-            super::jts_buffer::buffer_union_unbuffer(&cluster, distance)
-                .unwrap_or_else(|| overlay_buffer_union_unbuffer(&cluster, distance, buffer))
+            super::jts_buffer::buffer_union_unbuffer(
+                &cluster,
+                distance,
+                DROP_BELOW.with(std::cell::Cell::get),
+            )
+            .unwrap_or_else(|| overlay_buffer_union_unbuffer(&cluster, distance, buffer))
         } else {
             // Pinned mergeOverlappingPolygons uses minDist=buffer=0: a zero
             // buffer of each connected cluster's collection, through the
@@ -1813,6 +2493,171 @@ fn merge_nearby_impl<const SKIP_CONNECTED: bool>(
     }
     result.sort_by_key(|(members, ..)| members[0]);
     result
+}
+
+/// Products of vertex counts up to which the proximity test compares every
+/// vertex with every segment; above it, it sweeps over vertices sorted by x.
+const DIRECT_SCAN_PAIRS: usize = 64 * 64;
+
+/// Whether `Euclidean.distance(a, b) <= distance`, as `merge_nearby` asks it,
+/// with an early exit at the first vertex and segment within the distance.
+/// geo's distance is the minimum of the same `line_segment_distance` values
+/// over the same rings (through R-trees of segments that it builds for every
+/// pair, or a sorted projection), so the answers could differ only where two
+/// segments tie for a vertex's nearest within rounding of `distance`. Polygons
+/// with holes whose boxes overlap still go to geo, which picks their rings by
+/// a containment test.
+fn within_distance(a: &MultiPolygon<f64>, b: &MultiPolygon<f64>, distance: f64) -> bool {
+    // geo folds the minimum over every pair of member polygons.
+    a.0.iter()
+        .any(|p| b.0.iter().any(|q| polygons_within(p, q, distance)))
+}
+
+fn polygons_within(p: &Polygon<f64>, q: &Polygon<f64>, distance: f64) -> bool {
+    let (pe, qe) = (p.exterior(), q.exterior());
+    if pe.0.is_empty() || qe.0.is_empty() {
+        // geo answers 0 for an empty polygon.
+        return true;
+    }
+    let (rp, rq) = (ring_rect(pe), ring_rect(qe));
+    let x_separated = rp.max().x < rq.min().x || rq.max().x < rp.min().x;
+    let y_separated = rp.max().y < rq.min().y || rq.max().y < rp.min().y;
+    if (x_separated || y_separated) && pe.0.len() >= 4 && qe.0.len() >= 4 {
+        // Disjoint boxes cannot intersect; geo measures between the exteriors.
+        return rings_within(pe, qe, distance);
+    }
+    if !p.interiors().is_empty() || !q.interiors().is_empty() {
+        return Euclidean.distance(p, q) <= distance;
+    }
+    // geo: 0 if they intersect, else the distance between the exteriors.
+    rings_within(pe, qe, distance) || exteriors_intersect(p, q)
+}
+
+fn ring_rect(ring: &LineString<f64>) -> Rect<f64> {
+    let first = ring.0[0];
+    let (mut min, mut max) = (first, first);
+    for c in &ring.0[1..] {
+        min.x = min.x.min(c.x);
+        min.y = min.y.min(c.y);
+        max.x = max.x.max(c.x);
+        max.y = max.y.max(c.y);
+    }
+    Rect::new(min, max)
+}
+
+/// Whether some vertex of either ring lies within `distance` of a segment of
+/// the other, by geo's `line_segment_distance`.
+fn rings_within(a: &LineString<f64>, b: &LineString<f64>, distance: f64) -> bool {
+    vertices_within(&a.0, &b.0, distance) || vertices_within(&b.0, &a.0, distance)
+}
+
+fn vertices_within(points: &[Coord<f64>], ring: &[Coord<f64>], distance: f64) -> bool {
+    // A vertex farther than this from a segment's box along one axis cannot
+    // be within `distance` of it; the margin covers line_segment_distance's
+    // rounding.
+    let reach = distance + 1e-6 * (1. + distance);
+    let reach_box = |start: Coord<f64>, end: Coord<f64>| {
+        (
+            start.x.min(end.x) - reach,
+            start.x.max(end.x) + reach,
+            start.y.min(end.y) - reach,
+            start.y.max(end.y) + reach,
+        )
+    };
+    if points.len() * ring.len() <= DIRECT_SCAN_PAIRS {
+        for segment in ring.windows(2) {
+            let (start, end) = (segment[0], segment[1]);
+            let (min_x, max_x, min_y, max_y) = reach_box(start, end);
+            for &point in points {
+                if point.x < min_x || point.x > max_x || point.y < min_y || point.y > max_y {
+                    continue;
+                }
+                if line_segment_distance(point, start, end) <= distance {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    let mut sorted = points.to_vec();
+    sorted.sort_unstable_by(|a, b| a.x.total_cmp(&b.x));
+    for segment in ring.windows(2) {
+        let (start, end) = (segment[0], segment[1]);
+        let (min_x, max_x, min_y, max_y) = reach_box(start, end);
+        let first = sorted.partition_point(|p| p.x < min_x);
+        for &point in &sorted[first..] {
+            if point.x > max_x {
+                break;
+            }
+            if point.y < min_y || point.y > max_y {
+                continue;
+            }
+            if line_segment_distance(point, start, end) <= distance {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// geo's `Polygon::intersects` for polygons without holes whose boxes
+/// overlap: a vertex of either inside or on the other, or crossing exterior
+/// segments, by the same robust predicates; large rings are swept by x
+/// instead of compared pair by pair.
+fn exteriors_intersect(p: &Polygon<f64>, q: &Polygon<f64>) -> bool {
+    let (pe, qe) = (&p.exterior().0, &q.exterior().0);
+    if q.intersects(&pe[0]) || p.intersects(&qe[0]) {
+        return true;
+    }
+    let boxes_meet = |a: &[Coord<f64>], b: &[Coord<f64>]| {
+        a[0].x.min(a[1].x) <= b[0].x.max(b[1].x)
+            && b[0].x.min(b[1].x) <= a[0].x.max(a[1].x)
+            && a[0].y.min(a[1].y) <= b[0].y.max(b[1].y)
+            && b[0].y.min(b[1].y) <= a[0].y.max(a[1].y)
+    };
+    let cross = |a: &[Coord<f64>], b: &[Coord<f64>]| {
+        boxes_meet(a, b) && geo::Line::new(a[0], a[1]).intersects(&geo::Line::new(b[0], b[1]))
+    };
+    if pe.len() * qe.len() <= DIRECT_SCAN_PAIRS {
+        return pe.windows(2).any(|a| qe.windows(2).any(|b| cross(a, b)));
+    }
+    let mut segments: Vec<&[Coord<f64>]> = qe.windows(2).collect();
+    segments.sort_unstable_by(|a, b| a[0].x.min(a[1].x).total_cmp(&b[0].x.min(b[1].x)));
+    let widest = segments
+        .iter()
+        .map(|s| (s[0].x - s[1].x).abs())
+        .fold(0_f64, f64::max);
+    pe.windows(2).any(|a| {
+        let (low, high) = (a[0].x.min(a[1].x), a[0].x.max(a[1].x));
+        // Segments starting further left than this end before `low`; the
+        // margin covers rounding of the subtraction.
+        let from = low - widest - (1. + 1e-9 * low.abs());
+        let first = segments.partition_point(|s| s[0].x.min(s[1].x) < from);
+        segments[first..]
+            .iter()
+            .take_while(|s| s[0].x.min(s[1].x) <= high)
+            .any(|b| cross(a, b))
+    })
+}
+
+/// geo-types' `private_utils::line_segment_distance` for f64, with the same
+/// floating-point operations.
+fn line_segment_distance(point: Coord<f64>, start: Coord<f64>, end: Coord<f64>) -> f64 {
+    if start == end {
+        return (start.x - point.x).hypot(start.y - point.y);
+    }
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let d_squared = dx * dx + dy * dy;
+    let r = ((point.x - start.x) * dx + (point.y - start.y) * dy) / d_squared;
+    if r <= 0. {
+        return (start.x - point.x).hypot(start.y - point.y);
+    }
+    if r >= 1. {
+        return (end.x - point.x).hypot(end.y - point.y);
+    }
+    let s = ((start.y - point.y) * dx - (start.x - point.x) * dy) / d_squared;
+    s.abs() * dx.hypot(dy)
 }
 
 fn overlay_buffer_union_unbuffer(
@@ -1841,11 +2686,7 @@ fn overlay_buffer_union_unbuffer(
     merged
 }
 
-fn line_merge_policy(
-    layer: &str,
-    zoom: u8,
-    attrs: &BTreeMap<String, AttrValue>,
-) -> Option<(f64, f64)> {
+fn line_merge_policy(layer: &str, zoom: u8, attrs: &AttrMap) -> Option<(f64, f64)> {
     let pixels = |meters: f64| meters / 40_075_016.685_578_49 * 256. * 2_f64.powi(i32::from(zoom));
     match layer {
         "waterway" if (6..=11).contains(&zoom) => Some((
@@ -3031,7 +3872,7 @@ mod tests {
         ]);
         for name in names {
             let mut r = record(17);
-            r.layer = name.clone();
+            r.layer = name.clone().into();
             r.tile_id = 42;
             r.sort_key = -9;
             let encoded = EncodedRecord::encode(
@@ -3077,7 +3918,7 @@ mod tests {
             );
         }
         let mut long = record(17);
-        long.layer = "z".repeat(MAX_LAYER_BYTES + 1);
+        long.layer = "z".repeat(MAX_LAYER_BYTES + 1).into();
         assert!(EncodedRecord::encode(&long, seq(0)).is_err());
     }
     #[test]
@@ -3090,7 +3931,7 @@ mod tests {
             for b in &names {
                 let key = |name: &str| {
                     let mut r = record(17);
-                    r.layer = name.into();
+                    r.layer = name.to_owned().into();
                     SortKey::of(&r, seq(0))
                 };
                 assert_eq!(key(a).cmp(&key(b)), a.cmp(b), "{a} vs {b}");
@@ -3167,13 +4008,13 @@ mod tests {
             assert_eq!(actual, expected);
         }
         assert_eq!(
-            line_merge_policy("transportation", 8, &BTreeMap::new())
+            line_merge_policy("transportation", 8, &AttrMap::new())
                 .unwrap()
                 .0,
             0.
         );
         assert!(
-            line_merge_policy("transportation", 7, &BTreeMap::new())
+            line_merge_policy("transportation", 7, &AttrMap::new())
                 .unwrap()
                 .0
                 > 0.
@@ -3182,7 +4023,11 @@ mod tests {
 
     #[test]
     fn worker_decode_preserves_record_order_and_rejects_corrupt_records() {
-        let make_job = |records: Vec<EncodedRecord>| TileJob { id: 0, records };
+        let make_job = |records: Vec<EncodedRecord>| TileJob {
+            id: 0,
+            records,
+            old: None,
+        };
         let decoded = make_job(vec![
             EncodedRecord::encode(&record(9), seq(0)).unwrap(),
             EncodedRecord::encode(&record(2), seq(0)).unwrap(),
@@ -3238,11 +4083,11 @@ mod tests {
             let mut zooms: BTreeMap<String, (u8, u8)> = BTreeMap::new();
             for record in records {
                 let z = zooms
-                    .entry(record.layer.clone())
+                    .entry(record.layer.to_string())
                     .or_insert((record.zoom, record.zoom));
                 z.0 = z.0.min(record.zoom);
                 z.1 = z.1.max(record.zoom);
-                let fields = fields.entry(record.layer.clone()).or_default();
+                let fields = fields.entry(record.layer.to_string()).or_default();
                 for (key, value) in &record.attrs {
                     if !key.starts_with('_') {
                         let kind = match value {
@@ -3251,7 +4096,7 @@ mod tests {
                             _ => "Number",
                         };
                         fields
-                            .entry(key.clone())
+                            .entry(key.to_string())
                             .and_modify(|old| {
                                 if old != kind {
                                     *old = "String".into();
@@ -3403,7 +4248,7 @@ mod tests {
         // budget small enough to spill several runs.
         let layers = ["poi", "zzz_custom", "building", "aaa_custom", "water"];
         let mut expected = vec![];
-        let mut sorter = store.sorter(0, 600);
+        let mut sorter = store.sorter(0, &SortBudget::fixed(600));
         for i in 0..200u64 {
             let mut r = record(i % 3);
             r.tile_id = (i * 7) % 4;
@@ -3439,12 +4284,62 @@ mod tests {
     }
 
     #[test]
+    fn merge_plan_merges_only_the_smallest_runs_it_needs() {
+        let f = MERGE_FAN_IN;
+        assert!(merge_plan(&vec![1; f]).is_empty());
+        // One run too many: the two smallest become one.
+        let mut sizes = (0..=f as u64).map(|run| 1000 - run).collect::<Vec<_>>();
+        assert_eq!(merge_plan(&sizes), vec![vec![f, f - 1]]);
+        // Many small early runs and a few large ones: only small ones merge.
+        sizes = [vec![8; 3 * f], vec![1 << 20; 40]].concat();
+        let plan = merge_plan(&sizes);
+        assert!(plan.iter().flatten().all(|&run| sizes[run] == 8));
+        let left = sizes.len() - plan.iter().map(Vec::len).sum::<usize>() + plan.len();
+        assert_eq!(left, f);
+        assert!(plan.iter().all(|group| (2..=f).contains(&group.len())));
+        // More than one pass can reach: every run, in groups of at most f.
+        sizes = vec![1; f * f + 1];
+        let plan = merge_plan(&sizes);
+        assert_eq!(plan.len(), f + 1);
+        assert_eq!(plan.iter().map(Vec::len).sum::<usize>(), sizes.len());
+        assert!(plan.iter().all(|group| group.len() <= f));
+        let mut runs = plan.concat();
+        runs.sort_unstable();
+        assert!(runs.iter().copied().eq(0..sizes.len()));
+    }
+
+    #[test]
+    fn sort_budget_grows_after_many_runs_up_to_its_memory() {
+        let entry = size_of::<SortEntry>() as u64;
+        let budget = SortBudget::new(100, Some(4 * 10_000), 4);
+        // Runs below `GROW_AFTER_RUNS` keep the floor.
+        for run in 1..GROW_AFTER_RUNS as u64 {
+            assert_eq!(budget.after_spill(100, run * 100, run), 100);
+        }
+        // Then a run is as large as the sorter's earlier ones together.
+        assert_eq!(budget.after_spill(100, 300, 3), 300);
+        assert_eq!(budget.after_spill(300, 600, 6), 600);
+        // Up to the worker's 10,000 bytes, less its entries and their spare
+        // capacity: records of 100 frame bytes leave 100 / (100 + 2 * 32).
+        let ceiling = (10_000 * 100 / (100 + 2 * entry)) as usize;
+        assert_eq!(budget.after_spill(600, 100 << 14, 1 << 14), ceiling);
+        // Never below the floor, however little memory there is.
+        let starved = SortBudget::new(100, Some(10), 4);
+        starved.runs.store(GROW_AFTER_RUNS, AtomicOrdering::Relaxed);
+        assert_eq!(starved.after_spill(100, 1 << 20, 1 << 14), 100);
+        // Unknown memory keeps the floor too.
+        let unknown = SortBudget::new(100, None, 4);
+        unknown.runs.store(GROW_AFTER_RUNS, AtomicOrdering::Relaxed);
+        assert_eq!(unknown.after_spill(100, 1 << 20, 1 << 14), 100);
+    }
+
+    #[test]
     fn opaque_merge_orders_equal_keys_by_sequence_across_multiple_passes() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = Store::new(temp.path()).unwrap();
         // Equal sort keys; sequences are interleaved across runs and workers.
         for run in 0..20u64 {
-            let mut sorter = store.sorter(run as usize, usize::MAX);
+            let mut sorter = store.sorter(run as usize, &SortBudget::fixed(usize::MAX));
             for offset in 0..3u64 {
                 let sequence = offset * 20 + run;
                 let mut r = record(7);
@@ -3473,6 +4368,102 @@ mod tests {
         .unwrap();
         assert_eq!(values, (0..60).map(AttrValue::Int).collect::<Vec<_>>());
     }
+    /// Runs whose records interleave across tiles and runs, each run many
+    /// blocks long.
+    fn interleaved_runs(temp: &Path) -> Store {
+        let mut store = Store::new(temp).unwrap();
+        for worker in 0..6u64 {
+            let mut sorter = store.sorter(worker as usize, &SortBudget::fixed(400 * 300));
+            for i in 0..1500u64 {
+                let mut r = record(i);
+                r.tile_id = (i * i * 7 + worker * 13) % 9000 / 30;
+                r.attrs.insert(
+                    "padding".into(),
+                    AttrValue::String("x".repeat((i % 97) as usize * 3)),
+                );
+                sorter
+                    .add(EncodedRecord::encode(&r, seq(worker * 10_000 + i)).unwrap())
+                    .unwrap();
+            }
+            store.add_runs(sorter.finish().unwrap());
+        }
+        store
+    }
+
+    #[test]
+    fn prefetched_merge_gives_the_records_of_one_merge() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = interleaved_runs(temp.path());
+        assert!(store.runs.len() > 6, "{} runs", store.runs.len());
+        let mut expected = vec![];
+        merge(&store.runs, |r| {
+            expected.push((r.key, r.payload));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(expected.len(), 6 * 1500);
+        for decoders in [1, 2, 3, 16] {
+            let mut found = vec![];
+            merge_prefetched(&store.runs, decoders, &Control::detached(), |r| {
+                found.push((r.key, r.payload));
+                Ok(())
+            })
+            .unwrap();
+            assert!(found == expected, "{decoders} decoders");
+        }
+        merge_prefetched(&[], 4, &Control::detached(), |_| panic!("no records")).unwrap();
+    }
+
+    #[test]
+    fn prefetched_merge_stops_on_the_first_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = interleaved_runs(temp.path());
+        // The consumer failing while decoders still run.
+        let mut emitted = 0;
+        let result = merge_prefetched(&store.runs, 4, &Control::detached(), |_| {
+            emitted += 1;
+            if emitted == 100 {
+                Err("writer failed".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err("writer failed".into()));
+        assert_eq!(emitted, 100);
+        // A run damaged past its first block fails the merge where the merge
+        // reaches the damage, after every record before it.
+        let damaged = temp.path().join("damaged");
+        let mut bytes = fs::read(&store.runs[1]).unwrap();
+        let cut = bytes.len() * 2 / 3;
+        bytes.truncate(cut);
+        fs::write(&damaged, &bytes).unwrap();
+        let mut runs = store.runs.clone();
+        runs[1] = damaged;
+        let mut serial = 0;
+        let serial_error = merge(&runs, |_| {
+            serial += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        let mut prefetched = 0;
+        let prefetched_error = merge_prefetched(&runs, 3, &Control::detached(), |_| {
+            prefetched += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(prefetched_error, serial_error);
+        assert!(prefetched > 0);
+        assert_eq!(prefetched, serial);
+        // A run that cannot be opened.
+        let mut runs = store.runs.clone();
+        runs[2] = temp.path().join("missing");
+        assert!(
+            merge_prefetched(&runs, 2, &Control::detached(), |_| Ok(()))
+                .unwrap_err()
+                .contains("missing")
+        );
+    }
+
     /// A test job: sleep `millis`, then succeed or fail with `error`
     /// (`"panic"` panics). The job's index is its result.
     type TestJob = (usize, u64, Option<&'static str>);
@@ -3730,7 +4721,7 @@ mod tests {
     /// Sorts records into one run owned by `store`; the position in `records`
     /// plus `first` is the insertion sequence.
     fn add_run(store: &mut Store, worker: usize, first: u64, records: Vec<Record>) {
-        let mut sorter = store.sorter(worker, usize::MAX);
+        let mut sorter = store.sorter(worker, &SortBudget::fixed(usize::MAX));
         for (offset, r) in records.iter().enumerate() {
             sorter
                 .add(EncodedRecord::encode(r, seq(first + offset as u64)).unwrap())
@@ -3745,7 +4736,7 @@ mod tests {
             id,
             layer: "poi".into(),
             geometry: TileGeometry::Point(vec![TilePoint::new(20, 20)]),
-            attrs: BTreeMap::new(),
+            attrs: AttrMap::new(),
             sort_key: 0,
             grid_size: 64.,
             grid_cell: Some((0, 0)),
@@ -3755,7 +4746,7 @@ mod tests {
     }
     fn polygon_record(layer: &str, zoom: u8, id: u64, x: i32) -> Record {
         let mut r = record(id);
-        r.layer = layer.into();
+        r.layer = layer.to_owned().into();
         r.zoom = zoom;
         r.grid_size = 0.;
         r.grid_cell = None;
@@ -4076,14 +5067,14 @@ mod tests {
         simplify_merged_lines(&mut paths, 1.6);
         assert_eq!(paths, vec![vec![p(0, 0), p(4, 0)]]);
         assert_eq!(
-            line_merge_policy("boundary", 8, &BTreeMap::new()),
+            line_merge_policy("boundary", 8, &AttrMap::new()),
             Some((1. / 16., 4.))
         );
     }
 
     #[test]
     fn transportation_name_length_threshold_matches_pinned_profile() {
-        let mut attrs = BTreeMap::new();
+        let mut attrs = AttrMap::new();
         attrs.insert("name".into(), AttrValue::String("A😀".into()));
         assert_eq!(
             line_merge_policy("transportation_name", 12, &attrs),
@@ -4184,5 +5175,730 @@ mod tests {
         });
         let path = std::env::var("OSM_TILE_COMPILER_BUILDING_STAGES").unwrap();
         std::fs::write(path, serde_json::to_vec_pretty(&output).unwrap()).unwrap();
+    }
+}
+
+/// With the `benchmark-profiling` feature and `OTC_MERGE_DUMP=<path>`, every
+/// dissolve group is appended to that file as one JSON line, for the offline
+/// merge benchmark (`merge_replay` below).
+#[cfg(feature = "benchmark-profiling")]
+pub(super) mod merge_dump {
+    use crate::tile_geometry::TileRingGroup;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    static FILE: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+
+    pub(in crate::omt) fn record(
+        layer: &str,
+        zoom: u8,
+        tile_id: u64,
+        distance: f64,
+        members: &[Vec<TileRingGroup>],
+    ) {
+        let Some(file) = FILE.get_or_init(|| {
+            std::env::var_os("OTC_MERGE_DUMP").map(|p| {
+                Mutex::new(std::io::BufWriter::new(
+                    std::fs::File::create(p).expect("merge dump file"),
+                ))
+            })
+        }) else {
+            return;
+        };
+        let geoms: Vec<Vec<Vec<Vec<[i32; 2]>>>> = members
+            .iter()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .map(|g| {
+                        std::iter::once(&g.exterior)
+                            .chain(g.holes.iter())
+                            .map(|r| r.iter().map(|p| [p.x, p.y]).collect())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let line = serde_json::json!({
+            "layer": layer, "zoom": zoom, "tile": tile_id, "distance": distance, "geoms": geoms
+        });
+        let mut f = file.lock().unwrap();
+        writeln!(f, "{line}").unwrap();
+        f.flush().unwrap();
+    }
+}
+
+/// Offline replay of dissolve groups dumped with `OTC_MERGE_DUMP`:
+/// `OTC_BENCH_GROUPS=<file> [OTC_BENCH_LAYER=building] cargo test --release
+/// --lib merge_replay -- --ignored --nocapture`.
+#[cfg(test)]
+mod merge_replay {
+    use super::*;
+    use std::time::Instant;
+
+    // The binary's allocator, so that replay timings match a compile's.
+    #[cfg(feature = "mimalloc")]
+    #[global_allocator]
+    static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+    #[derive(Deserialize)]
+    struct Group {
+        layer: String,
+        distance: f64,
+        geoms: Vec<Vec<Vec<Vec<[i32; 2]>>>>,
+    }
+
+    fn to_geo(member: &[Vec<Vec<[i32; 2]>>]) -> MultiPolygon<f64> {
+        let line = |r: &Vec<[i32; 2]>| {
+            LineString(
+                r.iter()
+                    .map(|p| Coord {
+                        x: f64::from(p[0]),
+                        y: f64::from(p[1]),
+                    })
+                    .collect(),
+            )
+        };
+        MultiPolygon(
+            member
+                .iter()
+                .map(|rings| Polygon::new(line(&rings[0]), rings[1..].iter().map(line).collect()))
+                .collect(),
+        )
+    }
+
+    fn groups() -> Option<Vec<(f64, Vec<MultiPolygon<f64>>)>> {
+        let path = std::env::var("OTC_BENCH_GROUPS").ok()?;
+        let only = std::env::var("OTC_BENCH_LAYER").ok();
+        let text = fs::read_to_string(path).unwrap();
+        Some(
+            text.lines()
+                .map(|line| serde_json::from_str::<Group>(line).unwrap())
+                .filter(|g| only.as_ref().is_none_or(|l| *l == g.layer))
+                .map(|g| {
+                    (
+                        g.distance * 16.,
+                        g.geoms.iter().map(|m| to_geo(m)).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Every pair of members whose boxes come within the distance gets the
+    /// same answer from `within_distance` as from geo's distance.
+    #[test]
+    #[ignore]
+    fn merge_replay_proximity_matches_geo() {
+        let Some(groups) = groups() else { return };
+        let (mut pairs, mut differ) = (0usize, 0usize);
+        let (mut geo_secs, mut ours_secs) = (0., 0.);
+        for (distance, geoms) in &groups {
+            let bounds: Vec<_> = geoms.iter().map(|g| g.bounding_rect()).collect();
+            for i in 0..geoms.len() {
+                for j in i + 1..geoms.len() {
+                    let (Some(a), Some(b)) = (bounds[i], bounds[j]) else {
+                        continue;
+                    };
+                    if b.min().x > a.max().x + distance
+                        || a.min().x > b.max().x + distance
+                        || b.min().y > a.max().y + distance
+                        || b.max().y < a.min().y - distance
+                    {
+                        continue;
+                    }
+                    pairs += 1;
+                    let started = Instant::now();
+                    let reference = Euclidean.distance(&geoms[i], &geoms[j]) <= *distance;
+                    geo_secs += started.elapsed().as_secs_f64();
+                    let started = Instant::now();
+                    let ours = within_distance(&geoms[i], &geoms[j], *distance);
+                    ours_secs += started.elapsed().as_secs_f64();
+                    if ours != reference {
+                        differ += 1;
+                        if differ <= 5 {
+                            println!("differs (geo {reference}): {:?} {:?}", geoms[i], geoms[j]);
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "pairs {pairs}, differing {differ}, geo {geo_secs:.2}s, within_distance {ours_secs:.2}s"
+        );
+        assert_eq!(differ, 0);
+    }
+
+    thread_local! {
+        /// Makes `merge_nearby` ask geo's distance, as before `within_distance`.
+        pub(super) static GEO_PROXIMITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Times the full dissolve (proximity, buffer, union, unbuffer, snap)
+    /// over the dumped groups on one thread, with each proximity test.
+    #[test]
+    #[ignore]
+    fn merge_replay_timing() {
+        let Some(groups) = groups() else { return };
+        let variants: &[bool] = if std::env::var_os("OTC_BENCH_GEO").is_some() {
+            &[true, false]
+        } else {
+            &[false]
+        };
+        for &geo in variants {
+            GEO_PROXIMITY.with(|g| g.set(geo));
+            replay_dissolve(
+                &groups,
+                if geo {
+                    "geo proximity"
+                } else {
+                    "within_distance"
+                },
+            );
+        }
+        GEO_PROXIMITY.with(|g| g.set(false));
+    }
+
+    fn replay_dissolve(groups: &[(f64, Vec<MultiPolygon<f64>>)], label: &str) {
+        use std::hash::{Hash, Hasher};
+        // A digest of every merged cluster's coordinates, in order, so that two
+        // builds can be compared bit for bit.
+        let mut digest = std::collections::hash_map::DefaultHasher::new();
+        let hash = |digest: &mut std::collections::hash_map::DefaultHasher,
+                    g: &MultiPolygon<f64>| {
+            for p in &g.0 {
+                for ring in std::iter::once(p.exterior()).chain(p.interiors()) {
+                    ring.0.len().hash(digest);
+                    for c in &ring.0 {
+                        (c.x.to_bits(), c.y.to_bits()).hash(digest);
+                    }
+                }
+            }
+        };
+        let only_small = std::env::var_os("OTC_BENCH_SMALL").is_some();
+        let mut total = 0.;
+        for (distance, geoms) in groups.iter().cloned() {
+            let geoms = if only_small {
+                // Clusters of at most five members, each run on its own.
+                let mut out = Vec::new();
+                for (members, ..) in merge_nearby_collect(&geoms, distance) {
+                    if (2..=5).contains(&members.len()) {
+                        out.push(members.iter().map(|&i| geoms[i].clone()).collect());
+                    }
+                }
+                out
+            } else {
+                vec![geoms]
+            };
+            for geoms in geoms {
+                let started = Instant::now();
+                let clusters = merge_nearby(geoms, distance);
+                let mut snapped = Vec::new();
+                for (members, merged, jts) in &clusters {
+                    if members.len() > 1 && *jts {
+                        snapped.push(super::super::jts_buffer::snap_and_fix(merged));
+                    }
+                }
+                total += started.elapsed().as_secs_f64();
+                for (members, merged, jts) in &clusters {
+                    members.hash(&mut digest);
+                    jts.hash(&mut digest);
+                    hash(&mut digest, merged);
+                }
+                for s in snapped.iter().flatten() {
+                    hash(&mut digest, s);
+                }
+            }
+        }
+        println!(
+            "{label}: dissolve total {total:.2}s, digest {:016x}",
+            digest.finish()
+        );
+    }
+
+    /// Stage times of the positive-distance dissolve, by cluster size and by
+    /// whether the area filter then drops the whole cluster, and how often
+    /// cheap bounds on the output's area would have predicted the drop.
+    #[test]
+    #[ignore]
+    fn merge_replay_stages() {
+        use super::super::jts_buffer as jts;
+        use geo::ConvexHull;
+        let Some(groups) = groups() else { return };
+        let min_area: f64 = std::env::var("OTC_BENCH_MIN_AREA")
+            .ok()
+            .map_or(4., |v| v.parse().unwrap())
+            * 256.;
+        #[derive(Default, Clone)]
+        struct Row {
+            clusters: usize,
+            buffer: f64,
+            union: f64,
+            unbuffer: f64,
+            snap: f64,
+            hull: f64,
+            hull_pred: usize,
+            hull_pred_secs: f64,
+            env_pred: usize,
+            sum_pred: usize,
+        }
+        // [bucket][dropped]
+        let mut rows = vec![[Row::default(), Row::default()]; 5];
+        let mut proximity = 0.;
+        let (mut singles, mut singles_dropped) = (0usize, 0usize);
+        let mut worst_ratio = 0_f64;
+        let mut violations = 0usize;
+        let mut worst_excess = f64::MIN;
+        let mut ratio_hist = [0usize; 12];
+        let mut sound = [[(0usize, 0f64, 0usize, 0usize); 3]; 3];
+        let mut sound_cost = 0.;
+        const THRESHOLDS: [f64; 8] = [0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25];
+        let mut sweep = [[(0usize, 0f64, 0f64); 8]; 3];
+        for (distance, geoms) in &groups {
+            if *distance <= 0. {
+                continue;
+            }
+            let started = Instant::now();
+            let clusters = merge_nearby_collect(geoms, *distance);
+            proximity += started.elapsed().as_secs_f64();
+            for (members, ..) in clusters {
+                if members.len() == 1 {
+                    singles += 1;
+                    let a = geoms[members[0]]
+                        .0
+                        .iter()
+                        .map(|p| Polygon::new(p.exterior().clone(), vec![]).unsigned_area())
+                        .fold(0., f64::max);
+                    if a <= min_area {
+                        singles_dropped += 1;
+                    }
+                    continue;
+                }
+                let cluster: Vec<MultiPolygon<f64>> =
+                    members.iter().map(|&i| geoms[i].clone()).collect();
+                let t0 = Instant::now();
+                let expanded = cluster
+                    .iter()
+                    .map(|g| jts::buffer(g, *distance))
+                    .collect::<Option<Vec<_>>>();
+                let t1 = Instant::now();
+                let Some(expanded) = expanded else { continue };
+                let Some(u) = jts::union(&expanded) else {
+                    continue;
+                };
+                let t2 = Instant::now();
+                let Some(merged) = jts::buffer(&u, -*distance) else {
+                    continue;
+                };
+                let t3 = Instant::now();
+                let envelope = merged
+                    .bounding_rect()
+                    .map_or(0., |r| r.width() * r.height());
+                let rings = if envelope < min_area {
+                    vec![]
+                } else {
+                    jts::snap_and_fix(&merged)
+                        .map(from_grid_polygons)
+                        .unwrap_or_else(|| from_polygons(merged.clone()))
+                };
+                let t4 = Instant::now();
+                // largest exterior area out
+                let out_max = to_polygons(&rings)
+                    .0
+                    .iter()
+                    .map(|p| Polygon::new(p.exterior().clone(), vec![]).unsigned_area())
+                    .fold(0., f64::max);
+                let dropped = filter_tile_polygon_areas(rings, min_area, min_area).is_empty();
+                // bounds
+                let t5 = Instant::now();
+                let all = geo::MultiPoint::from(
+                    cluster
+                        .iter()
+                        .flat_map(|g| {
+                            g.0.iter()
+                                .flat_map(|p| p.exterior().0.iter().map(|c| geo::Point::from(*c)))
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let hull = all.convex_hull();
+                let hull_area = hull.unsigned_area();
+                let t6 = Instant::now();
+                let perimeter: f64 = hull
+                    .exterior()
+                    .0
+                    .windows(2)
+                    .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
+                    .sum();
+                let hull_bound = hull_area + perimeter * 1. + 4.;
+                let env = all.bounding_rect().map_or(0., |r| r.width() * r.height());
+                let sum_buffered: f64 = expanded.iter().map(|g| g.unsigned_area()).sum();
+                // Sound bounds from the buffered members (see findings): the
+                // unbuffered union lies in the erosion of any convex superset.
+                let t7 = Instant::now();
+                let dd = *distance - 1.;
+                let bpts = geo::MultiPoint::from(
+                    expanded
+                        .iter()
+                        .flat_map(|g| {
+                            g.0.iter()
+                                .flat_map(|p| p.exterior().0.iter().map(|c| geo::Point::from(*c)))
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let bhull = bpts.convex_hull();
+                let bhull_area = bhull.unsigned_area();
+                let iso_bound = (bhull_area.sqrt() - dd * std::f64::consts::PI.sqrt())
+                    .max(0.)
+                    .powi(2);
+                // The hull eroded by the distance less 0.8 (rounding and input
+                // simplification slack): its edges' half-planes moved inwards.
+                // Andrew's monotone chain, strictly convex, counter-clockwise.
+                let chain = {
+                    let mut pts: Vec<Coord<f64>> = bpts.0.iter().map(|p| p.0).collect();
+                    pts.sort_unstable_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+                    pts.dedup();
+                    let cross = |o: Coord<f64>, a: Coord<f64>, b: Coord<f64>| {
+                        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+                    };
+                    let mut h: Vec<Coord<f64>> = Vec::with_capacity(pts.len() + 1);
+                    for pass in 0..2 {
+                        let start = h.len();
+                        let it: Box<dyn Iterator<Item = &Coord<f64>>> = if pass == 0 {
+                            Box::new(pts.iter())
+                        } else {
+                            Box::new(pts.iter().rev())
+                        };
+                        for &p in it {
+                            while h.len() >= start + 2
+                                && cross(h[h.len() - 2], h[h.len() - 1], p) <= 0.
+                            {
+                                h.pop();
+                            }
+                            h.push(p);
+                        }
+                        h.pop();
+                    }
+                    let first = h[0];
+                    h.push(first);
+                    h
+                };
+                let erode = |amount: f64| {
+                    let ring = &chain;
+                    let sign = 1.;
+                    let mut poly: Vec<Coord<f64>> = ring[..ring.len() - 1].to_vec();
+                    for e in ring.windows(2) {
+                        let (dx, dy) = (e[1].x - e[0].x, e[1].y - e[0].y);
+                        let len = dx.hypot(dy);
+                        if len == 0. {
+                            continue;
+                        }
+                        let (nx, ny) = (-dy / len * sign, dx / len * sign);
+                        let side =
+                            |c: &Coord<f64>| (c.x - e[0].x) * nx + (c.y - e[0].y) * ny - amount;
+                        let mut next = Vec::with_capacity(poly.len() + 1);
+                        for i in 0..poly.len() {
+                            let (p, q) = (poly[i], poly[(i + 1) % poly.len()]);
+                            let (sp, sq) = (side(&p), side(&q));
+                            if sp >= 0. {
+                                next.push(p);
+                            }
+                            if (sp >= 0.) != (sq >= 0.) {
+                                let t = sp / (sp - sq);
+                                next.push(Coord {
+                                    x: p.x + t * (q.x - p.x),
+                                    y: p.y + t * (q.y - p.y),
+                                });
+                            }
+                        }
+                        poly = next;
+                        if poly.len() < 3 {
+                            return 0.;
+                        }
+                    }
+                    let mut twice = 0.;
+                    for i in 0..poly.len() {
+                        let (p, q) = (poly[i], poly[(i + 1) % poly.len()]);
+                        twice += p.x * q.y - q.x * p.y;
+                    }
+                    twice.abs() / 2.
+                };
+                let env_bound = erode(*distance - 0.8);
+                let iso_bound = iso_bound.min(erode(*distance - 2.));
+                let t8 = Instant::now();
+                let size = usize::from(members.len() > 2) + usize::from(members.len() > 5);
+                for (k, bound) in [env_bound, iso_bound, env_bound.min(iso_bound)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if bound <= min_area {
+                        sound[size][k].0 += 1;
+                        sound[size][k].1 += (t4 - t1).as_secs_f64();
+                        if !dropped {
+                            sound[size][k].2 += 1;
+                        }
+                    }
+                    if out_max > bound {
+                        sound[size][k].3 += 1;
+                    }
+                }
+                sound_cost += (t8 - t7).as_secs_f64();
+                if out_max > env_bound.min(iso_bound) + 1e-9 {
+                    println!(
+                        "VIOLATION members {} out_max {out_max} hull-erode(d-0.8) {env_bound} other {iso_bound} hull {bhull_area}",
+                        members.len()
+                    );
+                    println!(
+                        "INPUT {}",
+                        serde_json::to_string(
+                            &cluster
+                                .iter()
+                                .map(|g| g
+                                    .0
+                                    .iter()
+                                    .map(|p| std::iter::once(p.exterior())
+                                        .chain(p.interiors())
+                                        .map(|r| r.0.iter().map(|c| [c.x, c.y]).collect::<Vec<_>>())
+                                        .collect::<Vec<_>>())
+                                    .collect::<Vec<_>>())
+                                .collect::<Vec<_>>()
+                        )
+                        .unwrap()
+                    );
+                    for (name, g) in [("UNION", &u), ("MERGED", &merged)] {
+                        println!(
+                            "{name} {}",
+                            serde_json::to_string(
+                                &g.0.iter()
+                                    .map(|p| std::iter::once(p.exterior())
+                                        .chain(p.interiors())
+                                        .map(|r| r.0.iter().map(|c| [c.x, c.y]).collect::<Vec<_>>())
+                                        .collect::<Vec<_>>())
+                                    .collect::<Vec<_>>()
+                            )
+                            .unwrap()
+                        );
+                    }
+                }
+                let bucket = match members.len() {
+                    2 => 0,
+                    3..=5 => 1,
+                    6..=20 => 2,
+                    21..=100 => 3,
+                    _ => 4,
+                };
+                let row = &mut rows[bucket][usize::from(dropped)];
+                row.clusters += 1;
+                row.buffer += (t1 - t0).as_secs_f64();
+                row.union += (t2 - t1).as_secs_f64();
+                row.unbuffer += (t3 - t2).as_secs_f64();
+                row.snap += (t4 - t3).as_secs_f64();
+                row.hull += (t6 - t5).as_secs_f64();
+                if hull_bound <= min_area {
+                    row.hull_pred += 1;
+                    row.hull_pred_secs += (t4 - t0).as_secs_f64();
+                    if !dropped {
+                        violations += 1;
+                    }
+                }
+                if env <= min_area {
+                    row.env_pred += 1;
+                }
+                if sum_buffered <= min_area {
+                    row.sum_pred += 1;
+                }
+                {
+                    let secs = (t4 - t0).as_secs_f64();
+                    let size = usize::from(members.len() > 2) + usize::from(members.len() > 5);
+                    for (k, t) in THRESHOLDS.iter().enumerate() {
+                        if hull_bound <= *t * min_area {
+                            sweep[size][k].0 += 1;
+                            sweep[size][k].1 += secs;
+                            sweep[size][k].2 = sweep[size][k].2.max(out_max);
+                        }
+                    }
+                }
+                if hull_area > 0. {
+                    let ratio = out_max / hull_area;
+                    worst_ratio = worst_ratio.max(ratio);
+                    worst_excess = worst_excess.max(out_max - hull_bound);
+                    let slot = ((ratio * 10.) as usize).min(11);
+                    ratio_hist[slot] += 1;
+                }
+            }
+        }
+        println!(
+            "proximity {proximity:.2}s; singletons {singles}, of which dropped by area {singles_dropped}"
+        );
+        println!(
+            "bucket dropped clusters buffer union unbuffer snap | hull_time hull_pred hull_pred_secs env_pred sumbuf_pred"
+        );
+        for (b, name) in ["2", "3-5", "6-20", "21-100", ">100"].iter().enumerate() {
+            for (d, r) in rows[b].iter().enumerate() {
+                println!(
+                    "{name:>7} {d} {:>7} {:6.2} {:6.2} {:6.2} {:6.2} | {:5.2} {:>7} {:6.2} {:>7} {:>7}",
+                    r.clusters,
+                    r.buffer,
+                    r.union,
+                    r.unbuffer,
+                    r.snap,
+                    r.hull,
+                    r.hull_pred,
+                    r.hull_pred_secs,
+                    r.env_pred,
+                    r.sum_pred
+                );
+            }
+        }
+        for (size, name) in ["2", "3-5", ">5"].iter().enumerate() {
+            for (k, t) in THRESHOLDS.iter().enumerate() {
+                let (n, secs, max_out) = sweep[size][k];
+                println!(
+                    "members {name}: hull_bound <= {t} x min_area: {n} clusters, {secs:.2}s, largest output exterior {:.3} x min_area",
+                    max_out / min_area
+                );
+            }
+        }
+        for (size, name) in ["2", "3-5", ">5"].iter().enumerate() {
+            for (k, bound) in ["hull eroded d-0.8", "iso or hull eroded d-2", "either"]
+                .iter()
+                .enumerate()
+            {
+                let (n, secs, wrong, exceeded) = sound[size][k];
+                println!(
+                    "sound {bound}, members {name}: {n} clusters skip union+unbuffer+snap, {secs:.2}s saved, {wrong} wrongly skipped, {exceeded} outputs above the bound"
+                );
+            }
+        }
+        println!("sound bounds cost {sound_cost:.2}s");
+        println!(
+            "hull bound violations {violations}; worst out/hull area ratio {worst_ratio:.4}; worst out - hull_bound {worst_excess:.2}; ratio histogram {ratio_hist:?}"
+        );
+    }
+
+    /// Checks the early-out bounds on every merged cluster of the dumped
+    /// groups: no polygon the full dissolve keeps may have an exterior above
+    /// either bound, and reports how many clusters each bound skips and the
+    /// single-thread time the dissolve spends on them.
+    #[test]
+    #[ignore]
+    fn merge_replay_drop_bounds() {
+        use super::super::jts_buffer as jts;
+        let Some(groups) = groups() else { return };
+        let min_area: f64 = std::env::var("OTC_BENCH_MIN_AREA")
+            .ok()
+            .map_or(4., |v| v.parse().unwrap())
+            * 256.;
+        let overlay_buffer = |g: &MultiPolygon<f64>, amount: f64| {
+            g.buffer_with_style(
+                BufferStyle::new(amount).line_join(LineJoin::Miter(2. * (1_f64 / 5.).asin())),
+            )
+        };
+        let (mut merged_clusters, mut fallbacks) = (0usize, 0usize);
+        let (mut before_skips, mut after_skips) = (0usize, 0usize);
+        let (mut before_secs, mut after_secs, mut total_secs) = (0., 0., 0.);
+        let (mut bound_secs, mut buffer_secs_skipped) = (0., 0.);
+        let (mut above_before, mut above_after, mut wrong) = (0usize, 0usize, 0usize);
+        let (mut worst_before, mut worst_after) = (0_f64, 0_f64);
+        for (distance, geoms) in &groups {
+            if *distance <= 1. {
+                continue;
+            }
+            for (members, ..) in merge_nearby_collect(geoms, *distance) {
+                if members.len() == 1 {
+                    continue;
+                }
+                merged_clusters += 1;
+                let cluster: Vec<MultiPolygon<f64>> =
+                    members.iter().map(|&i| geoms[i].clone()).collect();
+                let t0 = Instant::now();
+                let before = jts::pre_buffer_bound(&cluster, *distance);
+                let t1 = Instant::now();
+                let after = jts::post_buffer_bound(&cluster, *distance);
+                for g in &cluster {
+                    let _ = jts::buffer(g, *distance);
+                }
+                let t2 = Instant::now();
+                let merged = match jts::buffer_union_unbuffer(&cluster, *distance, 0.) {
+                    Some(m) => m,
+                    None => {
+                        fallbacks += 1;
+                        overlay_buffer_union_unbuffer(&cluster, *distance, overlay_buffer)
+                    }
+                };
+                let envelope = merged
+                    .bounding_rect()
+                    .map_or(0., |r| r.width() * r.height());
+                let rings = if envelope < min_area {
+                    vec![]
+                } else {
+                    jts::snap_and_fix(&merged)
+                        .map(from_grid_polygons)
+                        .unwrap_or_else(|| from_polygons(merged.clone()))
+                };
+                let t3 = Instant::now();
+                let kept = filter_tile_polygon_areas(rings, min_area, min_area);
+                let out_max = to_polygons(&kept)
+                    .0
+                    .iter()
+                    .map(|p| Polygon::new(p.exterior().clone(), vec![]).unsigned_area())
+                    .fold(0., f64::max);
+                let secs = (t3 - t2).as_secs_f64() + (t2 - t1).as_secs_f64();
+                total_secs += secs;
+                bound_secs += (t1 - t0).as_secs_f64();
+                let after = after.unwrap_or(f64::INFINITY);
+                if out_max > before + 1e-9 {
+                    above_before += 1;
+                }
+                if out_max > after + 1e-9 {
+                    above_after += 1;
+                }
+                if out_max > 0. {
+                    worst_before = worst_before.max(out_max / before);
+                    worst_after = worst_after.max(out_max / after);
+                }
+                if before <= min_area {
+                    before_skips += 1;
+                    before_secs += secs;
+                    buffer_secs_skipped += (t2 - t1).as_secs_f64();
+                    if !kept.is_empty() {
+                        wrong += 1;
+                    }
+                } else if after <= min_area {
+                    after_skips += 1;
+                    after_secs += secs - (t2 - t1).as_secs_f64();
+                    if !kept.is_empty() {
+                        wrong += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "{merged_clusters} merged clusters, {fallbacks} through the overlay fallback, {total_secs:.2}s buffer to snap"
+        );
+        println!(
+            "before buffering: {before_skips} skipped, {before_secs:.2}s saved, of which buffer {buffer_secs_skipped:.2}s"
+        );
+        println!("after buffering only: {after_skips} more skipped, {after_secs:.2}s saved");
+        println!("bound before buffering costs {bound_secs:.2}s");
+        println!(
+            "outputs above the bound before buffering {above_before}, after {above_after}; wrongly skipped {wrong}; worst output/bound {worst_before:.4} and {worst_after:.4}"
+        );
+        assert_eq!((above_before, above_after, wrong), (0, 0, 0));
+    }
+
+    /// The proximity clusters' members, without merging them.
+    fn merge_nearby_collect(
+        geoms: &[MultiPolygon<f64>],
+        distance: f64,
+    ) -> Vec<(Vec<usize>, MultiPolygon<f64>, bool)> {
+        COLLECT_ONLY.with(|c| c.set(true));
+        let result = merge_nearby(geoms.to_vec(), distance);
+        COLLECT_ONLY.with(|c| c.set(false));
+        result
+    }
+
+    thread_local! {
+        /// Makes `merge_nearby` return each cluster's members unmerged.
+        pub(super) static COLLECT_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 }

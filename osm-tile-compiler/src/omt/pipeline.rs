@@ -9,7 +9,7 @@ use super::{
     ingest::Job,
     render,
     selection::Selection,
-    store::{EncodedRecord, MetadataSummary, Seq, Sorter, Store},
+    store::{EncodedRecord, MetadataSummary, Seq, SortBudget, Sorter, Store},
     types::{Feature, Source},
 };
 use crate::compile_area::Region;
@@ -26,12 +26,20 @@ use std::{
     time::Duration,
 };
 
-// In-memory sort budget per worker, counted in spilled frame bytes. It is
-// fixed, not divided among workers, so the number of spilled runs follows the
+// Starting in-memory sort budget per worker, counted in spilled frame bytes.
+// It is not divided among workers, so the number of spilled runs follows the
 // data size rather than the thread count. Compact frames hold about four times
 // as many records per byte as the earlier format did at 32 MiB, so 8 MiB keeps
 // the records per run, the run count and the peak memory where they were.
+// Compiles that spill many runs grow it (`SortBudget`).
 const WORKER_SORT_BYTES: usize = 8 * 1024 * 1024;
+
+/// The memory the tile sort's buffers may hold together: `requested`, or
+/// else half of what the machine has available when rendering starts. The
+/// other half is left to what the compile already holds and still grows.
+pub(super) fn sort_memory(requested: Option<u64>) -> Option<u64> {
+    requested.or_else(|| crate::memory::available_bytes().map(|bytes| bytes / 2))
+}
 // Features travel in small batches: a wake-up per feature costs the producer
 // more than rendering most features does.
 const BATCH_FEATURES: usize = 16;
@@ -88,18 +96,19 @@ impl Pipeline {
     pub fn new(
         store: &Store,
         threads: usize,
+        sort_memory: Option<u64>,
         region: Region,
-        min_zoom: u8,
-        max_zoom: u8,
+        zooms: (u8, u8),
         selection: Arc<Selection>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self, String> {
+        let budget = SortBudget::new(WORKER_SORT_BYTES, sort_memory, threads);
         Self::with_budget(
             store,
             threads,
-            WORKER_SORT_BYTES,
+            Arc::new(budget),
             region,
-            (min_zoom, max_zoom),
+            zooms,
             selection,
             cancelled,
         )
@@ -108,7 +117,7 @@ impl Pipeline {
     fn with_budget(
         store: &Store,
         threads: usize,
-        worker_budget: usize,
+        worker_budget: Arc<SortBudget>,
         region: impl Into<Region>,
         (min_zoom, max_zoom): (u8, u8),
         selection: Arc<Selection>,
@@ -130,7 +139,7 @@ impl Pipeline {
         // On a spawn error `pipeline` drops, which stops and joins any workers.
         for worker in 0..threads {
             let receiver = receiver.clone();
-            let sorter = store.sorter(worker, worker_budget);
+            let sorter = store.sorter(worker, &worker_budget);
             let shared = pipeline.shared.clone();
             let region = region.clone();
             let selection = selection.clone();
@@ -191,7 +200,10 @@ impl Pipeline {
             Ok(()) => Ok(()),
             // Only time the main thread when it actually has to wait.
             Err(TrySendError::Full(work)) => {
-                self.blocked.measure(|| sender.send(work)).map_err(drop)
+                crate::stage_profile::time(crate::stage_profile::Counter::RenderQueueFull, || {
+                    self.blocked.measure(|| sender.send(work))
+                })
+                .map_err(drop)
             }
             Err(TrySendError::Disconnected(_)) => Err(()),
         };
@@ -472,7 +484,10 @@ fn work(
             // spilled.
             return Err((u64::MAX, crate::control::CANCELLED.into()));
         }
-        if let Err(failure) = busy.measure(|| worker.handle(work)) {
+        let handled = crate::stage_profile::time(crate::stage_profile::Counter::RenderBusy, || {
+            busy.measure(|| worker.handle(work))
+        });
+        if let Err(failure) = handled {
             shared.failed.store(true, Ordering::Relaxed);
             shared.progress.notify_all();
             return Err(failure);
@@ -565,14 +580,20 @@ mod tests {
             .collect::<Vec<_>>();
         let mut archives = Vec::new();
         // The tiny budget makes every worker spill many runs.
-        for (threads, budget) in [(1, WORKER_SORT_BYTES), (3, 4096), (7, 1)] {
+        for (threads, budget) in [(1, WORKER_SORT_BYTES), (3, 4096), (7, 1), (2, 0)] {
             let workspace = temp.path().join(format!("work-{threads}"));
             fs::create_dir(&workspace).unwrap();
             let mut store = Store::new(&workspace).unwrap();
+            // Budget 0 starts at one byte and grows: past `GROW_AFTER_RUNS`
+            // each run is as large as the worker's earlier ones together.
+            let limits = match budget {
+                0 => Arc::new(SortBudget::new(1, Some(1 << 30), threads)),
+                budget => SortBudget::fixed(budget),
+            };
             let mut pipeline = Pipeline::with_budget(
                 &store,
                 threads,
-                budget,
+                limits,
                 bounds,
                 (2, 4),
                 Default::default(),
@@ -611,6 +632,7 @@ mod tests {
         }
         assert_eq!(archives[0], archives[1]);
         assert_eq!(archives[0], archives[2]);
+        assert_eq!(archives[0], archives[3]);
     }
 
     #[test]
@@ -622,7 +644,7 @@ mod tests {
         let mut pipeline = Pipeline::with_budget(
             &store,
             3,
-            1,
+            SortBudget::fixed(1),
             bounds,
             (2, 4),
             Default::default(),
@@ -665,7 +687,7 @@ mod tests {
         let mut pipeline = Pipeline::with_budget(
             &store,
             3,
-            1,
+            SortBudget::fixed(1),
             bounds,
             (2, 4),
             Default::default(),
@@ -701,7 +723,7 @@ mod tests {
         let mut pipeline = Pipeline::with_budget(
             &store,
             2,
-            1,
+            SortBudget::fixed(1),
             bounds,
             (2, 4),
             Default::default(),

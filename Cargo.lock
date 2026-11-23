@@ -1335,6 +1335,7 @@ dependencies = [
  "hex",
  "i_overlay 9.2.0",
  "icu_experimental",
+ "libc",
  "libmimalloc-sys",
  "mimalloc",
  "osm-pbf-ingest",
