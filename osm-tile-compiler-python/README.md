@@ -86,8 +86,13 @@ GeoJSON or `.poly` file), `read` (`"whole_extract"`, `"near_area"`), `center`
 `gzip_level`, `min_zoom`, `max_zoom`, `threads`, `layers` or `exclude_layers`
 (names from `LAYERS`), `languages`, `building_levels`, `search_index`,
 `tile_format` (`"mvt"`, the default, or `"mlt"` for MapLibre Tiles), `sar`,
-`sort_memory`. It returns `archive`, `format`, `bounds`, `building_levels`
-and `search_index` (each a path or None),
+`sort_memory`, `schema`, and `data_layers`: a list of dicts that add layers of
+other vector data (GeoJSON, CSV, Shapefile, GeoPackage, FlatGeobuf,
+GeoParquet), such as
+`{"layer": "stations", "source": {"path": "stations.csv"}, "min_zoom": 12}`
+(the form is in the repository's `docs/data-layers.md`).
+It returns `archive`, `format`, `bounds`, `building_levels` and
+`search_index` (each a path or None),
 `result` (the compile's statistics), `supplemental_inputs`,
 `omitted_sources` and `manifest` (the `basemap-manifest` document).
 

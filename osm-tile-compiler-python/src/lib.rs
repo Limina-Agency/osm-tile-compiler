@@ -340,6 +340,7 @@ struct CompileOptions {
     sar: bool,
     sort_memory: Option<u64>,
     schema: Option<String>,
+    data_layers: Vec<osm_tile_compiler::DataLayer>,
 }
 
 fn basemap_request(
@@ -443,6 +444,7 @@ fn basemap_request(
         request.schema =
             osm_tile_compiler::TileSchema::from_name_or_path(schema).map_err(invalid)?;
     }
+    request.data_layers = options.data_layers;
     request.validate()?;
     Ok(request)
 }
@@ -461,6 +463,23 @@ fn compile_output(output: &BasemapOutput) -> Value {
     })
 }
 
+/// The data layers a Python list of dicts describes, as the Rust
+/// `DataLayer` reads them from JSON.
+fn data_layers_from(
+    py: Python<'_>,
+    layers: &Bound<'_, PyAny>,
+) -> PyResult<Vec<osm_tile_compiler::DataLayer>> {
+    let json = py.import("json")?;
+    let options = pyo3::types::PyDict::new(py);
+    // Paths may be pathlib.Path objects.
+    options.set_item("default", py.import("builtins")?.getattr("str")?)?;
+    let text: String = json
+        .call_method("dumps", (layers,), Some(&options))?
+        .extract()?;
+    serde_json::from_str(&text)
+        .map_err(|error| to_py_err(py, &invalid(format!("data_layers: {error}"))))
+}
+
 /// Compiles an `.osm.pbf` extract into an OpenMapTiles basemap archive
 /// (PMTiles or MBTiles, by `format` or the output's extension).
 #[pyfunction]
@@ -472,7 +491,7 @@ fn compile_output(output: &BasemapOutput) -> Value {
     attribution = None, gzip_level = None, min_zoom = None, max_zoom = None, threads = None,
     layers = None, exclude_layers = None, languages = None, building_levels = false,
     search_index = false, tile_format = "mvt".to_string(), sar = false, sort_memory = None, schema = None,
-    progress = None, cancel = None,
+    data_layers = None, progress = None, cancel = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn compile(
@@ -505,9 +524,14 @@ fn compile(
     sar: bool,
     sort_memory: Option<u64>,
     schema: Option<String>,
+    data_layers: Option<Bound<'_, PyAny>>,
     progress: Option<Bound<'_, PyAny>>,
     cancel: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
+    let data_layers = match data_layers {
+        Some(layers) => data_layers_from(py, &layers)?,
+        None => Vec::new(),
+    };
     let options = CompileOptions {
         extra_inputs,
         format,
@@ -533,6 +557,7 @@ fn compile(
         sar,
         sort_memory,
         schema,
+        data_layers,
     };
     let request = basemap_request(input_pbf, output, sources, temp_dir, options)
         .map_err(|error| to_py_err(py, &error))?;

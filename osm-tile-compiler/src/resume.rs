@@ -95,6 +95,9 @@ pub(crate) struct Rendered {
     /// resumed compile gives again.
     pub warnings: Vec<String>,
     pub osm_data: OsmDataInfo,
+    /// What each data layer read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_layers: Vec<crate::DataLayerReport>,
 }
 
 /// The tile sort's runs and layer metadata, in the sort directory.
@@ -484,6 +487,12 @@ pub(crate) fn fingerprint(
         .chain(
             used.iter()
                 .map(|dataset| request.sources.join(dataset.file_name())),
+        )
+        .chain(
+            request
+                .data_layers
+                .iter()
+                .flat_map(|data| data.source.files()),
         );
     for file in files {
         add(&format!("{file:?}={:?}", FileIdentity::of(&file)));

@@ -16,6 +16,12 @@ targets = [
 
 [advisories]
 version = 2
+ignore = [
+    # chrono is unmaintained (no vulnerability). It comes in only through
+    # parquet, which requires it, for the `geoparquet` feature; drop this
+    # once parquet moves off it.
+    { id = "RUSTSEC-2026-0543", reason = "chrono, unmaintained, required by parquet (geoparquet feature)" },
+]
 
 [licenses]
 version = 2
@@ -31,6 +37,8 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "CDLA-Permissive-2.0",
+    # crs-definitions' EPSG table (the `reproject` feature).
+    "CC0-1.0",
 ]
 
 [bans]

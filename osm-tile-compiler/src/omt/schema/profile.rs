@@ -718,6 +718,13 @@ impl LayerFilter {
         Ok(Self { layers })
     }
 
+    /// The same filter, also keeping the features of these data layers.
+    /// [`Self::layers`] still lists only the schema's.
+    pub fn with_data_layers<'a>(mut self, names: impl IntoIterator<Item = &'a str>) -> Self {
+        self.layers.extend(names.into_iter().map(String::from));
+        self
+    }
+
     /// The layers written, in the schema's order.
     pub fn layers<'a>(&self, schema: &'a Schema) -> Vec<&'a str> {
         schema

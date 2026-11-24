@@ -89,6 +89,8 @@ pub(crate) const COMMANDS: &[Command] = &[
             ("--merge-cache", Flag),
             ("--reuse-from", File),
             ("--resume", Flag),
+            ("--data", Text),
+            ("--data-layers", File),
         ],
     },
     Command {
@@ -145,6 +147,12 @@ pub(crate) const COMMANDS: &[Command] = &[
     Command {
         name: "inspect",
         about: "Describe a PMTiles archive",
+        arguments: File,
+        options: &[("--json", Flag)],
+    },
+    Command {
+        name: "data-info",
+        about: "Describe a vector data file as compile --data reads it",
         arguments: File,
         options: &[("--json", Flag)],
     },

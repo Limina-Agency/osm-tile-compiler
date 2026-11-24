@@ -1,6 +1,6 @@
 # Type stubs for the extension module; the docstrings are in __init__.py and
 # the README.
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
 from typing import Any, Literal
 
@@ -77,6 +77,7 @@ def compile(
     sar: bool = False,
     sort_memory: int | None = None,
     schema: str | None = None,
+    data_layers: Sequence[Mapping[str, Any]] | None = None,
     progress: Callable[[Progress], object] | None = None,
     cancel: _Cancel = None,
 ) -> _Report: ...

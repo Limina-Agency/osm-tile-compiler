@@ -60,6 +60,10 @@ struct CompilerProcessRequest {
     /// How each tile is compressed, `gzip` or `none` [default: gzip].
     #[serde(default)]
     tile_compression: osm_tile_compiler::TileCompression,
+    /// Layers of other vector data (`BasemapRequest::data_layers`), with
+    /// snake_case or camelCase keys [default: none].
+    #[serde(default)]
+    data_layers: Vec<osm_tile_compiler::DataLayer>,
 }
 
 /// Reads the request at `path`: the compile it asks for, and where to write
@@ -112,5 +116,6 @@ pub fn read(path: &Path) -> Result<(BasemapRequest, PathBuf), String> {
         compile.schema = osm_tile_compiler::TileSchema::from_name_or_path(&name)?;
     }
     compile.archive.tile_compression = request.tile_compression;
+    compile.data_layers = request.data_layers;
     Ok((compile, request.manifest_path))
 }

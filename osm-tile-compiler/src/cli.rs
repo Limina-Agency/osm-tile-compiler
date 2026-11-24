@@ -26,6 +26,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod data_layers;
 mod search;
 
 const NAME: &str = "osm-tile-compiler";
@@ -51,6 +52,7 @@ Usage:
   osm-tile-compiler schema layers <FILE.yml|shortbread|openmaptiles>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar] [--tile-format <F>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
+  osm-tile-compiler data-info <FILE>[,<KEY>=<VALUE>...] [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--sign <KEY>] [--changed-tiles <FILE>] [--json]
@@ -81,6 +83,7 @@ Usage:
   osm-tile-compiler schema layers <FILE.yml|shortbread|openmaptiles>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar] [--tile-format <F>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
+  osm-tile-compiler data-info <FILE>[,<KEY>=<VALUE>...] [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--sign <KEY>] [--changed-tiles <FILE>] [--json]
@@ -119,6 +122,9 @@ Commands:
                    write it to a directory with its fonts and icons instead
   inspect          Describe a PMTiles archive: header, metadata, tile sizes per
                    zoom and the largest tiles, and any problems 'verify' finds
+  data-info        Describe a vector data file as compile --data reads it:
+                   its format, coordinate system, features, bounds in WGS84
+                   and attributes; takes the same keys as --data
   verify           Check a PMTiles archive's layout and every tile's MVT or
                    MLT encoding; exits with 1 if anything is wrong
   extract          Cut an area out of a PMTiles archive into a new one: the
@@ -247,6 +253,24 @@ Compile options:
                         all, '-xx' leaves one out (so 'default,-ru'), and an
                         empty list writes none. name, name_en, name_de,
                         name_int, name:latin and name:nonlatin stay
+  --data <LAYER>=<FILE>[,<KEY>=<VALUE>...]
+                        Also write the features of FILE as the layer LAYER:
+                        GeoJSON (.geojson, .json), newline-delimited GeoJSON
+                        (.geojsonl, .ndjson), CSV (.csv, .tsv), Shapefile
+                        (.shp), GeoPackage (.gpkg), FlatGeobuf (.fgb) or
+                        GeoParquet (.parquet). Repeat for more layers. Keys:
+                        format, table (GeoPackage), crs (EPSG:<code>, a PROJ
+                        string or WKT, over what the file says), zoom=<MIN>-<MAX>
+                        or min-zoom and max-zoom, attributes=<A|B> (keep
+                        only these), exclude=<A|B>, rename=<FROM:TO|...>,
+                        id (the attribute for feature ids), attribution, and
+                        for CSV lon, lat, geometry (WKT or hex WKB) and
+                        delimiter. Coordinates are reprojected to WGS84
+  --data-layers <FILE.json>
+                        Also write the data layers a JSON file lists: an
+                        array of objects with layer, source (path, format,
+                        crs, ...), min_zoom, max_zoom and attributes, as
+                        docs/data-layers.md describes
   --changes <FILE>      Experimental: apply an OSM change file (.osc, .osc.gz)
                         to the input before compiling; repeat for more, oldest
                         first. The input itself is left as it is
@@ -465,6 +489,7 @@ struct CompileArgs {
     sign_delta: Option<PathBuf>,
     merge_cache: osm_tile_compiler::MergeCacheOptions,
     schema: osm_tile_compiler::TileSchema,
+    data_layers: Vec<osm_tile_compiler::DataLayer>,
 }
 
 /// The change files and replication server `compile` and `update` apply.
@@ -587,6 +612,10 @@ enum Command {
         archive: PathBuf,
         json: bool,
     },
+    DataInfo {
+        spec: String,
+        json: bool,
+    },
     Verify {
         archive: PathBuf,
         json: bool,
@@ -688,6 +717,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         }
         Command::Style(args) => style(args),
         Command::Inspect { archive, json } => inspect(&archive, json),
+        Command::DataInfo { spec, json } => data_layers::info(&spec, json),
         Command::Verify { archive, json } => verify(&archive, json),
         Command::Extract(args) => extract(*args),
         Command::Diff(args) => diff(args),
@@ -745,6 +775,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("schema") => parse_schema(rest),
         Some("style") => parse_style(rest),
         Some(name @ ("inspect" | "verify")) => parse_archive_command(name, rest),
+        Some("data-info") => parse_data_info(rest),
         Some("extract") => parse_extract(rest),
         Some(name @ ("diff" | "apply")) => parse_delta_command(name, rest),
         Some("update") => parse_update(rest),
@@ -905,6 +936,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut profile = None;
     let mut only_layers = None;
     let mut excluded_layers = None;
+    let mut data_layers = Vec::new();
     let mut languages = None;
     let mut schema = osm_tile_compiler::TileSchema::OpenMapTiles;
     let mut changes = ChangeArgs::default();
@@ -1038,6 +1070,13 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 let list = list(value(&mut args, &flag)?);
                 resolve_languages(&list).map_err(|e| format!("--languages: {}", e.message()))?;
                 languages = Some(list);
+            }
+            "--data" => {
+                let spec = value(&mut args, &flag)?.to_string_lossy().into_owned();
+                data_layers.push(data_layers::parse(&spec)?);
+            }
+            "--data-layers" => {
+                data_layers.extend(data_layers::read_file(Path::new(value(&mut args, &flag)?))?);
             }
             "--delta-from" => delta_from = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--sign-delta" => sign_delta = Some(PathBuf::from(value(&mut args, &flag)?)),
@@ -1182,6 +1221,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         sign_delta,
         merge_cache,
         schema,
+        data_layers,
     })))
 }
 
@@ -1411,6 +1451,24 @@ fn parse_archive_command(name: &str, args: &[OsString]) -> Result<Command, Strin
     } else {
         Command::Verify { archive, json }
     })
+}
+
+fn parse_data_info(args: &[OsString]) -> Result<Command, String> {
+    let mut spec = None;
+    let mut json = false;
+    for arg in args {
+        match option(arg).as_deref() {
+            Some("--help" | "-h") => return Ok(Command::Help),
+            Some("--json") => json = true,
+            Some(flag) => return Err(format!("unknown data-info option '{flag}'")),
+            None if spec.is_some() => {
+                return Err("data-info takes one file".into());
+            }
+            None => spec = Some(arg.to_string_lossy().into_owned()),
+        }
+    }
+    let spec = spec.ok_or("data-info needs a file")?;
+    Ok(Command::DataInfo { spec, json })
 }
 
 fn parse_extract(args: &[OsString]) -> Result<Command, String> {
@@ -2280,6 +2338,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.merge_cache = args.merge_cache;
     request.schema = args.schema;
     request.resume = args.resume;
+    request.data_layers = args.data_layers;
     if args.resume && osm_tile_compiler::checkpoint_directory(&request).is_dir() {
         status.line(&format!(
             "Resuming from the checkpoint in {}",
@@ -2387,6 +2446,21 @@ fn report_compile(status: &mut Status, output: &osm_tile_compiler::BasemapOutput
             "Largest tile: {} at {}",
             largest.tile,
             kib(largest.bytes)
+        ));
+    }
+    for data in &result.data_layers {
+        status.line(&format!(
+            "Data layer {}: {} features from {} ({}, {}){}",
+            data.layer,
+            data.read.features,
+            data.file,
+            data.format,
+            data.read.crs,
+            match (data.read.outside_bounds, data.read.without_geometry) {
+                (0, 0) => String::new(),
+                (outside, empty) =>
+                    format!("; skipped {outside} outside the area, {empty} without geometry"),
+            }
         ));
     }
     if let Some(cache) = &result.merge_cache {

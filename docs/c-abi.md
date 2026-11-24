@@ -137,7 +137,11 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
   "buildingLevels": false,
   "sar": false,
   "resume": false,
-  "schema": "openmaptiles"
+  "schema": "openmaptiles",
+  "dataLayers": [
+    { "layer": "stations", "source": { "path": "/…/stations.csv" }, "minZoom": 12 },
+    { "layer": "parcels", "source": { "path": "/…/parcels.gpkg", "table": "parcels", "crs": "EPSG:2180" } }
+  ]
 }
 ```
 
@@ -162,7 +166,10 @@ from the last stage completed, with the same archive. `schema` is
 `openmaptiles` (the default), `shortbread`, the path of a YAML schema, or
 `{"yaml": "..."}` holding the schema's text ([schemas.md](schemas.md)); with
 another schema, `layers` names its layers, and `sar`, `languages` and
-`buildingLevels` are refused.
+`buildingLevels` are refused. `dataLayers` adds
+layers of other vector data (GeoJSON, CSV, Shapefile, GeoPackage, FlatGeobuf,
+GeoParquet) to the archive, in the form [data-layers.md](data-layers.md)
+gives; the C ABI library is built with every reader and reprojection.
 
 The result is the basemap manifest the worker writes (`format`,
 `formatVersion`, `schema`, `version`, `result`, `supplementalInputs`,

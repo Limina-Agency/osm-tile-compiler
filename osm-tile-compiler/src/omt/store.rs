@@ -187,8 +187,8 @@ pub(super) struct ArchiveHeader<'a> {
     pub options: &'a ArchiveOptions,
     pub min_zoom: u8,
     pub max_zoom: u8,
-    /// The layers the metadata declares, in `LAYERS` order (or the
-    /// schema's).
+    /// The layers the metadata declares: the profile's (in `LAYERS` order,
+    /// or the schema's), then the data layers.
     pub layers: &'a [&'a str],
     /// The configured schema the tiles follow, or `None` for OpenMapTiles,
     /// whose post-processing and metadata apply only then.
@@ -197,6 +197,8 @@ pub(super) struct ArchiveHeader<'a> {
     pub omitted_sources: &'a [&'static str],
     /// How current the OSM data is, for the metadata.
     pub osm_data: &'a super::OsmDataInfo,
+    /// The metadata's `data_layers`: what each data layer was read from.
+    pub data_layers: &'a [serde_json::Value],
 }
 
 #[cfg(test)]
@@ -224,6 +226,7 @@ impl ArchiveHeader<'static> {
             schema: None,
             omitted_sources: &[],
             osm_data: &OSM_DATA,
+            data_layers: &[],
         }
     }
 }
@@ -1207,6 +1210,7 @@ impl Store {
             options,
             header.omitted_sources,
             header.osm_data,
+            header.data_layers,
         );
         let mut archive = archive.open_writer(&ArchiveSpec {
             bounds,
@@ -1849,6 +1853,7 @@ pub(super) fn metadata_for_test(header: &ArchiveHeader) -> serde_json::Value {
         header.options,
         header.omitted_sources,
         header.osm_data,
+        header.data_layers,
     ))
     .unwrap()
 }
@@ -1866,6 +1871,7 @@ fn metadata(
     options: &ArchiveOptions,
     omitted_sources: &[&str],
     osm_data: &super::OsmDataInfo,
+    data_layers: &[serde_json::Value],
 ) -> String {
     if let Some(schema) = schema {
         return schema_metadata(
@@ -1876,6 +1882,7 @@ fn metadata(
             options,
             omitted_sources,
             osm_data,
+            data_layers,
         );
     }
     let layers_written = layers;
@@ -1910,6 +1917,10 @@ fn metadata(
     if !omitted_sources.is_empty() {
         metadata["omitted_sources"] = serde_json::json!(omitted_sources);
     }
+    // And only one with data layers says where they came from.
+    if !data_layers.is_empty() {
+        metadata["data_layers"] = serde_json::json!(data_layers);
+    }
     // Likewise only an archive with the opt-in layer names its schema.
     if layers_written.contains(&super::sar::LAYER) {
         metadata["sar_schema"] = serde_json::json!(super::sar::SCHEMA_VERSION);
@@ -1934,6 +1945,7 @@ fn osm_metadata(metadata: &mut serde_json::Value, osm_data: &super::OsmDataInfo)
 /// The metadata of an archive a configured schema made. Its name,
 /// description and attribution are the schema's unless the request set
 /// them; there is no OpenMapTiles version or Planetiler commit to give.
+#[allow(clippy::too_many_arguments)]
 fn schema_metadata(
     schema: &super::schema::Schema,
     layers: &[&str],
@@ -1942,6 +1954,7 @@ fn schema_metadata(
     options: &ArchiveOptions,
     omitted_sources: &[&str],
     osm_data: &super::OsmDataInfo,
+    data_layers: &[serde_json::Value],
 ) -> String {
     let defaults = ArchiveOptions::default();
     let pick = |set: &str, default: &str, own: Option<&str>, fallback: &str| -> String {
@@ -1993,6 +2006,9 @@ fn schema_metadata(
     if !omitted_sources.is_empty() {
         metadata["omitted_sources"] = serde_json::json!(omitted_sources);
     }
+    if !data_layers.is_empty() {
+        metadata["data_layers"] = serde_json::json!(data_layers);
+    }
     metadata.to_string()
 }
 
@@ -2000,7 +2016,7 @@ fn schema_metadata(
 type LayerFields = BTreeMap<String, BTreeMap<String, String>>;
 
 /// The attribution of a schema that gives none: the data's own.
-const OSM_ATTRIBUTION: &str = "<a href=\"https://www.openstreetmap.org/copyright\" \
+pub(super) const OSM_ATTRIBUTION: &str = "<a href=\"https://www.openstreetmap.org/copyright\" \
 target=\"_blank\">&copy; OpenStreetMap contributors</a>";
 
 struct EncodeTimings {

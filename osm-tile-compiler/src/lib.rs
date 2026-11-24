@@ -87,6 +87,7 @@ mod compile_area;
 mod compile_bounds;
 mod control;
 mod coordinate_groups;
+mod data_sources;
 mod extracts;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -123,6 +124,10 @@ pub use building_levels::{
 pub use compile_area::CompileArea;
 pub use compile_bounds::{ArchiveCenter, CompileBounds};
 pub use control::{CompileError, CompileProgress, CompileStage};
+pub use data_sources::{
+    CsvColumns, DataFormat, DataInput, DataLayer, DataLayerReport, DataReadReport, PropertyValue,
+    SourceFeature,
+};
 pub use extracts::{
     Extract, ExtractEvent, GEOFABRIK_INDEX_URL, fetch_extract, fetch_extract_from, find_extract,
     parse_index,
