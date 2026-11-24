@@ -163,7 +163,7 @@ pub struct ArchiveOptions {
     pub attribution: String,
     /// The gzip level of the tiles, 0 (stored) to 9 (smallest, slowest).
     pub gzip_level: u32,
-    /// How the tiles are encoded: MVT, or (experimental) MLT.
+    /// How the tiles are encoded: MVT or MLT.
     pub tile_format: crate::TileFormat,
     /// How each tile is compressed: gzip, or none (PMTiles only, and not
     /// with the merge cache).

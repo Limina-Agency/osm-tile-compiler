@@ -243,18 +243,6 @@ impl BasemapRequest {
                 self.output_format().name()
             )));
         }
-        if self.building_levels && self.archive.tile_format != crate::TileFormat::Mvt {
-            return Err(invalid(format!(
-                "building levels are read from MVT basemaps only, not {}",
-                self.archive.tile_format.name()
-            )));
-        }
-        if self.search_index && self.archive.tile_format != crate::TileFormat::Mvt {
-            return Err(invalid(format!(
-                "the search index is read from MVT basemaps only, not {}",
-                self.archive.tile_format.name()
-            )));
-        }
         let caching = self.merge_cache.write || self.merge_cache.reuse_from.is_some();
         if self.archive.tile_compression == crate::TileCompression::None {
             if self.output_format() != OutputFormat::PmTiles {

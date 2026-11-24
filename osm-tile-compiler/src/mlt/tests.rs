@@ -1,3 +1,4 @@
+use super::decode::json::{geojson, same};
 use super::decode::{self, Geometry as G, UNSUPPORTED, Value};
 use super::*;
 use fast_mvt::{MvtCoord, MvtGeomType, MvtLayerBuilder};
@@ -11,94 +12,50 @@ fn coords(points: &[(i32, i32)]) -> Vec<MvtCoord> {
 
 /// The fixtures directory, which a packaged crate doesn't have.
 fn fixtures() -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/mlt-synthetic");
+    fixtures_in("mlt-synthetic")
+}
+
+fn fixtures_in(name: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../fixtures")
+        .join(name);
     dir.is_dir().then_some(dir)
 }
 
-/// The fixtures' features as `decode` reads them, written as the fixtures'
-/// JSON: GeoJSON with each feature's `_layer` and `_extent` among its
-/// properties and polygon rings closed.
-fn geojson(layers: &[decode::Layer]) -> Vec<Json> {
-    let point = |v: &[i32; 2]| serde_json::json!([v[0], v[1]]);
-    let path = |p: &Vec<[i32; 2]>| Json::Array(p.iter().map(point).collect());
-    let ring = |r: &Vec<[i32; 2]>| {
-        let mut ring = r.iter().map(point).collect::<Vec<_>>();
-        if let Some(first) = r.first() {
-            ring.push(point(first));
-        }
-        Json::Array(ring)
-    };
-    let polygon = |p: &Vec<Vec<[i32; 2]>>| Json::Array(p.iter().map(ring).collect());
-    let mut out = Vec::new();
-    for layer in layers {
-        for feature in &layer.features {
-            let (kind, coordinates) = match &feature.geometry {
-                G::Point(p) => ("Point", point(p)),
-                G::MultiPoint(m) => ("MultiPoint", Json::Array(m.iter().map(point).collect())),
-                G::LineString(l) => ("LineString", path(l)),
-                G::MultiLineString(m) => {
-                    ("MultiLineString", Json::Array(m.iter().map(path).collect()))
-                }
-                G::Polygon(p) => ("Polygon", polygon(p)),
-                G::MultiPolygon(m) => {
-                    ("MultiPolygon", Json::Array(m.iter().map(polygon).collect()))
-                }
-            };
-            let mut properties = serde_json::Map::new();
-            properties.insert("_extent".into(), layer.extent.into());
-            properties.insert("_layer".into(), layer.name.clone().into());
-            for (key, value) in &feature.properties {
-                let value = match value {
-                    Value::Bool(v) => Json::from(*v),
-                    Value::Int(v) => Json::from(*v),
-                    Value::UInt(v) => Json::from(*v),
-                    Value::String(v) => Json::from(v.clone()),
-                    Value::Float(v) => special(v.is_nan(), v.is_infinite(), *v < 0.0, "f32")
-                        .unwrap_or_else(|| Json::from(f64::from(*v))),
-                    Value::Double(v) => special(v.is_nan(), v.is_infinite(), *v < 0.0, "f64")
-                        .unwrap_or_else(|| Json::from(*v)),
-                };
-                properties.insert(key.clone(), value);
+/// Decodes every `.mlt` fixture in `dir` and compares it with its `.json`.
+/// With `skip_unsupported`, a fixture in an encoding the decoder doesn't
+/// read is counted rather than failed. Returns (checked, unsupported).
+fn check_fixtures(dir: &std::path::Path, skip_unsupported: bool) -> (usize, Vec<String>) {
+    let (mut checked, mut unsupported) = (0, Vec::new());
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("mlt"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let tile = std::fs::read(&path).unwrap();
+        let expected: Json =
+            serde_json::from_slice(&std::fs::read(path.with_extension("json")).unwrap()).unwrap();
+        let layers = match decode::decode(&tile) {
+            Ok(layers) => layers,
+            Err(e) if skip_unsupported && e.starts_with(UNSUPPORTED) => {
+                unsupported.push(name);
+                continue;
             }
-            let mut json = serde_json::json!({
-                "type": "Feature",
-                "properties": properties,
-                "geometry": {"type": kind, "coordinates": coordinates},
-            });
-            if let Some(id) = feature.id {
-                json["id"] = id.into();
-            }
-            out.push(json);
-        }
+            Err(e) => panic!("{}: {e}", path.display()),
+        };
+        let features = Json::Array(geojson(&layers));
+        assert!(
+            same(&features, &expected["features"]),
+            "{}:\n ours   {features}\n theirs {}",
+            path.display(),
+            expected["features"]
+        );
+        checked += 1;
     }
-    out
-}
-
-fn special(nan: bool, infinite: bool, negative: bool, kind: &str) -> Option<Json> {
-    match (nan, infinite, negative) {
-        (true, _, _) => Some(format!("{kind}::NAN").into()),
-        (_, true, false) => Some(format!("{kind}::INFINITY").into()),
-        (_, true, true) => Some(format!("{kind}::NEG_INFINITY").into()),
-        _ => None,
-    }
-}
-
-/// Whether two fixture values are the same, floats compared at the
-/// precision `ours` has.
-fn same(ours: &Json, theirs: &Json) -> bool {
-    match (ours, theirs) {
-        (Json::Number(a), Json::Number(b)) if a.is_f64() || b.is_f64() => {
-            let (a, b) = (a.as_f64().unwrap(), b.as_f64().unwrap());
-            a.to_bits() == b.to_bits() || (a as f32).to_bits() == (b as f32).to_bits()
-        }
-        (Json::Array(a), Json::Array(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b))
-        }
-        (Json::Object(a), Json::Object(b)) => {
-            a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| same(v, w)))
-        }
-        _ => ours == theirs,
-    }
+    (checked, unsupported)
 }
 
 #[test]
@@ -106,29 +63,37 @@ fn the_decoder_reads_the_specification_fixtures() {
     let Some(dir) = fixtures() else {
         return;
     };
-    let mut checked = 0;
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("mlt") {
-            continue;
-        }
-        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-        let tile = std::fs::read(&path).unwrap();
-        let expected: Json =
-            serde_json::from_slice(&std::fs::read(path.with_extension("json")).unwrap()).unwrap();
-        let layers = match decode::decode(&tile) {
-            Ok(layers) => layers,
-            Err(e) => panic!("{name}: {e}"),
-        };
-        let features = Json::Array(geojson(&layers));
-        assert!(
-            same(&features, &expected["features"]),
-            "{name}:\n ours   {features}\n theirs {}",
-            expected["features"]
+    let (checked, _) = check_fixtures(&dir, false);
+    assert!(checked >= 300, "only {checked} fixtures");
+    // The ones the Rust reference encoder writes in its own ways.
+    let (checked, _) = check_fixtures(&fixtures_in("mlt-synthetic-rust").unwrap(), false);
+    assert!(checked >= 116, "only {checked} Rust fixtures");
+}
+
+/// The fixtures of a checkout of maplibre-tile-spec, as they are now:
+/// `MLT_SPEC_FIXTURES` lists v1 fixture directories, such as its
+/// `test/synthetic/0x01` and `test/synthetic/0x01-rust`, separated by the
+/// platform's path separator. Every fixture in an encoding the decoder reads
+/// must decode to its JSON; the nightly workflow runs this against the
+/// specification's main branch (`scripts/check-mlt-spec.sh`).
+#[test]
+#[ignore = "needs MLT_SPEC_FIXTURES"]
+fn the_decoder_reads_the_current_specification_fixtures() {
+    let dirs = std::env::var_os("MLT_SPEC_FIXTURES").expect("MLT_SPEC_FIXTURES is not set");
+    for dir in std::env::split_paths(&dirs) {
+        let (checked, unsupported) = check_fixtures(&dir, true);
+        eprintln!(
+            "{}: {checked} fixtures decoded, {} in encodings the decoder doesn't read",
+            dir.display(),
+            unsupported.len()
         );
-        checked += 1;
+        eprintln!(
+            "unsupported in {}: {}",
+            dir.display(),
+            unsupported.join(" ")
+        );
+        assert!(checked > 0, "{}: no fixture decoded", dir.display());
     }
-    assert!(checked >= 290, "only {checked} fixtures");
 }
 
 /// Each layer of `tile` transcoded, then decoded, must hold what the MVT
@@ -136,6 +101,15 @@ fn the_decoder_reads_the_specification_fixtures() {
 fn round_trip(tile: &[u8]) -> Vec<u8> {
     let mlt = from_mvt(tile).unwrap();
     decode::same_as_mvt(&mlt, tile).unwrap();
+    // Back to MVT, the tile holds the same features, and encodes to the same
+    // MLT bytes again.
+    let back = to_mvt(&mlt).unwrap();
+    decode::same_as_mvt(&mlt, &back).unwrap();
+    assert_eq!(
+        from_mvt(&back).unwrap(),
+        mlt,
+        "MLT to MVT to MLT changed the tile"
+    );
     mlt
 }
 

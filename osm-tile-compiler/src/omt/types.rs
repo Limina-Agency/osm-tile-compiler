@@ -66,6 +66,12 @@ impl Source {
     }
 }
 
+/// The top of a feature's zooms when the profile leaves it open, as
+/// Planetiler's default `maxzoom` does: the feature reaches the archive's
+/// highest zoom, whatever that is. Rendering stops at the archive's top, so a
+/// zoom 14 archive gets exactly what it got when this was 14.
+pub const TOP: u8 = crate::ZoomRange::LIMIT;
+
 #[derive(Debug, Clone)]
 pub struct Feature {
     pub id: u64,
