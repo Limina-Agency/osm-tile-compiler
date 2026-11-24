@@ -171,8 +171,10 @@ Compile options:
                         zooms show only the area's surroundings
   --center <LON LAT Z>  Where viewers start [default: the middle of the area,
                         at the highest zoom that shows all of it]
-  --min-zoom <N>        Lowest zoom, 0-14 [default: 0]
-  --max-zoom <N>        Highest zoom, 0-14 [default: 14]
+  --min-zoom <N>        Lowest zoom, 0-16 [default: 0]
+  --max-zoom <N>        Highest zoom, 0-16 [default: 14]. Its tiles keep
+                        every detail; viewers overzoom them. Each zoom above
+                        14 takes about four times the tiles and time
   --threads <N>         Worker threads [default: available cores]
   --sort-memory <MIB>   Memory the tile sort may hold before it writes runs
                         to scratch, at least 8 MiB per thread [default: half
@@ -305,7 +307,7 @@ Update options (experimental):
                         after, with a quarter tile around it for labels; must
                         not exist yet
   --min-zoom <N>, --max-zoom <N>
-                        Zooms --changed-tiles lists [default: 0 and 14]
+                        Zooms --changed-tiles lists, 0-16 [default: 0 and 14]
   --json                Print the update report as JSON on stdout
   Changes to objects the input holds are always kept; new objects are kept
   when they are inside the box or reach into the extract. Rewritten blocks
@@ -823,7 +825,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut center = None;
     let mut archive = ArchiveOptions::default();
     let mut min_zoom = 0;
-    let mut max_zoom = 14;
+    let mut max_zoom = ZoomRange::DEFAULT_MAX_ZOOM;
     let mut threads = None;
     let mut sort_memory = None;
     let mut temp_dir = None;
@@ -901,9 +903,10 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                     *slot = number(arg, &flag)?;
                 }
                 let [longitude, latitude, zoom] = values;
-                if zoom.fract() != 0.0 || !(0.0..=14.0).contains(&zoom) {
+                if zoom.fract() != 0.0 || !(0.0..=f64::from(ZoomRange::LIMIT)).contains(&zoom) {
                     return Err(format!(
-                        "--center zoom must be a whole number 0-14, got {zoom}"
+                        "--center zoom must be a whole number 0-{}, got {zoom}",
+                        ZoomRange::LIMIT
                     ));
                 }
                 center = Some(ArchiveCenter::new(longitude, latitude, zoom as u8));
@@ -971,7 +974,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let zoom = ZoomRange::new(min_zoom, max_zoom).map_err(|_| {
         format!(
             "zooms must satisfy 0 <= --min-zoom <= --max-zoom <= {}, got {min_zoom} and {max_zoom}",
-            ZoomRange::MAX_ZOOM
+            ZoomRange::LIMIT
         )
     })?;
     let (layers, flag) = match (only_layers, excluded_layers) {
@@ -1149,7 +1152,7 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
             output: path,
             zooms: ZoomRange::new(
                 min_zoom.unwrap_or(0),
-                max_zoom.unwrap_or(ZoomRange::MAX_ZOOM),
+                max_zoom.unwrap_or(ZoomRange::DEFAULT_MAX_ZOOM),
             )
             .map_err(String::from)?,
         }),
@@ -2435,12 +2438,13 @@ fn extract(args: ExtractArgs) -> Result<(), String> {
         request.polygon = Some(osm_tile_compiler::CompileArea::read(polygon)?);
     }
     if args.min_zoom.is_some() || args.max_zoom.is_some() {
-        let max = args.max_zoom.unwrap_or(ZoomRange::MAX_ZOOM);
+        // Without --max-zoom, up to whatever the source holds.
+        let max = args.max_zoom.unwrap_or(ZoomRange::LIMIT);
         let min = args.min_zoom.unwrap_or(0).min(max);
         request.zoom = Some(ZoomRange::new(min, max).map_err(|_| {
             format!(
                 "zooms must satisfy 0 <= --min-zoom <= --max-zoom <= {}, got {min} and {max}",
-                ZoomRange::MAX_ZOOM
+                ZoomRange::LIMIT
             )
         })?);
     }

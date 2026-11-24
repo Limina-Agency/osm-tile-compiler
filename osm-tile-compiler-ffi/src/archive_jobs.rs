@@ -79,7 +79,7 @@ fn extract_request(request: Value) -> Result<(ExtractRequest, Option<PathBuf>), 
     let mut request = ExtractRequest::new(json.source, json.output);
     request.bounds = json.bounds.map(BoundsJson::checked).transpose()?;
     if let Some(zoom) = json.zoom {
-        let max = zoom.max.unwrap_or(ZoomRange::MAX_ZOOM);
+        let max = zoom.max.unwrap_or(ZoomRange::LIMIT);
         let min = zoom.min.unwrap_or(0);
         request.zoom = Some(ZoomRange::new(min, max)?);
     }
@@ -315,7 +315,7 @@ mod tests {
             refused(extract_work(request))
         };
         assert!(extract(json!({ "zoom": { "min": 9, "max": 3 } })).contains("zooms must satisfy"));
-        assert!(extract(json!({ "zoom": { "max": 15 } })).contains("zooms must satisfy"));
+        assert!(extract(json!({ "zoom": { "max": 17 } })).contains("zooms must satisfy"));
         assert!(
             extract(json!({ "bounds": { "north": 1.0, "south": 2.0, "east": 4.0, "west": 3.0 } }))
                 .contains("bounds must")

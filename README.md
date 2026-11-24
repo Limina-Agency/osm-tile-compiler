@@ -262,7 +262,27 @@ what lies near the area, besides the supplemental datasets.
 
 Viewers open the archive at the middle of the area, zoomed to show all of
 it, unless you pass `--center LON LAT ZOOM`. `--min-zoom` and `--max-zoom`
-narrow the zooms from 0 to 14.
+choose the zooms, 0 to 14 by default.
+
+`--max-zoom` goes up to 16, as Planetiler's `--maxzoom` does. The tiles at
+the highest zoom keep every detail and viewers overzoom them, so a zoom 14
+archive already serves any zoom; a higher top gives finer geometry (z14 is
+then simplified as the zooms below it are) and more, smaller tiles. Every
+feature that reaches z14 goes on to the top, and the output follows
+Planetiler's rules for a higher top, with one change: lake labels without a
+centerline go on above z14 too, where Planetiler stops them at z14. Berlin,
+four threads (4 cores, Linux):
+
+| `--max-zoom` | Time | Archive | Tiles | Planetiler 0.10.2 |
+|---|---|---|---|---|
+| 14 (default) | 13 s | 42 MB | 942 | 91 s, 41 MB |
+| 15 | 17 s | 84 MB | 3,282 | 97 s, 82 MB |
+| 16 | 21 s | 139 MB | 11,975 | 107 s, 135 MB |
+
+The memory a compile holds barely changes with the top zoom (about 390 MB
+here), since the tile sort spills to disk. Only zoom 14 at the top is part of
+the parity measurement (`parity_verified`); see `docs/parity.md` for z15 and
+z16.
 
 ### Layers and languages
 
@@ -446,7 +466,7 @@ Recompiling and diffing against the archive from before gave an 88 kB delta
 `update_extract`, built on `osm_pbf_ingest::changes`.
 
 `update --changed-tiles reach.txt` also writes which tiles the changes reach,
-one `z/x/y` per line at zooms 0 to 14 (`--min-zoom`, `--max-zoom`), the list
+one `z/x/y` per line at zooms 0 to 14 (`--min-zoom`, `--max-zoom`, up to 16), the list
 osm2pgsql's expiry writes and Tilekiln and other renderers regenerate from. It
 covers the boxes of every changed object before and after, of every way whose
 node moved, and of every multipolygon or boundary whose member changed,

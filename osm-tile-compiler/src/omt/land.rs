@@ -1,7 +1,7 @@
 //! OMT 3.16 source policy port from planetiler-openmaptiles 91516fdf.
 //! Per-tile polygon merging remains the renderer's responsibility (including
 //! landcover vertex-count-dependent grouping and z13 nearby building union).
-use super::types::{Feature, Source, java_meters, parse_number, parse_profile_double};
+use super::types::{Feature, Source, TOP, java_meters, parse_number, parse_profile_double};
 use serde_json::json;
 
 fn listed(value: &str, values: &str) -> bool {
@@ -129,8 +129,13 @@ pub fn process(source: &Source, out: &mut Vec<Feature>) {
             })
             .floor() as i32;
         if height < 3660 && min_height < 3660 {
-            let mut f =
-                Feature::new_original_geometry(source, "building", source.geometry.clone(), 13, 14);
+            let mut f = Feature::new_original_geometry(
+                source,
+                "building",
+                source.geometry.clone(),
+                13,
+                TOP,
+            );
             f.buffer_pixels = 4.0;
             f.min_size = 0.1;
             f.tolerance = 0.25;
@@ -180,11 +185,13 @@ pub fn process(source: &Source, out: &mut Vec<Feature>) {
         .find_map(|(key, values)| listed(source.tag(key), values).then_some(source.tag(key)))
         && let Some(class) = cover_class(subclass)
     {
-        for (min, max, size, tolerance) in [
-            (7, 9, 2.0, 0.25),
-            (10, 10, 4.0, 0.25),
-            (11, 13, 8.0, 0.1),
-            (14, 14, 0.0625, 0.0625),
+        // Above z13 the thresholds end and Planetiler's defaults apply: 1 pixel
+        // and 0.1 tolerance below the archive's top, 1/16 at it.
+        for (min, max, size, tolerance, at_max) in [
+            (7, 9, 2.0, 0.25, None),
+            (10, 10, 4.0, 0.25, None),
+            (11, 13, 8.0, 0.1, None),
+            (14, TOP, 1.0, 0.1, Some(0.0625)),
         ] {
             let mut f = Feature::new_original_geometry(
                 source,
@@ -195,9 +202,9 @@ pub fn process(source: &Source, out: &mut Vec<Feature>) {
             );
             f.buffer_pixels = 4.0;
             f.min_size = size;
-            f.min_size_at_max_zoom = size;
+            f.min_size_at_max_zoom = at_max.unwrap_or(size);
             f.tolerance = tolerance;
-            f.tolerance_at_max_zoom = tolerance;
+            f.tolerance_at_max_zoom = at_max.unwrap_or(tolerance);
             f.attrs.insert("class".into(), json!(class));
             f.attrs.insert("subclass".into(), json!(subclass));
             // Renderer replaces this marker with the zoom-simplified,
@@ -241,7 +248,7 @@ pub fn process(source: &Source, out: &mut Vec<Feature>) {
         } else {
             9
         };
-        for (lo, hi, size) in [(6, 6, 1.0), (7, 7, 2.0), (8, 13, 4.0), (14, 14, 0.0625)] {
+        for (lo, hi, size) in [(6, 6, 1.0), (7, 7, 2.0), (8, 13, 4.0), (14, TOP, 1.0)] {
             if hi < min {
                 continue;
             }

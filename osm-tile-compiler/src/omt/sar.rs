@@ -7,7 +7,7 @@
 //! matching feature is kept, since a missing shelter costs more than a
 //! crowded tile.
 use super::labels::{centroid_label_feature, elevation_meters};
-use super::types::{Feature, Source, add_names};
+use super::types::{Feature, Source, TOP, add_names};
 use serde_json::json;
 
 /// The layer's name in the archive.
@@ -164,7 +164,7 @@ fn point_class(source: &Source) -> Option<(Class, &str, u8)> {
 fn line(source: &Source) -> Option<Feature> {
     let (class, subclass, min_zoom) = line_class(source)?;
     let mut f =
-        Feature::new_original_geometry(source, LAYER, source.geometry.clone(), min_zoom, 14);
+        Feature::new_original_geometry(source, LAYER, source.geometry.clone(), min_zoom, TOP);
     common(source, &mut f, class, subclass);
     match class {
         Class::Hazard => {
@@ -418,7 +418,7 @@ mod tests {
             assert_eq!(f.layer, "sar");
             assert_eq!(text(&f, "class"), Some(class), "{tags:?}");
             assert_eq!(text(&f, "subclass"), Some(subclass), "{tags:?}");
-            assert_eq!((f.min_zoom, f.max_zoom), (zoom, 14), "{tags:?}");
+            assert_eq!((f.min_zoom, f.max_zoom), (zoom, TOP), "{tags:?}");
             assert_eq!(f.grid_limit, 0, "no label grid thins the layer");
             assert_eq!(f.id, 11);
         }

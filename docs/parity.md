@@ -389,6 +389,33 @@ All other differing polygons are inside the bar. Polygons invalid in native
 but valid in Planetiler are checked over every tile, not only the differing
 ones.
 
+## Above zoom 14: 2026-11-24
+
+`--max-zoom 15` and `16` measured on Berlin (2026-11-18 extract) against
+Planetiler 0.10.2 with the same `--maxzoom` and `--render-maxzoom`, every
+tile, with `compare.py --all-tiles` and `pairdiff.py`:
+
+- **z15**, built with Planetiler's literal z14 stop for lake labels: 51 of
+  3,273 tiles differ and every pair meets the bar, the same buildings,
+  landuse, POI names and motorway as at z14, accepted as there.
+- **z15 as shipped**: the same, plus 5,286 `water_name` points at z15 that
+  Planetiler does not write and 9 tiles that hold only those. Planetiler
+  ends a lake's label point at a literal z14 (`WaterName.java`, "maxzoom
+  ... : 14"), so a z15 or z16 archive would lose the labels of lakes without
+  a centerline above z14, which a z14 archive shows overzoomed; native
+  carries them to the top.
+- **z16 as shipped**: the lake labels again (5,293 at z16), and one POI
+  point (way 148247521, a pitch) one tile unit (0.15 m) from Planetiler's on
+  the four z16 tiles that hold it, a rounding difference like the accepted
+  motorway vertex. Nothing else is outside the bar.
+
+What changes above z14 follows Planetiler: features whose zoom range the
+profile leaves open reach the archive's top; the max zoom tolerance and
+minimum size (1/16 pixel) apply at the top only, and z14 gets the default 0.1
+pixel tolerance and 1 pixel minimum, which for a point is 0; line merging
+switches tolerance at the top; lines are kept at `max(top, 14) - z` extra
+bits until merged; park label ranks end with the label grid at z14.
+
 ## The bar
 
 `parity_verified` becomes `true` when, on Malopolskie and two more regions of

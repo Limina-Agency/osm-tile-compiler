@@ -77,11 +77,14 @@ thread_local! {
 }
 
 /// The hash of a layer's records, in the order the encoder receives them.
-pub(super) fn layer_key(tile_id: u64, name: &str, records: &[EncodedRecord]) -> Key {
+/// `top` is the zoom the post-processing treats as the archive's top, which
+/// changes how a layer merges.
+pub(super) fn layer_key(tile_id: u64, top: u8, name: &str, records: &[EncodedRecord]) -> Key {
     let mut hash = Sha256::new();
     hash.update((FINGERPRINT.len() as u64).to_le_bytes());
     hash.update(FINGERPRINT.as_bytes());
     hash.update(tile_id.to_le_bytes());
+    hash.update([top]);
     hash.update((name.len() as u64).to_le_bytes());
     hash.update(name.as_bytes());
     hash.update((records.len() as u64).to_le_bytes());
