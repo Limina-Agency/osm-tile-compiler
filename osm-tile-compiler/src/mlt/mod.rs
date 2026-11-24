@@ -116,6 +116,80 @@ pub(crate) fn from_mvt(tile: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Transcodes an uncompressed MLT tile back to MVT: one MVT layer per v1
+/// frame, in order, with the features' ids, geometries and attributes. What
+/// reads a basemap's tiles (the search index, building levels) reads an MLT
+/// archive through it, so it sees the MVT tile the MLT one was made from:
+/// [`from_mvt`] keeps every feature, coordinate, ring and attribute, and a
+/// column's values keep their kinds unless one column mixes kinds.
+pub(crate) fn to_mvt(tile: &[u8]) -> Result<Vec<u8>, String> {
+    use decode::{Geometry as G, Value};
+    use fast_mvt::{MvtCoord, MvtGeomType, MvtLayerBuilder};
+
+    fn coords(path: &[Vertex]) -> impl Iterator<Item = MvtCoord> + '_ {
+        path.iter().map(|&[x, y]| MvtCoord { x, y })
+    }
+    let failed = |e: fast_mvt::MvtError| format!("Failed to write an MVT tile: {e}");
+    let mut out = Vec::with_capacity(tile.len() * 2);
+    for layer in decode::decode(tile)? {
+        let mut builder = MvtLayerBuilder::new(layer.name).map_err(failed)?;
+        let extent = std::num::NonZeroU32::new(layer.extent).ok_or("an MLT layer of extent 0")?;
+        builder.extent(extent);
+        for feature in &layer.features {
+            let kind = match feature.geometry {
+                G::Point(_) | G::MultiPoint(_) => MvtGeomType::Point,
+                G::LineString(_) | G::MultiLineString(_) => MvtGeomType::LineString,
+                G::Polygon(_) | G::MultiPolygon(_) => MvtGeomType::Polygon,
+            };
+            let mut mvt = builder.feature_of(kind);
+            mvt.id(feature.id);
+            match &feature.geometry {
+                G::Point(point) => {
+                    mvt.points(coords(std::slice::from_ref(point)))
+                        .map_err(failed)?;
+                }
+                G::MultiPoint(points) => {
+                    mvt.points(coords(points)).map_err(failed)?;
+                }
+                G::LineString(line) => {
+                    mvt.line(coords(line)).map_err(failed)?;
+                }
+                G::MultiLineString(lines) => {
+                    for line in lines {
+                        mvt.line(coords(line)).map_err(failed)?;
+                    }
+                }
+                G::Polygon(rings) => {
+                    for (i, ring) in rings.iter().enumerate() {
+                        mvt.ring(coords(ring), i == 0).map_err(failed)?;
+                    }
+                }
+                G::MultiPolygon(polygons) => {
+                    for rings in polygons {
+                        for (i, ring) in rings.iter().enumerate() {
+                            mvt.ring(coords(ring), i == 0).map_err(failed)?;
+                        }
+                    }
+                }
+            }
+            for (key, value) in &feature.properties {
+                let value = match value {
+                    Value::Bool(v) => MvtValueRef::Bool(*v),
+                    Value::Int(v) => MvtValueRef::Int(*v),
+                    Value::UInt(v) => MvtValueRef::UInt(*v),
+                    Value::Float(v) => MvtValueRef::Float(*v),
+                    Value::Double(v) => MvtValueRef::Double(*v),
+                    Value::String(v) => MvtValueRef::String(v),
+                };
+                mvt.tag_ref(key, value).map_err(failed)?;
+            }
+            builder = mvt.end();
+        }
+        out.extend(builder.encode());
+    }
+    Ok(out)
+}
+
 struct Feature<'a> {
     id: Option<u64>,
     geometry: Geometry,

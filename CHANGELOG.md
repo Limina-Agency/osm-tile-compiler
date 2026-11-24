@@ -4,6 +4,22 @@
 
 ### New
 
+- Tile schemas besides OpenMapTiles ([docs/schemas.md](docs/schemas.md)):
+  `compile --schema shortbread` writes Shortbread, from the `shortbread.yml`
+  Planetiler 0.10.2 ships, and `--schema FILE.yml` a schema in Planetiler's
+  custom map YAML. On Berlin the Shortbread archive has the same 885 tiles
+  and, in all 26 layers, the same features, attributes and geometry as
+  Planetiler's, in 6.9 s against 35 s; its 67 specification examples pass.
+  `schema verify FILE.yml` runs a schema's examples and `schema layers`
+  lists its layers. The library takes `TileSchema` (`Schema::from_file`,
+  `Schema::from_yaml`, `shortbread()`), the worker request and the C ABI a
+  `schema` field (the C ABI also `{"yaml": "..."}`), and Python a `schema`
+  argument. Only the supplemental datasets a schema reads are used; the
+  archive's metadata carries the schema's name, description, attribution,
+  `schema` and `schema_digest`. `BasemapRequest` and `BasemapOutput` gain
+  `schema`.
+- The engine renders through a `Profile` trait, with OpenMapTiles as one
+  profile; OpenMapTiles archives are byte for byte as before.
 - Data layers: a compile can write layers of other vector data beside the
   basemap, from GeoJSON, newline-delimited GeoJSON, CSV/TSV (coordinate
   columns, WKT or hex WKB), Shapefile, GeoPackage, FlatGeobuf and GeoParquet

@@ -335,8 +335,11 @@ struct CompileOptions {
     exclude_layers: Option<Vec<String>>,
     languages: Option<Vec<String>>,
     building_levels: bool,
+    search_index: bool,
+    tile_format: String,
     sar: bool,
     sort_memory: Option<u64>,
+    schema: Option<String>,
     data_layers: Vec<osm_tile_compiler::DataLayer>,
 }
 
@@ -427,8 +430,20 @@ fn basemap_request(
     };
     request.languages = options.languages;
     request.building_levels = options.building_levels;
+    request.search_index = options.search_index;
+    request.archive.tile_format = osm_tile_compiler::TileFormat::from_id(&options.tile_format)
+        .ok_or_else(|| {
+            invalid(format!(
+                "unknown tile_format '{}': it is mvt or mlt",
+                options.tile_format
+            ))
+        })?;
     request.sar = options.sar;
     request.sort_memory = options.sort_memory;
+    if let Some(schema) = &options.schema {
+        request.schema =
+            osm_tile_compiler::TileSchema::from_name_or_path(schema).map_err(invalid)?;
+    }
     request.data_layers = options.data_layers;
     request.validate()?;
     Ok(request)
@@ -440,6 +455,7 @@ fn compile_output(output: &BasemapOutput) -> Value {
         "format": output.format.id(),
         "bounds": bounds_list(output.bounds),
         "building_levels": output.building_levels.as_ref().map(|(path, _)| path),
+        "search_index": output.search_index.as_ref().map(|(path, _)| path),
         "result": output.result,
         "supplemental_inputs": output.supplemental_inputs,
         "omitted_sources": output.omitted_sources.iter().map(|d| d.id()).collect::<Vec<_>>(),
@@ -474,7 +490,8 @@ fn data_layers_from(
     read = "whole_extract".to_string(), center = None, name = None, description = None,
     attribution = None, gzip_level = None, min_zoom = None, max_zoom = None, threads = None,
     layers = None, exclude_layers = None, languages = None, building_levels = false,
-    sar = false, sort_memory = None, data_layers = None, progress = None, cancel = None,
+    search_index = false, tile_format = "mvt".to_string(), sar = false, sort_memory = None, schema = None,
+    data_layers = None, progress = None, cancel = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn compile(
@@ -502,8 +519,11 @@ fn compile(
     exclude_layers: Option<Vec<String>>,
     languages: Option<Vec<String>>,
     building_levels: bool,
+    search_index: bool,
+    tile_format: String,
     sar: bool,
     sort_memory: Option<u64>,
+    schema: Option<String>,
     data_layers: Option<Bound<'_, PyAny>>,
     progress: Option<Bound<'_, PyAny>>,
     cancel: Option<Bound<'_, PyAny>>,
@@ -532,8 +552,11 @@ fn compile(
         exclude_layers,
         languages,
         building_levels,
+        search_index,
+        tile_format,
         sar,
         sort_memory,
+        schema,
         data_layers,
     };
     let request = basemap_request(input_pbf, output, sources, temp_dir, options)
@@ -573,7 +596,9 @@ fn extract(
             request.polygon = Some(CompileArea::read(polygon)?);
         }
         if min_zoom.is_some() || max_zoom.is_some() {
-            request.zoom = Some(zoom_range(min_zoom, max_zoom)?);
+            // Without `max_zoom`, up to whatever the source holds.
+            let max = max_zoom.unwrap_or(ZoomRange::LIMIT);
+            request.zoom = Some(ZoomRange::new(min_zoom.unwrap_or(0).min(max), max)?);
         }
         Ok(())
     })();

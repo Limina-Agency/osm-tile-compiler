@@ -50,9 +50,16 @@ struct CompilerProcessRequest {
     /// from them on the next request for the same output [default: no].
     #[serde(default)]
     resume: bool,
-    /// The tiles' encoding, `mvt` or (experimental) `mlt` [default: mvt].
+    /// The tiles' encoding, `mvt` or `mlt` [default: mvt].
     #[serde(default)]
     tile_format: osm_tile_compiler::TileFormat,
+    /// The tile schema: `openmaptiles`, `shortbread` or a YAML file's path
+    /// [default: openmaptiles].
+    #[serde(default)]
+    schema: Option<String>,
+    /// How each tile is compressed, `gzip` or `none` [default: gzip].
+    #[serde(default)]
+    tile_compression: osm_tile_compiler::TileCompression,
     /// Layers of other vector data (`BasemapRequest::data_layers`), with
     /// snake_case or camelCase keys [default: none].
     #[serde(default)]
@@ -105,6 +112,10 @@ pub fn read(path: &Path) -> Result<(BasemapRequest, PathBuf), String> {
     compile.sar = request.sar;
     compile.resume = request.resume;
     compile.archive.tile_format = request.tile_format;
+    if let Some(name) = request.schema {
+        compile.schema = osm_tile_compiler::TileSchema::from_name_or_path(&name)?;
+    }
+    compile.archive.tile_compression = request.tile_compression;
     compile.data_layers = request.data_layers;
     Ok((compile, request.manifest_path))
 }

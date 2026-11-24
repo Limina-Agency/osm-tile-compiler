@@ -12,8 +12,8 @@ use crate::job::{JobError, Progress, Work};
 use crate::{archive_jobs, fetch_jobs, update_job};
 use osm_tile_compiler::{
     ArchiveCenter, Area, AreaPolygon, BasemapRequest, CompileBounds, CompileError, LayerSelection,
-    OutputFormat, ReadScope, SourcesPolicy, StylePackEvent, StylePackRequest, SupplementalDataset,
-    ZoomRange, compile_basemap, write_style_pack,
+    OutputFormat, ReadScope, Schema, SourcesPolicy, StylePackEvent, StylePackRequest,
+    SupplementalDataset, TileSchema, ZoomRange, compile_basemap, write_style_pack,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -208,6 +208,16 @@ struct AreaJson {
     read: ReadScopeJson,
 }
 
+/// The tile schema: `"openmaptiles"`, `"shortbread"` or a YAML file's path,
+/// or `{"yaml": "..."}` holding a schema's text, as an app that bundles its
+/// schema passes it.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SchemaJson {
+    NameOrPath(String),
+    Text { yaml: String },
+}
+
 /// `compile_basemap`'s request. Every field but the four paths is optional
 /// and defaults as `BasemapRequest::new` does. Its shape follows the request
 /// types (`ZoomRange`, `LayerSelection`, `Area`).
@@ -221,6 +231,8 @@ struct CompileBasemapJson {
     output: PathBuf,
     /// "pmtiles" or "mbtiles" [default: by the output's extension].
     format: Option<String>,
+    /// The tiles' encoding: "mvt" or "mlt" [default: mvt].
+    tile_format: Option<String>,
     sources: PathBuf,
     temp_dir: PathBuf,
     sources_policy: Option<SourcesPolicyJson>,
@@ -252,6 +264,14 @@ struct CompileBasemapJson {
     /// `attribution`.
     #[serde(default)]
     data_layers: Vec<osm_tile_compiler::DataLayer>,
+    /// The tile schema [default: OpenMapTiles].
+    schema: Option<SchemaJson>,
+}
+
+fn tile_format(id: &str) -> Result<osm_tile_compiler::TileFormat, JobError> {
+    osm_tile_compiler::TileFormat::from_id(id).ok_or_else(|| {
+        JobError::invalid_request(format!("Unknown tile format '{id}': it is mvt or mlt"))
+    })
 }
 
 fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
@@ -265,6 +285,9 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
                 "Unknown output format '{id}': it is pmtiles or mbtiles"
             ))
         })?);
+    }
+    if let Some(id) = json.tile_format {
+        request.archive.tile_format = tile_format(&id)?;
     }
     if let Some(policy) = json.sources_policy {
         request.sources_policy = match policy {
@@ -323,6 +346,15 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
     request.sar = json.sar;
     request.resume = json.resume;
     request.data_layers = json.data_layers;
+    request.schema = match json.schema {
+        None => TileSchema::OpenMapTiles,
+        Some(SchemaJson::NameOrPath(name)) => TileSchema::from_name_or_path(&name)
+            .map_err(|e| JobError::invalid_request(format!("Invalid schema: {e}")))?,
+        Some(SchemaJson::Text { yaml }) => TileSchema::Custom(std::sync::Arc::new(
+            Schema::from_yaml(&yaml)
+                .map_err(|e| JobError::invalid_request(format!("Invalid schema: {e}")))?,
+        )),
+    };
     // Everything that needs no reading or network fails the start, not the job.
     request.validate()?;
     Ok(request)
@@ -374,6 +406,8 @@ struct StylePackJson {
     base_url: Option<String>,
     #[serde(default)]
     sar: bool,
+    /// The archive's tiles: "mvt" or "mlt" [default: mvt].
+    tile_format: Option<String>,
 }
 
 fn style_pack_request(request: Value) -> Result<StylePackRequest, JobError> {
@@ -384,6 +418,9 @@ fn style_pack_request(request: Value) -> Result<StylePackRequest, JobError> {
     request.languages = json.languages;
     request.base_url = json.base_url;
     request.sar = json.sar;
+    if let Some(id) = json.tile_format {
+        request.tile_format = tile_format(&id)?;
+    }
     if let Some(glyphs) = json.glyphs {
         request.glyphs = glyphs;
     }
@@ -479,6 +516,7 @@ mod tests {
             "languages": ["en"],
             "buildingLevels": true,
             "sar": true,
+            "tileFormat": "mlt",
         }))
         .unwrap();
         assert_eq!(request.input_pbf, PathBuf::from("/in.osm.pbf"));
@@ -497,6 +535,10 @@ mod tests {
         assert_eq!(request.languages, Some(vec!["en".to_string()]));
         assert!(request.building_levels);
         assert!(request.sar);
+        assert_eq!(
+            request.archive.tile_format,
+            osm_tile_compiler::TileFormat::Mlt
+        );
     }
 
     #[test]
@@ -546,8 +588,10 @@ mod tests {
             "languages": ["uk"],
             "glyphs": "https://example.com/{fontstack}/{range}.pbf",
             "baseUrl": "asset://pack",
+            "tileFormat": "mlt",
         }))
         .unwrap();
+        assert_eq!(request.tile_format, osm_tile_compiler::TileFormat::Mlt);
         assert_eq!(request.directory, PathBuf::from("/nowhere/pack"));
         assert_eq!(request.languages, Some(vec!["uk".to_string()]));
         assert_eq!(request.base_url.as_deref(), Some("asset://pack"));
@@ -577,6 +621,7 @@ mod tests {
             parse_request(r#","omitSources":["x"]"#).contains("Unknown supplemental dataset 'x'")
         );
         assert!(parse_request(r#","colour":"red""#).contains("unknown field `colour`"));
+        assert!(parse_request(r#","tileFormat":"png""#).contains("Unknown tile format 'png'"));
         assert!(parse_request(r#","sourcesPolicy":"always""#).contains("unknown variant"));
         assert!(parse_request(r#","zoom":{"min":9,"max":3}"#).contains("zooms must satisfy"));
         // BasemapRequest::validate runs at start too.

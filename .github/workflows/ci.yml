@@ -78,6 +78,29 @@ jobs:
           path: target/wheels/osm_tile_compiler-*.whl
           if-no-files-found: error
 
+  # MLT conformance: the compiler's MLT tiles (Monaco) decoded by the
+  # reference decoders renderers use, mlt-core (Rust), @maplibre/mlt (GL JS)
+  # and the C++ decoder MapLibre Native bundles, each of which must read
+  # exactly the features the tiles hold. The decoders' versions are pinned in
+  # scripts/check-mlt-conformance.sh and scripts/mlt-conformance/; the built
+  # decoders are cached by version.
+  mlt-conformance:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/mlt-conformance/rust
+            target/mlt-conformance/cpp-*/build/tool/mlt-cpp-json
+          key: mlt-decoders-${{ hashFiles('scripts/check-mlt-conformance.sh') }}
+      - run: scripts/check-mlt-conformance.sh
+
   # The oldest Rust the crate declares (`rust-version`); rust-toolchain.toml
   # pins a newer one for everything else.
   msrv:

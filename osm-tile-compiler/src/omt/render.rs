@@ -1236,7 +1236,7 @@ pub(super) fn emit_records(
                         (!points.is_empty()).then_some(TileGeometry::Point(points))
                     }
                     WorldGeometry::Line(lines) => {
-                        let scale_exp = (14 - z).min(17);
+                        let scale_exp = (maxzoom.max(14) - z).min(17);
                         let clipped = lines
                             .iter()
                             .zip(&segments)

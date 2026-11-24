@@ -30,6 +30,7 @@ pub(crate) struct Command {
 
 const FORMATS: &[&str] = &["pmtiles", "mbtiles"];
 const TILE_FORMATS: &[&str] = &["mvt", "mlt"];
+const TILE_COMPRESSIONS: &[&str] = &["gzip", "none"];
 const DATASETS: &[&str] = &["water_polygons", "natural_earth", "lake_centerlines", "all"];
 const REPLICATION: &[&str] = &["header", "minute", "hour", "day"];
 pub(crate) const SHELLS: &[&str] = &["bash", "zsh", "fish"];
@@ -51,6 +52,7 @@ pub(crate) const COMMANDS: &[Command] = &[
             ("--output", File),
             ("--format", Words(FORMATS)),
             ("--tile-format", Words(TILE_FORMATS)),
+            ("--tile-compression", Words(TILE_COMPRESSIONS)),
             ("--sources", Dir),
             ("--bounds", Text),
             ("--polygon", File),
@@ -72,6 +74,7 @@ pub(crate) const COMMANDS: &[Command] = &[
             ("--description", Text),
             ("--attribution", Text),
             ("--gzip-level", Text),
+            ("--schema", File),
             // Filled with the layer names when the script is written.
             ("--layers", Words(&[])),
             ("--exclude-layers", Words(&[])),
@@ -119,6 +122,12 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "Download or verify the supplemental datasets",
         arguments: Dir,
         options: &[],
+    },
+    Command {
+        name: "schema",
+        about: "Verify a tile schema's examples, or list its layers",
+        arguments: File,
+        options: &[("--json", Flag)],
     },
     Command {
         name: "style",
@@ -183,6 +192,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         arguments: File,
         options: &[
             ("--output", File),
+            ("--in-place", Flag),
             ("--trusted-key", File),
             ("--json", Flag),
         ],
@@ -210,6 +220,17 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "Serve archives, TileJSON and styles over HTTP",
         arguments: File,
         options: &[("--style-pack", Dir), ("--host", Text), ("--port", Text)],
+    },
+    Command {
+        name: "martin-config",
+        about: "Write a Martin tile server config for archives",
+        arguments: File,
+        options: &[
+            ("--output", Dir),
+            ("--fonts", Dir),
+            ("--sprites", Dir),
+            ("--json", Flag),
+        ],
     },
     Command {
         name: "keygen",

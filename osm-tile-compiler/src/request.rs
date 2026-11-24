@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// The zooms a compile writes, from [`min`](Self::min) to [`max`](Self::max)
-/// inclusive. A value always holds `min <= max <= ZoomRange::MAX_ZOOM`.
+/// inclusive. A value always holds `min <= max <= ZoomRange::LIMIT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ZoomRange {
     min: u8,
@@ -15,26 +15,46 @@ pub struct ZoomRange {
 }
 
 impl ZoomRange {
-    /// The highest zoom a compile writes. Tiles at it carry every detail;
-    /// viewers overzoom them.
-    pub const MAX_ZOOM: u8 = 14;
+    /// The highest zoom a compile writes unless told otherwise: 14, the top
+    /// of the OpenMapTiles schema. Tiles at the top carry every detail and
+    /// viewers overzoom them, so a zoom 14 archive serves any zoom.
+    pub const DEFAULT_MAX_ZOOM: u8 = 14;
 
-    /// Zooms 0 to 14, the OpenMapTiles profile's full range.
+    /// The highest zoom a compile can write, as with Planetiler's
+    /// `--maxzoom`. Above 14 every feature that reaches z14 goes on to the
+    /// top, the tiles at the top keep the full detail, and z14 is simplified
+    /// as the zooms below it are. Each zoom has four times the tiles of the
+    /// one below.
+    pub const LIMIT: u8 = 16;
+
+    /// The default highest zoom.
+    #[deprecated(
+        since = "0.5.0",
+        note = "the highest zoom is no longer fixed: use `DEFAULT_MAX_ZOOM`, or `LIMIT` for the highest allowed"
+    )]
+    pub const MAX_ZOOM: u8 = Self::DEFAULT_MAX_ZOOM;
+
+    /// Zooms 0 to 14, the default, the OpenMapTiles profile's full range.
     pub const ALL: Self = Self {
         min: 0,
-        max: Self::MAX_ZOOM,
+        max: Self::DEFAULT_MAX_ZOOM,
     };
 
     /// The zooms from `min` to `max`; [`CompileError::InvalidRequest`] unless
-    /// `min <= max <= MAX_ZOOM`.
+    /// `min <= max <= LIMIT`.
     pub fn new(min: u8, max: u8) -> Result<Self, CompileError> {
-        if min > max || max > Self::MAX_ZOOM {
+        if min > max || max > Self::LIMIT {
             return Err(CompileError::InvalidRequest(format!(
                 "zooms must satisfy 0 <= min <= max <= {}, got {min} and {max}",
-                Self::MAX_ZOOM
+                Self::LIMIT
             )));
         }
         Ok(Self { min, max })
+    }
+
+    /// Zooms 0 to `max`.
+    pub fn up_to(max: u8) -> Result<Self, CompileError> {
+        Self::new(0, max)
     }
 
     /// The lowest zoom written.
@@ -306,8 +326,10 @@ mod tests {
         assert_eq!((range.min(), range.max()), (3, 9));
         assert!(range.contains(3) && range.contains(9) && !range.contains(10));
         assert!(ZoomRange::new(5, 4).is_err());
-        assert!(ZoomRange::new(0, 15).is_err());
+        assert!(ZoomRange::new(0, 17).is_err());
         assert_eq!(ZoomRange::new(14, 14).unwrap().min(), 14);
+        assert_eq!(ZoomRange::up_to(16).unwrap().max(), ZoomRange::LIMIT);
+        assert_eq!(ZoomRange::ALL.max(), ZoomRange::DEFAULT_MAX_ZOOM);
     }
 
     #[test]

@@ -633,3 +633,113 @@ async fn languages_limit_the_translated_names() {
         assert!(keys.contains(key), "{key} missing from {keys:?}");
     }
 }
+
+/// Every feature of an archive's tiles at zoom `z`: its tile, layer,
+/// attributes and the vertices of its geometry, and the archive's tile range
+/// at that zoom.
+type TileFeatures = Vec<((u32, u32), String, String, Vec<(i64, i64)>)>;
+async fn features_at(path: &Path, z: u8) -> (TileFeatures, (u32, u32, u32, u32)) {
+    let reader = AsyncPmTilesReader::new_with_path(path).await.unwrap();
+    let h = reader.get_header();
+    let bounds = (
+        h.min_longitude,
+        h.min_latitude,
+        h.max_longitude,
+        h.max_latitude,
+    );
+    let range = tile_range(bounds, z);
+    let mut features = Vec::new();
+    for x in range.0..=range.2 {
+        for y in range.1..=range.3 {
+            let coord = TileCoord::new(z, x, y).unwrap();
+            let Some(tile) = reader.get_tile_decompressed(coord).await.unwrap() else {
+                continue;
+            };
+            for (name, layer) in decode_tile(&tile) {
+                for f in layer {
+                    let numbers = f
+                        .geometry
+                        .split(' ')
+                        .filter_map(|v| v.parse::<i64>().ok())
+                        .collect::<Vec<_>>();
+                    let vertices = numbers.chunks(2).map(|p| (p[0], p[1])).collect();
+                    features.push(((x, y), name.clone(), f.attributes, vertices));
+                }
+            }
+        }
+    }
+    (features, range)
+}
+
+/// Above zoom 14 every feature goes on to the archive's top: wherever a
+/// feature of the default archive's z14 tiles lies inside its tile, the z16
+/// tile there holds it with the same attributes. z15 and z16 hold more tiles.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_higher_max_zoom_carries_every_feature_to_the_top() {
+    let temp = tempfile::tempdir().unwrap();
+    let sources = temp.path().join("sources");
+    synthetic_sources(&sources);
+    let (_, default) = compile(&sources, &temp.path().join("z14"), 2, None);
+
+    let out = temp.path().join("z16");
+    let output = out.join("basemap.pmtiles");
+    let mut request = BasemapRequest::new(monaco_pbf(), &output, &sources, out.join("temp"));
+    request.area = Area::bounds(pbf_bounds(&monaco_pbf()));
+    request.threads = 2;
+    request.zoom = osm_tile_compiler::ZoomRange::up_to(16).unwrap();
+    let result = compile_basemap(&request, |_| {}, || false).unwrap().result;
+    assert!(!result.parity_verified, "parity is measured at zoom 14");
+
+    let reader = AsyncPmTilesReader::new_with_path(&output).await.unwrap();
+    assert_eq!(reader.get_header().max_zoom, 16);
+    let metadata: Value = serde_json::from_str(&reader.get_metadata().await.unwrap()).unwrap();
+    assert_eq!(metadata["maxzoom"], json!(16));
+    let layers = vector_layers(&metadata);
+    for layer in ["building", "housenumber", "transportation", "poi", "water"] {
+        assert_eq!(layers[layer]["maxzoom"], json!(16), "{layer}");
+    }
+
+    let (top, _) = features_at(&default, 14).await;
+    let (z15, _) = features_at(&output, 15).await;
+    let (z16, range) = features_at(&output, 16).await;
+    let tiles = |features: &TileFeatures| {
+        features
+            .iter()
+            .map(|f| f.0)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    };
+    assert!(tiles(&top) < tiles(&z15) && tiles(&z15) < tiles(&z16));
+    let at_z16 = z16
+        .iter()
+        .map(|(tile, layer, attrs, _)| (*tile, layer.as_str(), attrs.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut checked = 0;
+    for ((x, y), layer, attrs, vertices) in &top {
+        let inside = vertices
+            .iter()
+            .find(|(px, py)| (0..4096).contains(px) && (0..4096).contains(py));
+        let Some((px, py)) = inside else { continue };
+        let child = (x * 4 + (*px / 1024) as u32, y * 4 + (*py / 1024) as u32);
+        if !(range.0..=range.2).contains(&child.0) || !(range.1..=range.3).contains(&child.1) {
+            continue;
+        }
+        // A merged line or polygon may start in a neighbouring tile at z16.
+        // A point's rank counts the points of its own tile, and of the house
+        // numbers a tile repeats it keeps one: the same number may come from
+        // another object.
+        let loose = |a: &str| {
+            a.split(' ')
+                .filter(|t| !t.starts_with("id=") && !t.starts_with("rank="))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let found = at_z16.contains(&(child, layer.as_str(), attrs.as_str()))
+            || z16
+                .iter()
+                .any(|(_, l, a, _)| l == layer && (a == attrs || loose(a) == loose(attrs)));
+        assert!(found, "z14/{x}/{y} {layer} {attrs} is not at z16");
+        checked += 1;
+    }
+    assert!(checked > 1000, "{checked}");
+}

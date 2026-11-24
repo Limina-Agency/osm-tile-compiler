@@ -87,6 +87,12 @@ the compile is no longer one the parity measurement covers
 (`parity_verified` is false). Two data layers may share a name: their
 features go into one layer.
 
+Data layers work with any schema ([schemas.md](schemas.md)). With Shortbread
+or a YAML schema, "the profile's layers" are that schema's: a data layer named
+like one of them adds to it, and OpenMapTiles' post-processing (point density
+and geometry merging) applies to no layer, data layers included. The
+attribution is the schema's, followed by each data layer's.
+
 The archive's metadata lists each data layer in `vector_layers` with its
 fields, as it lists the profile's, and under `data_layers` with the file
 name, format and number of features it came from. Each layer's

@@ -5,10 +5,9 @@
 //! classify themselves. Every record carries its source's ordinal, so the final
 //! merge reproduces serial insertion order no matter which worker rendered what.
 use super::{
-    Contribution,
     ingest::Job,
+    profile::{Contribution as _, FeatureFilter, Profile},
     render,
-    selection::Selection,
     store::{EncodedRecord, MetadataSummary, Seq, SortBudget, Sorter, Store},
     types::{Feature, Source},
 };
@@ -60,10 +59,10 @@ pub(super) fn sort_budget(
 const BATCH_FEATURES: usize = 16;
 const QUEUE_BATCHES_PER_WORKER: usize = 2;
 
-enum Work {
+enum Work<P> {
     /// Features with their source ordinal and position in that source's output.
     Features(Vec<(u64, u32, Feature)>),
-    Osm(Job),
+    Osm(Job<P>),
 }
 
 struct Output {
@@ -83,38 +82,49 @@ pub(super) struct Totals {
 }
 
 /// State shared by the producer and the workers.
-#[derive(Default)]
-struct Shared {
+struct Shared<P: Profile> {
     failed: AtomicBool,
     /// Raised when the compile is cancelled: workers drop what is queued.
     cancelled: Arc<AtomicBool>,
     /// Messages fully processed; `Pipeline::sync` waits for it to catch up.
     done: Mutex<u64>,
     progress: Condvar,
-    contributions: Mutex<Vec<(u64, Contribution)>>,
+    contributions: Mutex<Vec<(u64, P::Contribution)>>,
+}
+
+impl<P: Profile> Shared<P> {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            failed: AtomicBool::new(false),
+            cancelled,
+            done: Mutex::new(0),
+            progress: Condvar::new(),
+            contributions: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-pub(super) struct Pipeline {
-    sender: Option<Sender<Work>>,
+pub(super) struct Pipeline<P: Profile> {
+    sender: Option<Sender<Work<P>>>,
     workers: Vec<JoinHandle<Result<Output, Failure>>>,
-    shared: Arc<Shared>,
+    shared: Arc<Shared<P>>,
     batch: Vec<(u64, u32, Feature)>,
     sent: u64,
     blocked: crate::profiling::Accumulator,
 }
 
-impl Pipeline {
+impl<P: Profile> Pipeline<P> {
     pub fn new(
         store: &Store,
         threads: usize,
         budget: SortBudget,
         region: Region,
         zooms: (u8, u8),
-        selection: Arc<Selection>,
+        selection: Arc<dyn FeatureFilter>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         Self::with_budget(
@@ -134,7 +144,7 @@ impl Pipeline {
         worker_budget: Arc<SortBudget>,
         region: impl Into<Region>,
         (min_zoom, max_zoom): (u8, u8),
-        selection: Arc<Selection>,
+        selection: Arc<dyn FeatureFilter>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let region = region.into();
@@ -142,10 +152,7 @@ impl Pipeline {
         let mut pipeline = Self {
             sender: Some(sender),
             workers: Vec::new(),
-            shared: Arc::new(Shared {
-                cancelled,
-                ..Shared::default()
-            }),
+            shared: Arc::new(Shared::new(cancelled)),
             batch: Vec::with_capacity(BATCH_FEATURES),
             sent: 0,
             blocked: crate::profiling::Accumulator::new("omt_render_channel_blocked"),
@@ -164,7 +171,7 @@ impl Pipeline {
                         region: &region,
                         min_zoom,
                         max_zoom,
-                        selection: &selection,
+                        selection: &*selection,
                     };
                     work(&receiver, sorter, &shared, target)
                 })
@@ -190,7 +197,7 @@ impl Pipeline {
     }
 
     /// Queues an OSM assembly job; blocks while the queue is full.
-    pub fn submit(&mut self, job: Job) -> Result<(), String> {
+    pub fn submit(&mut self, job: Job<P>) -> Result<(), String> {
         if self.stopped() {
             return Err(self.abort());
         }
@@ -205,7 +212,7 @@ impl Pipeline {
         self.send(Work::Features(batch))
     }
 
-    fn send(&mut self, work: Work) -> Result<(), String> {
+    fn send(&mut self, work: Work<P>) -> Result<(), String> {
         let sender = self
             .sender
             .as_ref()
@@ -269,7 +276,7 @@ impl Pipeline {
 
     /// What OSM sources added to the profile state, in source order. Call after
     /// `sync`.
-    pub fn take_contributions(&mut self) -> Vec<(u64, Contribution)> {
+    pub fn take_contributions(&mut self) -> Vec<(u64, P::Contribution)> {
         let mut all = std::mem::take(&mut *lock(&self.shared.contributions));
         all.sort_unstable_by_key(|(ordinal, _)| *ordinal);
         all
@@ -341,7 +348,7 @@ impl Pipeline {
     }
 }
 
-impl Drop for Pipeline {
+impl<P: Profile> Drop for Pipeline<P> {
     fn drop(&mut self) {
         if let Ok(outputs) = self.join() {
             remove_runs(outputs);
@@ -361,13 +368,13 @@ struct Target<'a> {
     region: &'a Region,
     min_zoom: u8,
     max_zoom: u8,
-    selection: &'a Selection,
+    selection: &'a dyn FeatureFilter,
 }
 
-struct Worker<'a> {
+struct Worker<'a, P: Profile> {
     sorter: Sorter,
     metadata: MetadataSummary,
-    shared: &'a Shared,
+    shared: &'a Shared<P>,
     target: Target<'a>,
     /// Output of the source being evaluated.
     features: Vec<Feature>,
@@ -379,8 +386,8 @@ struct Worker<'a> {
     attrs_scratch: Vec<u8>,
 }
 
-impl Worker<'_> {
-    fn handle(&mut self, work: Work) -> Result<(), Failure> {
+impl<P: Profile> Worker<'_, P> {
+    fn handle(&mut self, work: Work<P>) -> Result<(), Failure> {
         match work {
             Work::Features(batch) => {
                 for (source, index, feature) in batch {
@@ -412,7 +419,7 @@ impl Worker<'_> {
                         return Err(String::new());
                     }
                     self.sources += 1;
-                    let mut contribution = Contribution::default();
+                    let mut contribution = P::Contribution::default();
                     profile.evaluate(&source, &mut self.features, &mut contribution);
                     drop(source);
                     self.feature_count += self.features.len() as u64;
@@ -444,10 +451,9 @@ impl Worker<'_> {
         // The profile has already evaluated the feature's source, so leaving
         // a feature out here changes no other layer; `seq` still counts it,
         // which keeps the order of the features kept.
-        if !self.target.selection.has_layer(&feature.layer) {
+        if !self.target.selection.keep(&mut feature) {
             return Ok(());
         }
-        self.target.selection.strip_names(&mut feature);
         let mut index = 0u32;
         // The records of one zoom share everything but their tile and
         // geometry (`emit_records`), so their attributes are encoded once,
@@ -489,10 +495,10 @@ impl Worker<'_> {
     }
 }
 
-fn work(
-    receiver: &Receiver<Work>,
+fn work<P: Profile>(
+    receiver: &Receiver<Work<P>>,
     sorter: Sorter,
-    shared: &Shared,
+    shared: &Shared<P>,
     target: Target,
 ) -> Result<Output, Failure> {
     let mut worker = Worker {
@@ -553,9 +559,11 @@ fn work(
 
 #[cfg(test)]
 mod tests {
+    use super::super::selection::Selection;
     use super::super::store::{ArchiveHeader, MERGE_FAN_IN};
     use super::super::types::{Source, SourceKind};
     use super::*;
+    type Pipeline = super::Pipeline<super::super::OmtProfile>;
     use crate::CompileBounds;
     use geo_types::{Geometry, LineString, Point, Polygon};
 
@@ -628,7 +636,7 @@ mod tests {
                 limits,
                 bounds,
                 (2, 4),
-                Default::default(),
+                Arc::new(Selection::default()),
                 Default::default(),
             )
             .unwrap();
@@ -682,7 +690,7 @@ mod tests {
                 SortBudget::fixed(1),
                 bounds,
                 (2, 4),
-                Default::default(),
+                Arc::new(Selection::default()),
                 Default::default(),
             )
             .unwrap();
@@ -760,7 +768,7 @@ mod tests {
             SortBudget::fixed(1),
             bounds,
             (2, 4),
-            Default::default(),
+            Arc::new(Selection::default()),
             Default::default(),
         )
         .unwrap();
@@ -803,7 +811,7 @@ mod tests {
             SortBudget::fixed(1),
             bounds,
             (2, 4),
-            Default::default(),
+            Arc::new(Selection::default()),
             Default::default(),
         )
         .unwrap();
@@ -839,7 +847,7 @@ mod tests {
             SortBudget::fixed(1),
             bounds,
             (2, 4),
-            Default::default(),
+            Arc::new(Selection::default()),
             Default::default(),
         )
         .unwrap();

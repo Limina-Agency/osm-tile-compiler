@@ -5,8 +5,8 @@
 //! the OpenMapTiles layers they leave alone come out the same.
 
 use osm_tile_compiler::{
-    BasemapRequest, CompileError, DataInput, DataLayer, LayerSelection, TileFormat, archive,
-    compile_basemap,
+    BasemapRequest, CompileError, DataInput, DataLayer, LayerSelection, TileFormat, TileSchema,
+    archive, compile_basemap,
 };
 #[allow(dead_code)]
 mod common;
@@ -273,4 +273,47 @@ fn data_layers_are_checked_before_the_compile() {
     request.layers = LayerSelection::All;
     request.data_layers[0].source.path = dir.path().join("missing.geojson");
     assert!(request.validate().is_err());
+}
+
+#[test]
+fn data_layers_compile_beside_a_configured_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut request = request(dir.path(), "shortbread-data.pmtiles");
+    request.schema = TileSchema::Shortbread;
+    // `poi` is an OpenMapTiles layer, which Shortbread doesn't have: here it
+    // is a layer of its own.
+    request.data_layers = data_layers(dir.path());
+    let output = compile_basemap(&request, |_| {}, || false).unwrap();
+    assert!(!output.result.parity_verified);
+    let path = dir.path().join("shortbread-data.pmtiles");
+    let report = archive::inspect(&path).unwrap();
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+
+    let meta = metadata(&path);
+    assert_eq!(meta["schema"], "Shortbread");
+    let ids = meta["vector_layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids[ids.len() - 3..], ["districts", "stations", "poi"]);
+    assert_eq!(meta["data_layers"][0]["file"], "districts.geojson");
+    // The schema's own attribution, then the data's credit.
+    let attribution = meta["attribution"].as_str().unwrap();
+    assert!(attribution.ends_with("© Monaco districts"), "{attribution}");
+    assert!(attribution.contains("OpenStreetMap"), "{attribution}");
+
+    let tiles = read_tiles(&path);
+    assert!(
+        layer_at(&tiles, "districts", 14)
+            .iter()
+            .any(|f| f.contains("Monte-Carlo"))
+    );
+    assert!(
+        layer_at(&tiles, "poi", 14)
+            .iter()
+            .any(|f| f.contains("Kiosk"))
+    );
+    assert!(!layer_at(&tiles, "streets", 14).is_empty());
 }

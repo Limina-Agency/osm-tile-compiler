@@ -20,10 +20,12 @@ mod line_merge;
 mod merge_cache;
 mod pipeline;
 mod polygon_validity;
+pub(crate) mod profile;
 mod record_codec;
 mod render;
 mod repair;
 mod sar;
+pub(crate) mod schema;
 mod selection;
 mod simplify;
 mod snap_round;
@@ -126,6 +128,9 @@ pub(crate) struct OpenMapTilesRequest {
     pub merge_cache: merge_cache::MergeCacheOptions,
     /// Layers of other vector data, written after the profile's layers.
     pub data_layers: Vec<crate::DataLayer>,
+    /// The schema to compile with, or `None` for OpenMapTiles. `layers` are
+    /// its layers then, and `languages` must be `None`.
+    pub schema: Option<Arc<schema::Schema>>,
 }
 /// Whether a compile with these options is one the parity measurement covers
 /// (docs/parity.md): Planetiler's default languages, every supplemental
@@ -139,6 +144,7 @@ fn parity_verified(request: &OpenMapTilesRequest) -> bool {
         .iter()
         .all(|data| !LAYERS.contains(&data.layer.as_str()) && data.layer.as_str() != SAR_LAYER);
     profile_layers_untouched
+        && request.schema.is_none()
         && request.languages.is_none()
         && request.omit_sources.is_empty()
         && !request.area_only
@@ -251,10 +257,11 @@ pub struct CompileResult {
     pub data_layers: Vec<crate::DataLayerReport>,
 }
 
-/// The profile's state. Supplements fill it serially; afterwards workers only
-/// read it and report what each OSM source adds as a `Contribution`.
+/// The OpenMapTiles profile's state. Supplements fill it serially;
+/// afterwards workers only read it and report what each OSM source adds as a
+/// `Contribution`.
 #[derive(Default)]
-struct Profile {
+pub(crate) struct OmtProfile {
     water: water::State,
     labels: labels::State,
     transport: transport::State,
@@ -264,19 +271,21 @@ struct Profile {
 }
 
 #[derive(Default)]
-struct Contribution {
+pub(crate) struct Contribution {
     water: water::Contribution,
     labels: labels::Contribution,
     transport: transport::Contribution,
 }
 
-impl Contribution {
+impl profile::Contribution for Contribution {
     fn is_empty(&self) -> bool {
         self.water.is_empty() && self.labels.is_empty() && self.transport.is_empty()
     }
 }
 
-impl Profile {
+impl profile::Profile for OmtProfile {
+    type Contribution = Contribution;
+
     /// Evaluates a source serially, applying what it contributes at once.
     fn process(&mut self, source: &types::Source, features: &mut Vec<types::Feature>) {
         land::process(source, features);
@@ -348,8 +357,11 @@ fn default_center(
 
 /// Checks the request's settings without reading anything.
 pub(crate) fn validate(request: &OpenMapTilesRequest) -> Result<(), String> {
-    if request.min_zoom > request.max_zoom || request.max_zoom > 14 {
-        return Err("OpenMapTiles port supports zooms 0 through 14".into());
+    if request.min_zoom > request.max_zoom || request.max_zoom > crate::ZoomRange::LIMIT {
+        return Err(format!(
+            "OpenMapTiles port supports zooms 0 through {}",
+            crate::ZoomRange::LIMIT
+        ));
     }
     if request.threads == 0 {
         return Err("threads must be positive".into());
@@ -360,9 +372,27 @@ pub(crate) fn validate(request: &OpenMapTilesRequest) -> Result<(), String> {
             request.archive.gzip_level
         ));
     }
-    let selection =
-        selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?;
-    check_data_layers(request, &selection)?;
+    match &request.schema {
+        None => {
+            selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?;
+        }
+        Some(schema) => {
+            if request.languages.is_some() {
+                return Err(format!(
+                    "languages apply to the OpenMapTiles schema, not {}",
+                    schema.name()
+                ));
+            }
+            if request.merge_cache.write || request.merge_cache.reuse_from.is_some() {
+                return Err(format!(
+                    "the merge cache works with the OpenMapTiles schema only, not {}",
+                    schema.name()
+                ));
+            }
+            schema::LayerFilter::new(schema, request.layers.as_deref())?;
+        }
+    }
+    check_data_layers(request, &Layers::new(request)?)?;
     check_bounds(request.bounds)?;
     if let Some(center) = request.center {
         check_center(
@@ -376,17 +406,13 @@ pub(crate) fn validate(request: &OpenMapTilesRequest) -> Result<(), String> {
 /// Checks the data layers: each on its own, and that one named like a
 /// profile layer adds to a layer that is written. Two data layers may share
 /// a name; their features then go into one layer.
-fn check_data_layers(
-    request: &OpenMapTilesRequest,
-    selection: &selection::Selection,
-) -> Result<(), String> {
+fn check_data_layers(request: &OpenMapTilesRequest, layers: &Layers) -> Result<(), String> {
     let zoom =
         crate::ZoomRange::new(request.min_zoom, request.max_zoom).map_err(|e| e.to_string())?;
     for data in &request.data_layers {
         data.validate(zoom).map_err(|e| e.to_string())?;
         let name = data.layer.as_str();
-        let profile_layer = LAYERS.contains(&name) || name == SAR_LAYER;
-        if profile_layer && !selection.layers().contains(&name) {
+        if layers.is_profile_layer(name) && !layers.names().contains(&name) {
             return Err(format!(
                 "data layer {name} adds to the profile's {name} layer, which this compile does \
                  not write"
@@ -398,11 +424,7 @@ fn check_data_layers(
 
 /// The layers an archive declares: the profile's written, then the data
 /// layers not among them, in the request's order.
-fn declared_layers<'a>(
-    selection: &selection::Selection,
-    data_layers: &'a [crate::DataLayer],
-) -> Vec<&'a str> {
-    let mut layers: Vec<&'a str> = selection.layers();
+fn declared_layers<'a>(mut layers: Vec<&'a str>, data_layers: &'a [crate::DataLayer]) -> Vec<&'a str> {
     for data in data_layers {
         if !layers.contains(&data.layer.as_str()) {
             layers.push(data.layer.as_str());
@@ -413,13 +435,28 @@ fn declared_layers<'a>(
 
 /// The archive's attribution, with each data layer's credit after it.
 fn attribution(request: &OpenMapTilesRequest) -> String {
-    let mut attribution = request.archive.attribution.clone();
-    for credit in request
+    let mut credits = request
         .data_layers
         .iter()
         .filter_map(|d| d.attribution.as_deref())
-    {
-        if !credit.is_empty() && !attribution.contains(credit) {
+        .filter(|credit| !credit.is_empty())
+        .peekable();
+    if credits.peek().is_none() {
+        return request.archive.attribution.clone();
+    }
+    // A schema's own attribution stands in for the default, as the
+    // metadata would give it, so the credits go after that.
+    let mut attribution = match &request.schema {
+        Some(schema) if request.archive.attribution == ArchiveOptions::default().attribution => {
+            schema
+                .attribution
+                .clone()
+                .unwrap_or_else(|| store::OSM_ATTRIBUTION.to_owned())
+        }
+        _ => request.archive.attribution.clone(),
+    };
+    for credit in credits {
+        if !attribution.contains(credit) {
             if !attribution.is_empty() {
                 attribution.push(' ');
             }
@@ -475,9 +512,7 @@ pub(crate) fn compile(
     checkpoints: Option<&crate::resume::Checkpoints>,
 ) -> Result<CompileResult, String> {
     validate(request)?;
-    let selection =
-        selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?
-            .with_data_layers(request.data_layers.iter().map(|d| d.layer.as_str()));
+    let layers = Layers::new(request)?.with_data_layers(&request.data_layers);
     let b = request.bounds.normalized();
     let bounds = match &request.area {
         Some(area) => b
@@ -531,16 +566,54 @@ pub(crate) fn compile(
         }
         None => {
             let mut store = store::Store::new(&request.temp_dir)?;
-            let mut rendered = render(
-                request,
-                control,
-                &mut progress,
-                &selection,
-                bounds,
-                region,
-                &mut store,
-                &mut warnings,
-            )?;
+            let mut rendered = match &layers {
+                Layers::OpenMapTiles(selection) => render(
+                    request,
+                    control,
+                    &mut progress,
+                    OmtProfile {
+                        sar: selection.has_layer(SAR_LAYER),
+                        ..OmtProfile::default()
+                    },
+                    Arc::new(selection.clone()),
+                    supplements::Read {
+                        // The ocean polygons only make water features.
+                        water_polygons: selection.has_layer("water")
+                            && !request
+                                .omit_sources
+                                .contains(&SupplementalDataset::WaterPolygons),
+                        natural_earth: !request
+                            .omit_sources
+                            .contains(&SupplementalDataset::NaturalEarth),
+                        lake_centerlines: !request
+                            .omit_sources
+                            .contains(&SupplementalDataset::LakeCenterlines),
+                    },
+                    bounds,
+                    region,
+                    &mut store,
+                    &mut warnings,
+                )?,
+                Layers::Schema(schema, filter) => render(
+                    request,
+                    control,
+                    &mut progress,
+                    schema::SchemaProfile::new(schema.clone(), request.max_zoom),
+                    Arc::new(filter.clone()),
+                    supplements::Read {
+                        water_polygons: schema.reads_water_polygons()
+                            && !request
+                                .omit_sources
+                                .contains(&SupplementalDataset::WaterPolygons),
+                        natural_earth: false,
+                        lake_centerlines: false,
+                    },
+                    bounds,
+                    region,
+                    &mut store,
+                    &mut warnings,
+                )?,
+            };
             if let Some(checkpoints) = checkpoints {
                 rendered.sort = store.checkpoint(checkpoints.clone())?;
                 rendered.warnings = warnings[cache_warnings..].to_vec();
@@ -569,6 +642,7 @@ pub(crate) fn compile(
     let omitted_sources = SupplementalDataset::ALL
         .into_iter()
         .filter(|dataset| request.omit_sources.contains(dataset))
+        .filter(|dataset| layers.reads(*dataset))
         .map(SupplementalDataset::id)
         .collect::<Vec<_>>();
     let archive_options = ArchiveOptions {
@@ -592,7 +666,8 @@ pub(crate) fn compile(
         options: &archive_options,
         min_zoom: request.min_zoom,
         max_zoom: request.max_zoom,
-        layers: &declared_layers(&selection, &request.data_layers),
+        layers: &declared_layers(layers.names(), &request.data_layers),
+        schema: request.schema.as_deref(),
         omitted_sources: &omitted_sources,
         osm_data: &osm_data,
         data_layers: &data_metadata,
@@ -632,9 +707,22 @@ pub(crate) fn compile(
         None => None,
     };
     warnings.extend(tile_stats.warning());
+    let (schema, profile_revision) = match &request.schema {
+        None => (
+            format!("OpenMapTiles {OMT_SCHEMA_VERSION} (native experimental port)"),
+            PROFILE_REVISION.to_owned(),
+        ),
+        Some(schema) => (
+            match &schema.version {
+                Some(version) => format!("{} {version} (configured schema)", schema.name()),
+                None => format!("{} (configured schema)", schema.name()),
+            },
+            schema.digest.clone(),
+        ),
+    };
     Ok(CompileResult {
-        schema: format!("OpenMapTiles {OMT_SCHEMA_VERSION} (native experimental port)"),
-        profile_revision: PROFILE_REVISION.into(),
+        schema,
+        profile_revision,
         parity_verified: parity_verified(request),
         sources_processed,
         profile_features,
@@ -652,15 +740,80 @@ pub(crate) fn compile(
     })
 }
 
+/// The layers a compile writes, and the schema they come from.
+enum Layers {
+    OpenMapTiles(selection::Selection),
+    Schema(Arc<schema::Schema>, schema::LayerFilter),
+}
+
+impl Layers {
+    fn new(request: &OpenMapTilesRequest) -> Result<Self, String> {
+        Ok(match &request.schema {
+            None => Self::OpenMapTiles(selection::Selection::new(
+                request.layers.as_deref(),
+                request.languages.as_deref(),
+            )?),
+            Some(schema) => Self::Schema(
+                schema.clone(),
+                schema::LayerFilter::new(schema, request.layers.as_deref())?,
+            ),
+        })
+    }
+
+    /// The same layers, also writing the data layers named like none of
+    /// the profile's.
+    fn with_data_layers(self, data_layers: &[crate::DataLayer]) -> Self {
+        let names = data_layers.iter().map(|d| d.layer.as_str());
+        match self {
+            Self::OpenMapTiles(selection) => {
+                Self::OpenMapTiles(selection.with_data_layers(names))
+            }
+            Self::Schema(schema, filter) => {
+                let filter = filter.with_data_layers(names);
+                Self::Schema(schema, filter)
+            }
+        }
+    }
+
+    /// Whether `name` is one of the profile's layers, written or not.
+    fn is_profile_layer(&self, name: &str) -> bool {
+        match self {
+            Self::OpenMapTiles(_) => LAYERS.contains(&name) || name == SAR_LAYER,
+            Self::Schema(schema, _) => schema.layers().contains(&name),
+        }
+    }
+
+    /// The profile's layers written, in the order the metadata lists them.
+    fn names(&self) -> Vec<&str> {
+        match self {
+            Self::OpenMapTiles(selection) => selection.layers(),
+            Self::Schema(schema, filter) => filter.layers(schema),
+        }
+    }
+
+    /// Whether the schema reads `dataset` at all, so that leaving it out
+    /// changes the map.
+    fn reads(&self, dataset: SupplementalDataset) -> bool {
+        match self {
+            Self::OpenMapTiles(_) => true,
+            Self::Schema(schema, _) => {
+                dataset == SupplementalDataset::WaterPolygons && schema.reads_water_polygons()
+            }
+        }
+    }
+}
+
 /// Reads the supplemental datasets and the OSM extract and renders every
 /// source into `store`'s sort, returning the counts and the OSM data's
 /// currency. The sort checkpoint it returns is empty.
 #[allow(clippy::too_many_arguments)]
-fn render(
+fn render<P: profile::Profile>(
     request: &OpenMapTilesRequest,
     control: &Control,
     mut progress: impl FnMut(&str),
-    selection: &selection::Selection,
+    mut profile: P,
+    filter: Arc<dyn profile::FeatureFilter>,
+    read: supplements::Read,
     bounds: CompileBounds,
     region: Region,
     store: &mut store::Store,
@@ -679,13 +832,9 @@ fn render(
         ),
         region,
         (request.min_zoom, request.max_zoom),
-        Arc::new(selection.clone()),
+        filter,
         control.flag(),
     )?;
-    let mut profile = Profile {
-        sar: selection.has_layer(SAR_LAYER),
-        ..Profile::default()
-    };
     let mut sources_processed = 0;
     let mut profile_features = 0;
     // Supplement sources run here, in order, because they fill the state that
@@ -699,7 +848,6 @@ fn render(
         sources_processed += 1;
         Ok(())
     };
-    let omitted = |dataset| request.omit_sources.contains(&dataset);
     let message = "Reading supplemental sources";
     progress(message);
     control.stage(CompileStage::ReadSources, message)?;
@@ -708,13 +856,7 @@ fn render(
         &request.sources,
         &request.temp_dir,
         bounds,
-        supplements::Read {
-            // The ocean polygons only make water features.
-            water_polygons: selection.has_layer("water")
-                && !omitted(SupplementalDataset::WaterPolygons),
-            natural_earth: !omitted(SupplementalDataset::NaturalEarth),
-            lake_centerlines: !omitted(SupplementalDataset::LakeCenterlines),
-        },
+        read,
         control,
         &mut process,
         warnings,

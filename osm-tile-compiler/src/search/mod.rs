@@ -2,13 +2,13 @@
 //! beside it, that finds places, points of interest, streets, peaks, waters
 //! and search-and-rescue features by name with no network.
 //!
-//! The index is built from the archive's highest zoom (z14 for a full
-//! compile), so it holds what the map shows and can be built again on a
-//! device from an archive cut with [`crate::archive::extract`]. Names are
-//! matched by words, without regard to case or diacritics: `lodz`, `Łódź`
-//! and `LODZ` are the same, and the last word of a query matches as a
-//! prefix, so `krak` finds Kraków. A word may also match the nearest town,
-//! so `dluga krakow` finds the streets called Długa in Kraków.
+//! The index is built from the archive's highest zoom (z14 unless the
+//! compile set another), so it holds what the map shows and can be built
+//! again on a device from an archive cut with [`crate::archive::extract`].
+//! Names are matched by words, without regard to case or diacritics:
+//! `lodz`, `Łódź` and `LODZ` are the same, and the last word of a query
+//! matches as a prefix, so `krak` finds Kraków. A word may also match the
+//! nearest town, so `dluga krakow` finds the streets called Długa in Kraków.
 //!
 //! The file is read with positioned reads: opening it reads its header and
 //! dictionary index (tens of kilobytes for a region), and a query reads only

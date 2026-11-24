@@ -55,6 +55,16 @@ def test_compile_writes_building_levels_beside_the_archive(tmp_path):
     assert Path(levels).is_file()
 
 
+def test_compile_writes_mlt_tiles_with_their_side_files(tmp_path):
+    result = compile_monaco(
+        tmp_path, tile_format="mlt", building_levels=True, search_index=True
+    )
+    assert otc.inspect(tmp_path / "monaco.pmtiles")["tile_type"] == "mlt"
+    assert Path(result["building_levels"]).is_file()
+    assert Path(result["search_index"]).is_file()
+    assert otc.verify(tmp_path / "monaco.pmtiles")["problems"] == []
+
+
 @pytest.mark.parametrize(
     "options, message",
     [
@@ -67,6 +77,7 @@ def test_compile_writes_building_levels_beside_the_archive(tmp_path):
         ({"read": "near_area"}, "bounds or a polygon"),
         ({"format": "geojson"}, "geojson"),
         ({"languages": ["xx"]}, "xx"),
+        ({"tile_format": "png"}, "tile_format"),
     ],
 )
 def test_bad_requests_raise_invalid_request(tmp_path, options, message):
