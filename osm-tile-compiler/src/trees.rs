@@ -10,7 +10,7 @@
 //! a tree. 0 is unknown in `height`, `crown`, `kind`'s fields and `genus`; `source` is 0 for a
 //! tree's own node and 1 for one of a row. Trees keep the extract's order, which is by ID in
 //! the extracts everyone publishes, rows after nodes. Then the stands: a `u8` count, each stand's
-//! `cover` (1 wood, 2 scrub, 3 orchard, 4 swamp, 5 grass, 6 heath, 7 field), `kind`, `genus` and height (metres), and,
+//! `cover` (1 wood, 2 scrub, 3 orchard, 4 swamp, 5 grass, 6 heath, 7 field, 8 reeds, 9 lawn), `kind`, `genus` and height (metres), and,
 //! unless there are none, 512 x 512 `u8` cells by rows from the north-west, each 0 or a stand's
 //! number from 1 (`stands.rs`). A tile with neither trees nor stands is not written.
 //!

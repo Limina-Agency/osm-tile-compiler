@@ -29,10 +29,11 @@ const CLEAR_OF_TREE: f64 = 2.5;
 /// What grows in an area. 0 is unknown but in `cover`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Stand {
-    /// 1 wood or forest, 2 scrub, 3 orchard, 4 swamp, 5 grass (meadow, grassland), 6 heath, 7 field
-    /// (farmland).
+    /// 1 wood or forest, 2 scrub, 3 orchard, 4 swamp, 5 grass (meadow, grassland), 6 heath (and bog),
+    /// 7 field (farmland), 8 reeds (reedbed, marsh, fen), 9 lawn (mown grass, parks, gardens).
     pub cover: u8,
-    /// As a tree's; a field's the way its rows run (`field_way`).
+    /// As a tree's; a field's the way its rows run (`field_way`, the high four bits) and its crop's
+    /// own number (the low four).
     pub kind: u8,
     pub genus: u8,
     /// Metres.
@@ -42,8 +43,6 @@ pub(crate) struct Stand {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum What {
     Stand(Stand),
-    /// Open land: nothing grows, but in a smaller area on it.
-    Open,
     /// Nothing grows, whatever else is there.
     Clear,
     /// The same, this many metres to either side of a line.
@@ -65,12 +64,16 @@ fn what<'a>(get: impl Fn(&str) -> Option<&'a str>, closed: bool) -> Option<What>
             3
         } else if is("wetland", &["swamp"]) {
             4
-        } else if is("landuse", &["meadow", "grass"]) || is("natural", &["grassland"]) {
+        } else if is("landuse", &["meadow"]) || is("natural", &["grassland"]) {
             5
-        } else if is("natural", &["heath"]) {
+        } else if is("natural", &["heath"]) || is("wetland", &["bog"]) {
             6
         } else if is("landuse", &["farmland"]) {
             7
+        } else if is("wetland", &["reedbed", "marsh", "fen"]) {
+            8
+        } else if is("landuse", &["grass", "village_green", "recreation_ground"]) || is("leisure", &["park", "garden", "common"]) {
+            9
         } else {
             0
         };
@@ -98,9 +101,7 @@ fn what<'a>(get: impl Fn(&str) -> Option<&'a str>, closed: bool) -> Option<What>
         {
             return Some(What::Clear);
         }
-        if is("wetland", &["bog", "marsh", "fen", "reedbed"]) {
-            return Some(What::Open);
-        }
+
     }
     if get("tunnel").is_some_and(|t| t != "no") {
         return None;
@@ -214,7 +215,10 @@ impl Feature {
         if let What::Stand(s) = &mut what
             && s.cover == 7
         {
-            s.kind = field_way(&pieces);
+            // its crop's number from where it is, the same each time it is read
+            let first = pieces.first().and_then(|p| p.first()).copied().unwrap_or([0, 0]);
+            let own = (first[0] as u32).wrapping_mul(0x9e37_79b9) ^ (first[1] as u32).wrapping_mul(0x85eb_ca6b);
+            s.kind = field_way(&pieces) | (own >> 28) as u8;
         }
         let mut bounds = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
         for p in pieces.iter().flat_map(|p| p.iter()) {
@@ -642,7 +646,7 @@ fn paint_row<'a>(
                 let number = number.min(usize::from(u16::MAX) - 1) as u16 + 1;
                 g.fill(f, number, &mut crossings);
             }
-            What::Open | What::Clear => g.fill(f, 0, &mut crossings),
+            What::Clear => g.fill(f, 0, &mut crossings),
             What::Strip(half) => {
                 let half = units(half, f.bounds[1] / 2 + f.bounds[3] / 2);
                 g.strip(f, half);
@@ -769,8 +773,11 @@ mod tests {
         assert_eq!(cover(&[("landuse", "meadow")]), 5);
         assert_eq!(cover(&[("natural", "grassland")]), 5);
         assert_eq!(cover(&[("natural", "heath")]), 6);
+        assert_eq!(cover(&[("wetland", "bog")]), 6);
         assert_eq!(cover(&[("landuse", "farmland")]), 7);
-        assert_eq!(told(&[("wetland", "marsh")], true), Some(What::Open));
+        assert_eq!(cover(&[("wetland", "marsh")]), 8);
+        assert_eq!(cover(&[("leisure", "park")]), 9);
+        assert_eq!(cover(&[("landuse", "grass")]), 9);
         assert_eq!(told(&[("natural", "wood")], false), None);
         assert!(matches!(told(&[("highway", "track")], false), Some(What::Strip(m)) if m < 3.0));
         assert_eq!(
@@ -817,7 +824,7 @@ mod tests {
             Feature::new(wood(2), vec![square(0, 0, 100, 100)]),
             Feature::new(wood(0), vec![square(10, 10, 20, 20)]),
             Feature::new(wood(1), vec![square(30, 30, 40, 40)]),
-            Feature::new(What::Open, vec![square(50, 50, 60, 60)]),
+            Feature::new(What::Clear, vec![square(50, 50, 60, 60)]),
         ]);
         let p = &p[0].1;
         let kind = |x, y| p.stands[usize::from(cell(p, x, y)) - 1].kind;
