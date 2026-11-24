@@ -493,6 +493,23 @@ worker (`--request <request.json>`), which reports progress as JSON lines on
 stdout. [`docs/formats.md`](docs/formats.md) describes the request, the manifest and the other
 formats the compiler writes, and how their versions change.
 
+### From Python
+
+[`osm-tile-compiler-python`](osm-tile-compiler-python/README.md) wraps
+`compile`, `extract`, `update`, `diff`, `apply`, `inspect` and `verify` for
+Python 3.10 and later as abi3 wheels built with maturin, with progress
+callbacks, a `CancelToken` and Ctrl-C cancelling. It is not on PyPI yet: CI
+builds the wheels, and `scripts/check-python.sh` builds and tests one
+locally.
+
+```python
+import osm_tile_compiler as otc
+
+result = otc.compile(pbf, output, sources_dir, temp_dir, max_zoom=12,
+                     exclude_layers=["housenumber"], progress=print)
+otc.verify(result["archive"])
+```
+
 ## Performance
 
 Times depend on the setup. The comparison above is the benchmark harness on
@@ -565,7 +582,9 @@ scripts/check.sh
 
 runs what CI runs: formatting, clippy (warnings are errors), the Rust tests
 and the benchmark harness's Python tests. CI also runs clippy and the tests
-on Windows and macOS, builds the library for iOS and Android, and reports
+on Windows and macOS, builds the library for iOS and Android, builds and
+tests the Python wheel on Linux, macOS and Windows
+(`scripts/check-python.sh`), and reports
 changes to the public API on pull requests (`scripts/semver-report.sh`).
 [`CONTRIBUTING.md`](CONTRIBUTING.md) covers changes to
 tile output, and [`RELEASING.md`](RELEASING.md) the release steps.

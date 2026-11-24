@@ -42,6 +42,42 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  # The Python bindings: the abi3 wheel built with maturin and the Python
+  # tests run against it, on the oldest Python it supports and, on Linux, a
+  # current one too. The wheels are kept as artifacts; nothing is published.
+  # The Linux wheel is tagged for the runner's glibc; a wheel for PyPI would
+  # need a manylinux container build.
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: blacksmith-4vcpu-ubuntu-2404, python: "3.10", wheel: linux-x86_64 }
+          - { os: blacksmith-4vcpu-ubuntu-2404, python: "3.13" }
+          - { os: macos-15, python: "3.10", wheel: macos-arm64 }
+          - { os: windows-2025, python: "3.10", wheel: windows-x86_64 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The fixtures are compared byte for byte: no CRLF conversion.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: python
+        with:
+          python-version: ${{ matrix.python }}
+      - run: scripts/check-python.sh "${{ steps.python.outputs.python-path }}"
+      - if: matrix.wheel
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-wheel-${{ matrix.wheel }}
+          path: target/wheels/osm_tile_compiler-*.whl
+          if-no-files-found: error
+
   # The oldest Rust the crate declares (`rust-version`); rust-toolchain.toml
   # pins a newer one for everything else.
   msrv:
