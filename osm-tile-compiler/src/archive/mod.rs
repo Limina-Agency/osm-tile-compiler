@@ -147,6 +147,9 @@ pub struct ArchiveOptions {
     pub gzip_level: u32,
     /// How the tiles are encoded: MVT, or (experimental) MLT.
     pub tile_format: crate::TileFormat,
+    /// How each tile is compressed: gzip, or none (PMTiles only, and not
+    /// with the merge cache).
+    pub tile_compression: crate::TileCompression,
 }
 
 impl Default for ArchiveOptions {
@@ -157,6 +160,7 @@ impl Default for ArchiveOptions {
             attribution: DEFAULT_ATTRIBUTION.into(),
             gzip_level: 6,
             tile_format: crate::TileFormat::Mvt,
+            tile_compression: crate::TileCompression::Gzip,
         }
     }
 }

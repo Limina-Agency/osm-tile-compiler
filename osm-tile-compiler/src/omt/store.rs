@@ -1204,6 +1204,7 @@ impl Store {
             min_zoom: minzoom,
             max_zoom: maxzoom,
             tile_format: options.tile_format,
+            tile_compression: options.tile_compression,
         })?;
         let mut writing = crate::profiling::Accumulator::new("omt_archive_write");
         let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
@@ -1241,7 +1242,11 @@ impl Store {
                             reuse,
                             counters,
                             timings,
-                            options.gzip_level,
+                            // Unzipped again as written: store, don't compress.
+                            match options.tile_compression {
+                                crate::TileCompression::None => 0,
+                                _ => options.gzip_level,
+                            },
                             options.tile_format,
                             control,
                         )
