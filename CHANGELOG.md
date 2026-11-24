@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- `extract` reads a remote archive: give it an `http://` or `https://` URL
+  instead of a file, on any server that answers range requests. Only the
+  header, the root directory, the leaf directories that may address kept
+  tiles and the kept tiles are downloaded, nearby tiles in one range and
+  eight ranges at a time; the output is the same, byte for byte, as from a
+  local copy. A server that ignores ranges, or an archive that changes
+  while it is read, is an error and nothing is written. From Rust,
+  `ExtractRequest::remote` (the new field `ExtractRequest::source_url`) and
+  `archive::is_remote_source`. `ExtractReport` gains `requests` and
+  `bytes_read`. Local extracts skip the leaf directories outside the area
+  too.
+- `compile --request <request.json>` runs a worker request from the command
+  line, with its progress printed as `compile` prints it, and writes the
+  request's manifest. Only `--threads` and `--json` go with it.
+- `completions <bash|zsh|fish>` prints a shell completion script for the
+  commands, their options and the values the tool knows (formats, layers,
+  datasets, replication sources).
+
 ## 0.3.0 (2026-11-23)
 
 ### Breaking

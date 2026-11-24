@@ -190,6 +190,18 @@ osm-tile-compiler style "pmtiles://file:///sdcard/maps/berlin.pmtiles" \
 From a native app, the C ABI's `write_style_pack` job does the same
 ([`docs/c-abi.md`](docs/c-abi.md)).
 
+### Shell completions
+
+```sh
+source <(osm-tile-compiler completions bash)   # in ~/.bashrc
+source <(osm-tile-compiler completions zsh)    # in ~/.zshrc
+osm-tile-compiler completions fish | source    # in ~/.config/fish/config.fish
+```
+
+They complete the commands, each command's options, and the values the
+tool knows: formats, layers, supplemental datasets, replication sources and
+shells.
+
 ## Choosing what to compile
 
 ### Area
@@ -330,6 +342,8 @@ metadata. Tiles over 1 MiB compressed produce a warning at compile time.
 osm-tile-compiler extract malopolskie.pmtiles --output tatras.pmtiles --bounds 19.70 49.15 20.25 49.35
 # A search area drawn as a polygon, without the street-level zoom
 osm-tile-compiler extract poland.pmtiles --output search.pmtiles --polygon area.geojson --max-zoom 13
+# The same from an archive on a web server or object store
+osm-tile-compiler extract https://example.com/poland.pmtiles --output tatras.pmtiles --bounds 19.70 49.15 20.25 49.35
 ```
 
 `extract` writes a new archive holding the tiles of an existing one within
@@ -341,6 +355,17 @@ polygon writes, and they are not cut: features keep their full geometry, as
 in the source. The header and metadata get the new bounds, center and zooms;
 everything else in the metadata is kept. It reads any PMTiles v3 archive.
 From Rust, `archive::extract` takes an `ExtractRequest`.
+
+The source can be an `http://` or `https://` URL on any server that answers
+range requests, as the ones PMTiles viewers read from do. `extract` then
+downloads only what the area needs: the header and root directory in one
+request, the leaf directories that may address kept tiles, and the kept
+tiles, nearby ones together in one range and eight ranges at a time. A box
+in central Berlin from a 42 MB Berlin archive takes 8 requests and 3.1 MB.
+The output is byte for byte the one a local copy gives. A server that
+ignores ranges is refused, and an archive that changes while it is read
+(another length or ETag) fails the extract; either way nothing is written.
+From Rust, `ExtractRequest::remote(url, output)`.
 
 ## Keeping an extract fresh (experimental)
 
@@ -490,7 +515,9 @@ let output: Result<BasemapOutput, CompileError> =
 
 Apps that would rather run a separate process can start the binary as a
 worker (`--request <request.json>`), which reports progress as JSON lines on
-stdout. [`docs/formats.md`](docs/formats.md) describes the request, the manifest and the other
+stdout. `compile --request <request.json>` runs the same request from a
+terminal, with the command line's progress instead, and writes the manifest
+where the request says: handy to rerun what an app asked for. [`docs/formats.md`](docs/formats.md) describes the request, the manifest and the other
 formats the compiler writes, and how their versions change.
 
 ## Performance

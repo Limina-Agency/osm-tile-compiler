@@ -32,10 +32,11 @@ const UPDATED_PBF: &str = ".osm-tile-compiler-updated.osm.pbf";
 /// local server the tests run.
 const GEOFABRIK_INDEX_VAR: &str = "OSM_TILE_COMPILER_GEOFABRIK_INDEX";
 
-const USAGE: &str = "\
+pub(crate) const USAGE: &str = "\
 Usage:
   osm-tile-compiler compile <INPUT.pbf>... --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile --request <REQUEST.json> [--threads <N>] [--json]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
@@ -45,16 +46,18 @@ Usage:
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
+  osm-tile-compiler completions <bash|zsh|fish>
   osm-tile-compiler help | --help
   osm-tile-compiler --version";
 
-const HELP: &str = "\
+pub(crate) const HELP: &str = "\
 Compiles an OpenStreetMap PBF extract into an OpenMapTiles-schema vector
 basemap, written as one PMTiles or MBTiles archive.
 
 Usage:
   osm-tile-compiler compile <INPUT.pbf>... --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile --request <REQUEST.json> [--threads <N>] [--json]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
@@ -64,6 +67,7 @@ Usage:
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
+  osm-tile-compiler completions <bash|zsh|fish>
   osm-tile-compiler help | --help
   osm-tile-compiler --version
 
@@ -97,8 +101,16 @@ Commands:
   update           Experimental: apply OSM change files, or the diffs a
                    replication server published since INPUT.pbf, and write
                    the updated extract to NEW.pbf, without a database
+  completions      Print a completion script for bash, zsh or fish:
+                   'source <(osm-tile-compiler completions bash)' in
+                   ~/.bashrc, the same with zsh in ~/.zshrc, or
+                   'osm-tile-compiler completions fish | source' in fish
 
 Compile options:
+  --request <FILE>      Compile what a worker request asks for (the JSON the
+                        worker mode below reads), printing progress as the
+                        command line does, and write its manifest where the
+                        request says. Only --threads and --json go with it
   --area <NAME>         Instead of INPUT.pbf, compile Geofabrik's extract of a
                         region: its identifier (malopolskie, us/georgia), its
                         name (Małopolskie) or its ISO code (PL-12). It is
@@ -397,6 +409,7 @@ enum Command {
     Help,
     Version,
     Compile(Box<CompileArgs>),
+    CompileRequest(RequestArgs),
     BuildingLevels(BuildingLevelsArgs),
     FetchSources(PathBuf),
     Style(StyleArgs),
@@ -406,6 +419,15 @@ enum Command {
     Diff(DeltaArgs),
     Apply(DeltaArgs),
     Update(Box<UpdateArgs>),
+    Completions(String),
+}
+
+/// `compile --request <FILE>`.
+#[derive(Debug)]
+struct RequestArgs {
+    request: PathBuf,
+    threads: Option<usize>,
+    json: bool,
 }
 
 #[derive(Debug)]
@@ -453,6 +475,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
             Ok(())
         }
         Command::Compile(args) => compile(*args),
+        Command::CompileRequest(args) => compile_request(args),
         Command::BuildingLevels(args) => building_levels(args),
         Command::FetchSources(directory) => fetch_sources(&directory),
         Command::Style(args) => style(args),
@@ -462,6 +485,11 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::Diff(args) => diff(args),
         Command::Apply(args) => apply(args),
         Command::Update(args) => update(*args),
+        Command::Completions(shell) => {
+            let script = crate::completions::script(&shell, NAME).expect("checked when parsed");
+            print!("{script}");
+            Ok(())
+        }
     };
     match result {
         Ok(()) => 0,
@@ -476,6 +504,12 @@ pub fn main(args: Vec<OsString>) -> i32 {
     }
 }
 
+/// The usage error `args` give, if any. For the completions' test.
+#[cfg(test)]
+pub(crate) fn usage_error(args: &[OsString]) -> Option<String> {
+    parse(args).err()
+}
+
 fn parse(args: &[OsString]) -> Result<Command, String> {
     let Some(first) = args.first() else {
         return Err("no command given".into());
@@ -484,6 +518,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
     match first.to_str() {
         Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some("--version" | "-V") => Ok(Command::Version),
+        Some("compile") if rest.iter().any(|arg| arg == "--request") => parse_compile_request(rest),
         Some("compile") => parse_compile(rest),
         Some("building-levels") => parse_building_levels(rest),
         Some("fetch-sources") => parse_fetch_sources(rest),
@@ -492,6 +527,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("extract") => parse_extract(rest),
         Some(name @ ("diff" | "apply")) => parse_delta_command(name, rest),
         Some("update") => parse_update(rest),
+        Some("completions") => parse_completions(rest),
         _ => Err(format!("unknown command '{}'", first.to_string_lossy())),
     }
 }
@@ -574,6 +610,46 @@ fn parse_bounds<'a>(
         ));
     }
     Ok(CompileBounds::new(north, south, east, west))
+}
+
+/// `compile --request <FILE> [--threads <N>] [--json]`: everything else
+/// comes from the request.
+fn parse_compile_request(args: &[OsString]) -> Result<Command, String> {
+    let mut request = None;
+    let mut threads = None;
+    let mut json = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match option(arg).as_deref() {
+            Some("--help" | "-h") => return Ok(Command::Help),
+            Some("--request") => request = Some(PathBuf::from(value(&mut args, "--request")?)),
+            Some("--json") => json = true,
+            Some("--threads") => {
+                let count: usize = number(value(&mut args, "--threads")?, "--threads")?;
+                if count == 0 {
+                    return Err("--threads must be at least 1".into());
+                }
+                threads = Some(count);
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "compile --request takes its options from the request; only \
+                     --threads and --json go with it, not '{flag}'"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "compile --request takes its input from the request, not '{}'",
+                    arg.to_string_lossy()
+                ));
+            }
+        }
+    }
+    Ok(Command::CompileRequest(RequestArgs {
+        request: request.ok_or("--request needs a value")?,
+        threads,
+        json,
+    }))
 }
 
 fn parse_compile(args: &[OsString]) -> Result<Command, String> {
@@ -1018,6 +1094,25 @@ fn parse_extract(args: &[OsString]) -> Result<Command, String> {
         max_zoom,
         json,
     })))
+}
+
+fn parse_completions(args: &[OsString]) -> Result<Command, String> {
+    let shells = "bash, zsh or fish";
+    match args {
+        [shell] if option(shell).is_none() => {
+            let shell = shell.to_string_lossy().into_owned();
+            if crate::completions::SHELLS.contains(&shell.as_str()) {
+                Ok(Command::Completions(shell))
+            } else {
+                Err(format!(
+                    "unknown shell '{shell}'; completions are for {shells}"
+                ))
+            }
+        }
+        [flag] if matches!(flag.to_str(), Some("--help" | "-h")) => Ok(Command::Help),
+        [] => Err(format!("completions needs a shell: {shells}")),
+        _ => Err(format!("completions takes one shell: {shells}")),
+    }
 }
 
 fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String> {
@@ -1703,28 +1798,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     if args.profile.is_some() {
         osm_tile_compiler::stage_profile::start(threads);
     }
-    let start = Instant::now();
-    let mut stage = None;
-    let output = compile_basemap(
-        &request,
-        |progress| {
-            if progress.stage == CompileStage::FetchSources {
-                let percent = progress
-                    .fraction
-                    .map(|f| format!(" {:.0}%", f * 100.0))
-                    .unwrap_or_default();
-                status.update(&format!("{}{percent}", progress.message));
-            } else if stage != Some(progress.stage) {
-                status.line(&format!(
-                    "[{:>7.1}s] {}",
-                    start.elapsed().as_secs_f64(),
-                    progress.message
-                ));
-            }
-            stage = Some(progress.stage);
-        },
-        interrupt::requested,
-    );
+    let output = run_compile(&request, &mut status);
     let profile = osm_tile_compiler::stage_profile::finish();
     if let Some(updated) = &updated_input {
         let _ = std::fs::remove_file(updated);
@@ -1742,9 +1816,61 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     })?;
     cleanup?;
     let result = &output.result;
+    report_compile(&mut status, &output);
+    write_profile(&mut status, args.profile.as_deref(), profile)?;
+    if let Some((old, delta_path)) = &delta {
+        let _partial = interrupt::remove_on_exit(archive::partial_path(delta_path));
+        let report = archive::diff(old, &args.output, delta_path)?;
+        status.line(&format!(
+            "Wrote {}: {}",
+            delta_path.display(),
+            delta_summary(&report.manifest, report.delta_bytes)
+        ));
+    }
+    if args.json {
+        let json = serde_json::to_string_pretty(result).map_err(|e| e.to_string())?;
+        println!("{json}");
+    }
+    Ok(())
+}
+
+/// Runs a compile, printing a line as each stage starts and download
+/// progress in place.
+fn run_compile(
+    request: &BasemapRequest,
+    status: &mut Status,
+) -> Result<osm_tile_compiler::BasemapOutput, CompileError> {
+    let start = Instant::now();
+    let mut stage = None;
+    compile_basemap(
+        request,
+        |progress| {
+            if progress.stage == CompileStage::FetchSources {
+                let percent = progress
+                    .fraction
+                    .map(|f| format!(" {:.0}%", f * 100.0))
+                    .unwrap_or_default();
+                status.update(&format!("{}{percent}", progress.message));
+            } else if stage != Some(progress.stage) {
+                status.line(&format!(
+                    "[{:>7.1}s] {}",
+                    start.elapsed().as_secs_f64(),
+                    progress.message
+                ));
+            }
+            stage = Some(progress.stage);
+        },
+        interrupt::requested,
+    )
+}
+
+/// The summary of a finished compile: what it wrote, how current its data
+/// is, its largest tile, the merge cache, warnings and building levels.
+fn report_compile(status: &mut Status, output: &osm_tile_compiler::BasemapOutput) {
+    let result = &output.result;
     status.line(&format!(
         "Wrote {}: {} tiles, {} features in {:.1} s",
-        args.output.display(),
+        output.archive.display(),
         result.tiles,
         result.profile_features,
         result.total_seconds
@@ -1769,20 +1895,42 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         status.line(&format!("warning: {warning}"));
     }
     if let Some((path, report)) = &output.building_levels {
-        report_levels(&mut status, path, report);
+        report_levels(status, path, report);
     }
-    write_profile(&mut status, args.profile.as_deref(), profile)?;
-    if let Some((old, delta_path)) = &delta {
-        let _partial = interrupt::remove_on_exit(archive::partial_path(delta_path));
-        let report = archive::diff(old, &args.output, delta_path)?;
-        status.line(&format!(
-            "Wrote {}: {}",
-            delta_path.display(),
-            delta_summary(&report.manifest, report.delta_bytes)
-        ));
+}
+
+/// `compile --request`: the compile a worker request asks for, with the
+/// command line's progress, and its manifest written where it says.
+fn compile_request(args: RequestArgs) -> Result<(), String> {
+    let _cooperating = interrupt::cooperate();
+    let (mut request, manifest) = crate::worker_request::read(&args.request)?;
+    if let Some(threads) = args.threads {
+        request.threads = threads;
     }
+    let mut status = Status::new();
+    status.line(&format!(
+        "Compiling {} into {} as {} asks ({} threads)",
+        request.input_pbf.display(),
+        request.output.display(),
+        args.request.display(),
+        request.threads
+    ));
+    let output = run_compile(&request, &mut status).map_err(|error| match error {
+        CompileError::Cancelled => format!(
+            "the compile was cancelled; {} was not written",
+            request.output.display()
+        ),
+        error => error.to_string(),
+    })?;
+    report_compile(&mut status, &output);
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&output.manifest()).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("Failed to write the manifest {}: {e}", manifest.display()))?;
+    status.line(&format!("Wrote {}", manifest.display()));
     if args.json {
-        let json = serde_json::to_string_pretty(result).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string_pretty(&output.result).map_err(|e| e.to_string())?;
         println!("{json}");
     }
     Ok(())

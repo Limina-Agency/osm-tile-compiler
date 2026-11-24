@@ -59,6 +59,20 @@ fn usage_errors_exit_with_2() {
         (&["--bogus"], "unknown command '--bogus'"),
         (&["compile"], "compile needs an input PBF"),
         (
+            &["compile", "--request", "r.json", "--output", "o.pmtiles"],
+            "only --threads and --json go with it, not '--output'",
+        ),
+        (
+            &["compile", "in.pbf", "--request", "r.json"],
+            "takes its input from the request, not 'in.pbf'",
+        ),
+        (&["compile", "--request"], "--request needs a value"),
+        (
+            &["completions"],
+            "completions needs a shell: bash, zsh or fish",
+        ),
+        (&["completions", "tcsh"], "unknown shell 'tcsh'"),
+        (
             &["extract", "a.pmtiles", "--output", "b.pmtiles"],
             "extract needs --bounds, --polygon, --min-zoom or --max-zoom",
         ),
@@ -1398,6 +1412,60 @@ fn worker_mode_still_reports_bad_arguments_as_error_events() {
             .unwrap()
             .starts_with("Failed to read compiler request"),
         "{event}"
+    );
+}
+
+/// `compile --request` runs the compile a worker request describes, with the
+/// command line's progress instead of JSON lines, and writes its manifest.
+#[test]
+fn compile_request_runs_a_worker_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("out.pmtiles");
+    let manifest = temp.path().join("manifest.json");
+    let request = serde_json::json!({
+        "inputPbfPath": monaco_pbf(),
+        "sourcesDir": temp.path().join("sources"),
+        "outputPmtilesPath": archive,
+        "tempDir": temp.path().join("temp"),
+        "manifestPath": manifest,
+        "omitSources": ["water_polygons", "natural_earth", "lake_centerlines"],
+        "layers": ["water", "transportation"],
+    });
+    let path = temp.path().join("request.json");
+    std::fs::write(&path, request.to_string()).unwrap();
+    let output = run([
+        "compile".as_ref(),
+        "--request".as_ref(),
+        path.as_os_str(),
+        "--threads".as_ref(),
+        "2".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("as "), "{stderr}");
+    assert!(stderr.contains("2 threads"), "{stderr}");
+    assert!(stderr.contains("Wrote"), "{stderr}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["tiles"].as_u64().unwrap() > 0, "{result}");
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(written["format"], "basemap-manifest");
+    assert!(archive.exists());
+
+    // A request the worker refuses is refused here too.
+    let output = run(["compile".as_ref(), "--request".as_ref(), path.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("refusing to replace"),
+        "{output:?}"
+    );
+    std::fs::write(&path, r#"{"inputPbfPath": "a.pbf"}"#).unwrap();
+    let output = run(["compile".as_ref(), "--request".as_ref(), path.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("Invalid compiler request"),
+        "{output:?}"
     );
 }
 
