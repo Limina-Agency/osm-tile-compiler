@@ -12,7 +12,7 @@ categories = ["science::geo", "command-line-utilities"]
 # These tests read ../fixtures/monaco.osm.pbf (and area_download.rs the
 # recorded Geofabrik index beside it), which live outside this crate.
 # The unit-test fixtures in tests/fixtures/ stay (1.3 MB).
-exclude = ["tests/monaco.rs", "tests/cli.rs", "tests/antimeridian.rs", "tests/embedding.rs", "tests/area_only.rs", "tests/area_download.rs", "tests/mbtiles.rs", "tests/sar.rs", "tests/mlt.rs", "tests/search.rs", "tests/common/"]
+exclude = ["tests/monaco.rs", "tests/cli.rs", "tests/antimeridian.rs", "tests/embedding.rs", "tests/area_only.rs", "tests/area_download.rs", "tests/mbtiles.rs", "tests/sar.rs", "tests/mlt.rs", "tests/search.rs", "tests/data_layers.rs", "tests/common/"]
 
 
 [lints]
@@ -20,7 +20,15 @@ workspace = true
 [features]
 # The binary's allocator. Apps that link the library leave it out with
 # `default-features = false`: the library itself never installs one.
-default = ["mimalloc", "ctrlc"]
+default = ["mimalloc", "ctrlc", "data-sources"]
+# Every data layer reader and reprojection from any EPSG code or projection
+# (`DataLayer`). GeoJSON, CSV, Shapefile and GeoPackage are always read, in
+# WGS84 and Web Mercator; these add the other formats and coordinate systems.
+# Each is pure Rust, so mobile builds can turn them on as well.
+data-sources = ["flatgeobuf", "geoparquet", "reproject"]
+flatgeobuf = ["dep:flatgeobuf", "dep:geozero"]
+geoparquet = ["dep:parquet"]
+reproject = ["dep:proj4rs", "dep:crs-definitions", "dep:proj4wkt"]
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # The binary's Ctrl-C, SIGTERM and SIGHUP handler, which cancels a running
 # command so that it removes its scratch space and partial outputs. The
@@ -63,6 +71,15 @@ serde_json = { workspace = true }
 osm-pbf-ingest = { workspace = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 getrandom = "0.4"
+# Data layers (src/data_sources).
+csv = "1.4"
+wkt = { version = "0.15", default-features = false, features = ["geo-types"] }
+flatgeobuf = { version = "6.0", default-features = false, optional = true }
+geozero = { version = "0.15", default-features = false, features = ["with-geo"], optional = true }
+parquet = { version = "60.2", default-features = false, features = ["snap", "flate2-zlib-rs", "zstd", "lz4"], optional = true }
+proj4rs = { version = "0.3", default-features = false, optional = true }
+crs-definitions = { version = "0.6", default-features = false, features = ["proj4"], optional = true }
+proj4wkt = { version = "0.2", optional = true }
 
 # The stage profiler's CPU clocks (getrusage, clock_gettime).
 [target.'cfg(unix)'.dependencies]

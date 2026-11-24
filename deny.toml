@@ -31,6 +31,8 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "CDLA-Permissive-2.0",
+    # crs-definitions' EPSG table (the `reproject` feature).
+    "CC0-1.0",
 ]
 
 [bans]

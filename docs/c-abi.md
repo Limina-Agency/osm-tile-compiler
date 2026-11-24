@@ -135,7 +135,11 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
   "threads": 2,
   "buildingLevels": false,
   "sar": false,
-  "resume": false
+  "resume": false,
+  "dataLayers": [
+    { "layer": "stations", "source": { "path": "/…/stations.csv" }, "minZoom": 12 },
+    { "layer": "parcels", "source": { "path": "/…/parcels.gpkg", "table": "parcels", "crs": "EPSG:2180" } }
+  ]
 }
 ```
 
@@ -152,7 +156,10 @@ PMTiles. `sar` also writes the search-and-rescue layer
 naming `sar` writes it too. `resume` makes the compile resumable
 (`BasemapRequest::resume`): when the app is killed or the job cancelled, its
 checkpoints stay in `tempDir`, and starting the same request again continues
-from the last stage completed, with the same archive.
+from the last stage completed, with the same archive. `dataLayers` adds
+layers of other vector data (GeoJSON, CSV, Shapefile, GeoPackage, FlatGeobuf,
+GeoParquet) to the archive, in the form [data-layers.md](data-layers.md)
+gives; the C ABI library is built with every reader and reprojection.
 
 The result is the basemap manifest the worker writes (`format`,
 `formatVersion`, `schema`, `version`, `result`, `supplementalInputs`,

@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- Data layers: a compile can write layers of other vector data beside the
+  basemap, from GeoJSON, newline-delimited GeoJSON, CSV/TSV (coordinate
+  columns, WKT or hex WKB), Shapefile, GeoPackage, FlatGeobuf and GeoParquet
+  files, all read in pure Rust. Coordinates are reprojected to WGS84 from
+  what each file declares, or from an input's `crs` (any EPSG code, PROJ
+  string or WKT, through proj4rs). Each layer has its zooms, a choice and
+  renaming of attributes, an id attribute and an attribution, and may add to
+  a profile layer such as `poi`. `BasemapRequest::data_layers` with the new
+  `DataLayer` and `DataInput` types (serde, for configuration files);
+  `DataInput::read` hands a file's features to any caller, independent of
+  tiles. The command line takes `compile --data LAYER=FILE[,KEY=VALUE...]`
+  and `--data-layers FILE.json`, and the new `data-info` command describes a
+  file. The C ABI's `compile_basemap` takes `dataLayers`, worker requests
+  `dataLayers` and Python's `compile` `data_layers`. The archive's metadata
+  lists the layers in `vector_layers` and their sources in `data_layers`;
+  `CompileResult::data_layers` reports what each read. See
+  [docs/data-layers.md](docs/data-layers.md).
+- Crate features `flatgeobuf`, `geoparquet` and `reproject`, together the
+  default `data-sources`. GeoJSON, CSV, Shapefile and GeoPackage in WGS84 or
+  Web Mercator need none of them.
+
 ## 0.4.0 (2026-11-24)
 
 ### Breaking

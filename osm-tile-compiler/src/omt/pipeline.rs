@@ -731,6 +731,7 @@ mod tests {
                     osm_seconds: 0.,
                     warnings: vec![],
                     osm_data: Default::default(),
+                    data_layers: vec![],
                 })
                 .unwrap();
             store.interrupt_merge_pass(groups_done);

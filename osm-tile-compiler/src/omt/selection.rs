@@ -24,6 +24,9 @@ pub(super) struct Selection {
     layers: [bool; KNOWN],
     /// `name:<lang>` attributes left out; empty when every language is kept.
     dropped_names: BTreeSet<String>,
+    /// The data layers' names besides the profile's layers; they are
+    /// always written.
+    data_layers: BTreeSet<String>,
 }
 
 /// Every OpenMapTiles layer, without `sar`.
@@ -38,6 +41,7 @@ impl Default for Selection {
         Self {
             layers: default_layers(),
             dropped_names: BTreeSet::new(),
+            data_layers: BTreeSet::new(),
         }
     }
 }
@@ -73,7 +77,20 @@ impl Selection {
         Ok(Self {
             layers,
             dropped_names,
+            data_layers: BTreeSet::new(),
         })
+    }
+
+    /// The same selection, also writing these data layers. A name of the
+    /// profile's layers is left to the profile's selection.
+    pub fn with_data_layers<'a>(mut self, names: impl IntoIterator<Item = &'a str>) -> Self {
+        self.data_layers.extend(
+            names
+                .into_iter()
+                .filter(|name| layer_index(name).is_err())
+                .map(String::from),
+        );
+        self
     }
 
     /// The layers written, in `LAYERS` order, then `sar`.
@@ -85,6 +102,9 @@ impl Selection {
     }
 
     pub fn has_layer(&self, layer: &str) -> bool {
+        if self.data_layers.contains(layer) {
+            return true;
+        }
         match layer_index(layer) {
             Ok(index) => self.layers[index],
             // As before `sar`, a full build passes on any other name, so a

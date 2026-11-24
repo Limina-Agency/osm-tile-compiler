@@ -140,6 +140,13 @@ pub struct BasemapRequest {
     /// [`CompileStage::WriteTiles`]), each pass of the sort's merge, the
     /// archive, and the building levels.
     pub resume: bool,
+    /// Layers of other vector data to compile with the basemap, each from a
+    /// GeoJSON, CSV, Shapefile, GeoPackage, FlatGeobuf or GeoParquet file
+    /// [default: none]. They are written after the profile's layers, in
+    /// this order; see [`DataLayer`](crate::DataLayer). The archive's
+    /// metadata lists them under `vector_layers` like the profile's, and
+    /// under `data_layers` with the file each came from.
+    pub data_layers: Vec<crate::DataLayer>,
 }
 
 impl BasemapRequest {
@@ -180,6 +187,7 @@ impl BasemapRequest {
             sort_memory: None,
             merge_cache: crate::MergeCacheOptions::default(),
             resume: false,
+            data_layers: Vec::new(),
         }
     }
 
@@ -261,6 +269,21 @@ impl BasemapRequest {
                 "the merge cache works with PMTiles archives only, not {}",
                 self.output_format().name()
             )));
+        }
+        for data in &self.data_layers {
+            data.validate(self.zoom)?;
+            let name = data.layer.as_str();
+            let profile_layer = omt::LAYERS.contains(&name) || name == omt::SAR_LAYER;
+            let written = match &layers {
+                Some(layers) => layers.iter().any(|layer| layer == name),
+                None => name != omt::SAR_LAYER,
+            };
+            if profile_layer && !written {
+                return Err(invalid(format!(
+                    "data layer {name} adds to the profile's {name} layer, which this compile \
+                     does not write"
+                )));
+            }
         }
         if self.area.read == ReadScope::NearArea && !self.area.is_limited() {
             return Err(invalid(
@@ -463,6 +486,7 @@ fn compile(
         sort_memory: request.sort_memory,
         format: request.output_format(),
         merge_cache: request.merge_cache.clone(),
+        data_layers: request.data_layers.clone(),
     };
     omt::validate(&compile_request)?;
     let used = request.used_sources();

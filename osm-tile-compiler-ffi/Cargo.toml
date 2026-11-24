@@ -21,7 +21,7 @@ workspace = true
 
 [dependencies]
 # The library never installs an allocator; the host's is used.
-osm-tile-compiler = { path = "../osm-tile-compiler", default-features = false }
+osm-tile-compiler = { path = "../osm-tile-compiler", default-features = false, features = ["data-sources"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

@@ -53,6 +53,10 @@ struct CompilerProcessRequest {
     /// The tiles' encoding, `mvt` or (experimental) `mlt` [default: mvt].
     #[serde(default)]
     tile_format: osm_tile_compiler::TileFormat,
+    /// Layers of other vector data (`BasemapRequest::data_layers`), with
+    /// snake_case or camelCase keys [default: none].
+    #[serde(default)]
+    data_layers: Vec<osm_tile_compiler::DataLayer>,
 }
 
 /// Reads the request at `path`: the compile it asks for, and where to write
@@ -101,5 +105,6 @@ pub fn read(path: &Path) -> Result<(BasemapRequest, PathBuf), String> {
     compile.sar = request.sar;
     compile.resume = request.resume;
     compile.archive.tile_format = request.tile_format;
+    compile.data_layers = request.data_layers;
     Ok((compile, request.manifest_path))
 }

@@ -84,7 +84,11 @@ dicts, the same fields the command line prints with `--json`.
 GeoJSON or `.poly` file), `read` (`"whole_extract"`, `"near_area"`), `center`
 (`(longitude, latitude, zoom)`), `name`, `description`, `attribution`,
 `gzip_level`, `min_zoom`, `max_zoom`, `threads`, `layers` or `exclude_layers`
-(names from `LAYERS`), `languages`, `building_levels`, `sar`, `sort_memory`.
+(names from `LAYERS`), `languages`, `building_levels`, `sar`, `sort_memory`,
+and `data_layers`: a list of dicts that add layers of other vector data
+(GeoJSON, CSV, Shapefile, GeoPackage, FlatGeobuf, GeoParquet), such as
+`{"layer": "stations", "source": {"path": "stations.csv"}, "min_zoom": 12}`
+(the form is in the repository's `docs/data-layers.md`).
 It returns `archive`, `format`, `bounds`, `building_levels` (a path or None),
 `result` (the compile's statistics), `supplemental_inputs`,
 `omitted_sources` and `manifest` (the `basemap-manifest` document).

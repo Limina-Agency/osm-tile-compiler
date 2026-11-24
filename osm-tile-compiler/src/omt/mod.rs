@@ -124,13 +124,22 @@ pub(crate) struct OpenMapTilesRequest {
     pub format: crate::OutputFormat,
     /// The merge cache to write and reuse.
     pub merge_cache: merge_cache::MergeCacheOptions,
+    /// Layers of other vector data, written after the profile's layers.
+    pub data_layers: Vec<crate::DataLayer>,
 }
 /// Whether a compile with these options is one the parity measurement covers
 /// (docs/parity.md): Planetiler's default languages, every supplemental
 /// dataset, a full read of the extract and zoom 14 at the top. A selection of
 /// layers is covered, since each layer is the same as in a full build.
 fn parity_verified(request: &OpenMapTilesRequest) -> bool {
-    request.languages.is_none()
+    // Data layers of their own leave the profile's layers as they are; one
+    // that adds to a profile layer changes it.
+    let profile_layers_untouched = request
+        .data_layers
+        .iter()
+        .all(|data| !LAYERS.contains(&data.layer.as_str()) && data.layer.as_str() != SAR_LAYER);
+    profile_layers_untouched
+        && request.languages.is_none()
         && request.omit_sources.is_empty()
         && !request.area_only
         && request.max_zoom == 14
@@ -237,6 +246,9 @@ pub struct CompileResult {
     /// How current the OSM data is, as the archive's metadata records it.
     #[serde(default)]
     pub osm_data: OsmDataInfo,
+    /// What each of the request's data layers read, in the request's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_layers: Vec<crate::DataLayerReport>,
 }
 
 /// The profile's state. Supplements fill it serially; afterwards workers only
@@ -348,7 +360,9 @@ pub(crate) fn validate(request: &OpenMapTilesRequest) -> Result<(), String> {
             request.archive.gzip_level
         ));
     }
-    selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?;
+    let selection =
+        selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?;
+    check_data_layers(request, &selection)?;
     check_bounds(request.bounds)?;
     if let Some(center) = request.center {
         check_center(
@@ -357,6 +371,62 @@ pub(crate) fn validate(request: &OpenMapTilesRequest) -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+/// Checks the data layers: each on its own, and that one named like a
+/// profile layer adds to a layer that is written. Two data layers may share
+/// a name; their features then go into one layer.
+fn check_data_layers(
+    request: &OpenMapTilesRequest,
+    selection: &selection::Selection,
+) -> Result<(), String> {
+    let zoom =
+        crate::ZoomRange::new(request.min_zoom, request.max_zoom).map_err(|e| e.to_string())?;
+    for data in &request.data_layers {
+        data.validate(zoom).map_err(|e| e.to_string())?;
+        let name = data.layer.as_str();
+        let profile_layer = LAYERS.contains(&name) || name == SAR_LAYER;
+        if profile_layer && !selection.layers().contains(&name) {
+            return Err(format!(
+                "data layer {name} adds to the profile's {name} layer, which this compile does \
+                 not write"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The layers an archive declares: the profile's written, then the data
+/// layers not among them, in the request's order.
+fn declared_layers<'a>(
+    selection: &selection::Selection,
+    data_layers: &'a [crate::DataLayer],
+) -> Vec<&'a str> {
+    let mut layers: Vec<&'a str> = selection.layers();
+    for data in data_layers {
+        if !layers.contains(&data.layer.as_str()) {
+            layers.push(data.layer.as_str());
+        }
+    }
+    layers
+}
+
+/// The archive's attribution, with each data layer's credit after it.
+fn attribution(request: &OpenMapTilesRequest) -> String {
+    let mut attribution = request.archive.attribution.clone();
+    for credit in request
+        .data_layers
+        .iter()
+        .filter_map(|d| d.attribution.as_deref())
+    {
+        if !credit.is_empty() && !attribution.contains(credit) {
+            if !attribution.is_empty() {
+                attribution.push(' ');
+            }
+            attribution.push_str(credit);
+        }
+    }
+    attribution
 }
 
 /// Checks that `bounds` are finite and, once normalized, a box Web Mercator
@@ -406,7 +476,8 @@ pub(crate) fn compile(
 ) -> Result<CompileResult, String> {
     validate(request)?;
     let selection =
-        selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?;
+        selection::Selection::new(request.layers.as_deref(), request.languages.as_deref())?
+            .with_data_layers(request.data_layers.iter().map(|d| d.layer.as_str()));
     let b = request.bounds.normalized();
     let bounds = match &request.area {
         Some(area) => b
@@ -484,6 +555,7 @@ pub(crate) fn compile(
         supplement_seconds,
         osm_seconds,
         osm_data,
+        data_layers,
         ..
     } = rendered;
     let finish_start = Instant::now();
@@ -499,15 +571,31 @@ pub(crate) fn compile(
         .filter(|dataset| request.omit_sources.contains(dataset))
         .map(SupplementalDataset::id)
         .collect::<Vec<_>>();
+    let archive_options = ArchiveOptions {
+        attribution: attribution(request),
+        ..request.archive.clone()
+    };
+    let data_metadata = data_layers
+        .iter()
+        .map(|report| {
+            serde_json::json!({
+                "id": report.layer,
+                "file": report.file,
+                "format": report.format,
+                "features": report.read.features,
+            })
+        })
+        .collect::<Vec<_>>();
     let header = store::ArchiveHeader {
         bounds,
         center,
-        options: &request.archive,
+        options: &archive_options,
         min_zoom: request.min_zoom,
         max_zoom: request.max_zoom,
-        layers: &selection.layers(),
+        layers: &declared_layers(&selection, &request.data_layers),
         omitted_sources: &omitted_sources,
         osm_data: &osm_data,
+        data_layers: &data_metadata,
     };
     let tile_stats =
         store.finish_cached(&partial, &header, request.threads, control, cache.as_mut())?;
@@ -560,6 +648,7 @@ pub(crate) fn compile(
         omitted_sources: omitted_sources.into_iter().map(String::from).collect(),
         merge_cache,
         osm_data,
+        data_layers,
     })
 }
 
@@ -631,6 +720,40 @@ fn render(
         warnings,
     )?;
     drop(sources_stage);
+    let mut data_layers = Vec::with_capacity(request.data_layers.len());
+    if !request.data_layers.is_empty() {
+        let data_stage = crate::stage_profile::Stage::start("read_data_layers");
+        for data in &request.data_layers {
+            let message = format!(
+                "Reading data layer {} from {}",
+                data.layer,
+                data.source.path.display()
+            );
+            progress(&message);
+            control.stage(CompileStage::ReadSources, &message)?;
+            let report = read_data_layer(
+                data,
+                bounds,
+                (request.min_zoom, request.max_zoom),
+                control,
+                &mut |features| {
+                    profile_features += features.len() as u64;
+                    pipeline.push_source(sources_processed, features)?;
+                    sources_processed += 1;
+                    Ok(())
+                },
+            )?;
+            if report.read.features == 0 {
+                warnings.push(format!(
+                    "data layer {} has no features within the compile's bounds ({} outside, {} \
+                     without geometry)",
+                    report.layer, report.read.outside_bounds, report.read.without_geometry
+                ));
+            }
+            data_layers.push(report);
+        }
+        drop(data_stage);
+    }
     let supplement_seconds = start.elapsed().as_secs_f64();
     control.stage(CompileStage::IndexOsm, "Indexing the OSM extract")?;
     let osm_start = Instant::now();
@@ -678,6 +801,85 @@ fn render(
             .as_ref()
             .map(OsmDataInfo::from_header)
             .unwrap_or_default(),
+        data_layers,
+    })
+}
+
+/// How many features of a data layer travel to the renderers together.
+const DATA_BATCH: usize = 64;
+
+/// Reads one data layer and hands its features to `push` in batches,
+/// each batch as one source.
+fn read_data_layer(
+    data: &crate::DataLayer,
+    bounds: CompileBounds,
+    zooms: (u8, u8),
+    control: &Control,
+    push: &mut dyn FnMut(&mut Vec<types::Feature>) -> Result<(), String>,
+) -> Result<crate::DataLayerReport, String> {
+    let zoom = crate::ZoomRange::new(zooms.0, zooms.1).map_err(|e| e.to_string())?;
+    let (min_zoom, max_zoom) = data.zoom_range(zoom);
+    let layer = data.layer.as_str();
+    let mut batch = Vec::with_capacity(DATA_BATCH);
+    // Features are read in and near the bounds: the tiles at the layer's
+    // highest zoom get every feature that reaches them; lower zooms, like a
+    // compile that reads only near its area, show what lies near it. The
+    // renderers clip what is read to the tiles, buffer included.
+    let margin = 360.0 / f64::from(1u32 << max_zoom);
+    let read_bounds = if bounds.wraps() || bounds.width() + 2.0 * margin >= 360.0 {
+        CompileBounds::new(
+            (bounds.north + margin).min(90.0),
+            (bounds.south - margin).max(-90.0),
+            180.0,
+            -180.0,
+        )
+    } else {
+        CompileBounds::new(
+            (bounds.north + margin).min(90.0),
+            (bounds.south - margin).max(-90.0),
+            bounds.east + margin,
+            bounds.west - margin,
+        )
+        .normalized()
+    };
+    let mut seen = 0u64;
+    let read = data.source.read_inner(Some(read_bounds), &mut |feature| {
+        seen += 1;
+        if seen.is_multiple_of(4096) {
+            control.check()?;
+        }
+        let source = types::Source {
+            id: feature.id,
+            osm_id: feature.id as i64,
+            kind: types::SourceKind::Supplement,
+            source_layer: layer.into(),
+            tags: Default::default(),
+            geometry: geo_types::Geometry::Point(geo_types::Point::new(0.0, 0.0)),
+            relations: Vec::new(),
+        };
+        let mut tile_feature =
+            types::Feature::new(&source, layer, feature.geometry, min_zoom, max_zoom);
+        tile_feature.attrs = data.tile_attributes(feature.properties);
+        batch.push(tile_feature);
+        if batch.len() >= DATA_BATCH {
+            push(&mut batch)?;
+        }
+        Ok(())
+    })?;
+    if !batch.is_empty() {
+        push(&mut batch)?;
+    }
+    let format = data.source.resolved_format().map_err(|e| e.to_string())?;
+    Ok(crate::DataLayerReport {
+        layer: layer.to_string(),
+        file: data
+            .source
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        format: format.id().to_string(),
+        read,
     })
 }
 

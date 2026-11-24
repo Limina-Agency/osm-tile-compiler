@@ -187,12 +187,15 @@ pub(super) struct ArchiveHeader<'a> {
     pub options: &'a ArchiveOptions,
     pub min_zoom: u8,
     pub max_zoom: u8,
-    /// The layers the metadata declares, in `LAYERS` order.
-    pub layers: &'a [&'static str],
+    /// The layers the metadata declares: the profile's in `LAYERS` order,
+    /// then the data layers.
+    pub layers: &'a [&'a str],
     /// The ids of the supplemental datasets left out, for the metadata.
     pub omitted_sources: &'a [&'static str],
     /// How current the OSM data is, for the metadata.
     pub osm_data: &'a super::OsmDataInfo,
+    /// The metadata's `data_layers`: what each data layer was read from.
+    pub data_layers: &'a [serde_json::Value],
 }
 
 #[cfg(test)]
@@ -219,6 +222,7 @@ impl ArchiveHeader<'static> {
             layers: &super::LAYERS,
             omitted_sources: &[],
             osm_data: &OSM_DATA,
+            data_layers: &[],
         }
     }
 }
@@ -1196,6 +1200,7 @@ impl Store {
             options,
             header.omitted_sources,
             header.osm_data,
+            header.data_layers,
         );
         let mut archive = archive.open_writer(&ArchiveSpec {
             bounds,
@@ -1830,6 +1835,7 @@ pub(super) fn metadata_for_test(header: &ArchiveHeader) -> serde_json::Value {
         header.options,
         header.omitted_sources,
         header.osm_data,
+        header.data_layers,
     ))
     .unwrap()
 }
@@ -1837,6 +1843,7 @@ pub(super) fn metadata_for_test(header: &ArchiveHeader) -> serde_json::Value {
 /// The metadata's `generator`: this crate and its version.
 pub(crate) const GENERATOR: &str = concat!("osm-tile-compiler ", env!("CARGO_PKG_VERSION"));
 
+#[allow(clippy::too_many_arguments)]
 fn metadata(
     layers: &[&str],
     (min, max): (u8, u8),
@@ -1845,6 +1852,7 @@ fn metadata(
     options: &ArchiveOptions,
     omitted_sources: &[&str],
     osm_data: &super::OsmDataInfo,
+    data_layers: &[serde_json::Value],
 ) -> String {
     let layers_written = layers;
     let layers = layers
@@ -1886,6 +1894,10 @@ fn metadata(
     // a full build's metadata is as before.
     if !omitted_sources.is_empty() {
         metadata["omitted_sources"] = serde_json::json!(omitted_sources);
+    }
+    // And only one with data layers says where they came from.
+    if !data_layers.is_empty() {
+        metadata["data_layers"] = serde_json::json!(data_layers);
     }
     // Likewise only an archive with the opt-in layer names its schema.
     if layers_written.contains(&super::sar::LAYER) {

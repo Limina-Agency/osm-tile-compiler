@@ -277,6 +277,26 @@ adds the whole list and `-ru` leaves one out, so `default,-ru` keeps all but
 Russian. `name`, `name_en`, `name_de`, `name_int`, `name:latin` and
 `name:nonlatin` are always written.
 
+### Your own data beside the basemap
+
+`--data <LAYER>=<FILE>` writes the features of a GeoJSON, CSV, Shapefile,
+GeoPackage, FlatGeobuf or GeoParquet file as a layer of its own in the same
+archive, reprojected to WGS84 from whatever coordinate system the file
+declares (or `crs=EPSG:<code>`):
+
+```sh
+osm-tile-compiler compile berlin.osm.pbf --output berlin.pmtiles --sources omt-sources \
+  --data "districts=bezirke.json,zoom=8-14,attributes=name" \
+  --data "parcels=parcels.gpkg,table=flurstuecke,min-zoom=13"
+```
+
+Each layer keeps the zooms and attributes you choose, the metadata lists it
+like the profile's layers, and its attribution is added to the archive's.
+`data-info <FILE>` shows what a file holds before you compile it. The
+readers are pure Rust, so apps get them through the library, the C ABI
+(`dataLayers`) and Python (`data_layers`) too. See
+[docs/data-layers.md](docs/data-layers.md).
+
 ### Without the supplemental datasets
 
 `--omit-sources water_polygons,natural_earth,lake_centerlines` (or `all`)

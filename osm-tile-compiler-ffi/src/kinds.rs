@@ -245,6 +245,13 @@ struct CompileBasemapJson {
     /// from them (`BasemapRequest::resume`).
     #[serde(default)]
     resume: bool,
+    /// Layers of other vector data (`BasemapRequest::data_layers`): each
+    /// with a `layer`, a `source` (`path`, and optionally `format`, `table`,
+    /// `crs`, `csv`, `idAttribute`), and optionally `minZoom`, `maxZoom`,
+    /// `attributes`, `excludeAttributes`, `renameAttributes` and
+    /// `attribution`.
+    #[serde(default)]
+    data_layers: Vec<osm_tile_compiler::DataLayer>,
 }
 
 fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
@@ -315,6 +322,7 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
     request.building_levels = json.building_levels;
     request.sar = json.sar;
     request.resume = json.resume;
+    request.data_layers = json.data_layers;
     // Everything that needs no reading or network fails the start, not the job.
     request.validate()?;
     Ok(request)
@@ -489,6 +497,45 @@ mod tests {
         assert_eq!(request.languages, Some(vec!["en".to_string()]));
         assert!(request.building_levels);
         assert!(request.sar);
+    }
+
+    #[test]
+    fn compile_basemap_requests_take_data_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("stations.csv");
+        std::fs::write(&csv, "lon,lat,name\n1,2,a\n").unwrap();
+        let request = compile_basemap_request(json!({
+            "inputPbf": "/in.osm.pbf",
+            "output": dir.path().join("out.pmtiles"),
+            "sources": "/sources",
+            "tempDir": "/tmp",
+            "omitSources": ["water_polygons", "natural_earth", "lake_centerlines"],
+            "dataLayers": [{
+                "layer": "stations",
+                "source": { "path": csv, "idAttribute": "name" },
+                "minZoom": 12,
+                "renameAttributes": { "name": "label" },
+            }],
+        }))
+        .unwrap();
+        let layer = &request.data_layers[0];
+        assert_eq!(layer.layer.as_str(), "stations");
+        assert_eq!(layer.min_zoom, Some(12));
+        assert_eq!(layer.source.id_attribute.as_deref(), Some("name"));
+        assert_eq!(layer.rename_attributes["name"], "label");
+        let missing = compile_basemap_request(json!({
+            "inputPbf": "/in.osm.pbf",
+            "output": dir.path().join("out.pmtiles"),
+            "sources": "/sources",
+            "tempDir": "/tmp",
+            "dataLayers": [{ "layer": "x", "source": { "path": "/nowhere.csv" } }],
+        }))
+        .unwrap_err();
+        assert!(
+            missing.message.contains("does not exist"),
+            "{}",
+            missing.message
+        );
     }
 
     #[test]
