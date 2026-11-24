@@ -23,6 +23,11 @@ pub use extract::{ExtractReport, ExtractRequest, extract};
 #[doc(hidden)]
 pub use reader::{ArchiveReader, Entry, Header};
 
+/// Decompresses a gzip-compressed tile.
+pub(crate) fn decompress_gzip(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    reader::decompress(bytes, 2)
+}
+
 /// Reads every part of the archive at `path`. Fails only when the file is
 /// not a readable PMTiles v3 archive; anything else wrong is listed in the
 /// report's problems.

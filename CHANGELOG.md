@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- `serve` runs a small local HTTP server for previews: each PMTiles or
+  MBTiles archive's tiles, TileJSON 3.0.0, MapLibre style and a map page,
+  plus the glyphs and sprite of an offline style pack (`--style-pack`), so a
+  browser or a phone on the same network (`--host 0.0.0.0`) draws the map
+  with no other network. From Rust, `TileServer` and `ServeRequest`.
+
 ## 0.3.0 (2026-11-23)
 
 ### Breaking

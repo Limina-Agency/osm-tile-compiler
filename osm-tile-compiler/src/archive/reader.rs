@@ -217,7 +217,11 @@ impl ArchiveReader {
         self.read(offset, u64::from(entry.length))
     }
 
-    fn directory(&mut self, offset: u64, length: u64) -> Result<Vec<(Entry, bool)>, String> {
+    pub(crate) fn directory(
+        &mut self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<(Entry, bool)>, String> {
         let bytes = self.read(offset, length)?;
         let bytes = decompress(&bytes, self.header.internal_compression)?;
         let at = &mut 0;

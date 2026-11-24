@@ -115,16 +115,30 @@ This writes `monaco.pmtiles`, zooms 0 to 14. `compile --fetch` downloads any dat
 with tile size statistics, on stdout. `osm-tile-compiler --help` lists every
 option.
 
-To look at the map, print a [MapLibre](https://maplibre.org/) style for
-the archive:
+To look at the map, serve the archive and open the page it prints:
+
+```sh
+osm-tile-compiler serve monaco.pmtiles
+# then open http://127.0.0.1:8080/maps/monaco
+```
+
+`serve` is a small local HTTP server, for previews and field use rather than
+production. For each archive (PMTiles or MBTiles, several at once) it serves
+the tiles, a TileJSON (`/tiles/monaco.json`), a [MapLibre](https://maplibre.org/)
+style (`/styles/monaco.json`) and a page that shows it (`/maps/monaco`, which
+loads MapLibre GL JS from unpkg.com). Apps load the style URL directly.
+`--host 0.0.0.0` lets phones on the same network use it; the styles name the
+server by the address each client reached it at.
+
+To host the archive on a static web server instead, print a style for it:
 
 ```sh
 osm-tile-compiler style monaco.pmtiles > style.json
 ```
 
 Put this `index.html` beside the style and the archive, and serve the
-directory over HTTP with range requests (for example `npx http-server`;
-Python's `http.server` cannot serve ranges):
+directory over HTTP with range requests (Python's `http.server` cannot
+serve ranges):
 
 ```html
 <!doctype html>
@@ -189,6 +203,14 @@ osm-tile-compiler style "pmtiles://file:///sdcard/maps/berlin.pmtiles" \
 
 From a native app, the C ABI's `write_style_pack` job does the same
 ([`docs/c-abi.md`](docs/c-abi.md)).
+
+`serve --style-pack` serves a pack with the archives, rewriting its style to
+load glyphs and sprite from the server, so a browser or phone draws the map
+with no network but the server's:
+
+```sh
+osm-tile-compiler serve berlin.pmtiles --style-pack berlin-style --host 0.0.0.0
+```
 
 ## Choosing what to compile
 

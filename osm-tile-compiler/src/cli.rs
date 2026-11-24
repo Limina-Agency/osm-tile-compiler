@@ -1,9 +1,11 @@
 //! The human command line: `compile`, `building-levels`, `fetch-sources`,
-//! `style`, `inspect`, `verify`, `extract`, `diff`, `apply`, `update`, `help`,
-//! `--version`.
+//! `style`, `inspect`, `verify`, `extract`, `diff`, `apply`, `update`, `serve`,
+//! `help`, `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
 //! the version, `--json`). Usage errors exit with 2, failures with 1, and
 //! a command stopped by Ctrl-C with 130 (see `interrupt`).
+mod serve;
+
 use crate::interrupt;
 use osm_tile_compiler::{
     ArchiveCenter, Area, BasemapRequest, BuildingLevelsReport, ClipTo, CompileBounds, CompileError,
@@ -45,6 +47,7 @@ Usage:
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
+  osm-tile-compiler serve <ARCHIVE>... [--style-pack <DIR>] [--host <ADDR>] [--port <N>]
   osm-tile-compiler help | --help
   osm-tile-compiler --version";
 
@@ -64,6 +67,7 @@ Usage:
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
+  osm-tile-compiler serve <ARCHIVE>... [--style-pack <DIR>] [--host <ADDR>] [--port <N>]
   osm-tile-compiler help | --help
   osm-tile-compiler --version
 
@@ -95,6 +99,9 @@ Commands:
   update           Experimental: apply OSM change files, or the diffs a
                    replication server published since INPUT.pbf, and write
                    the updated extract to NEW.pbf, without a database
+  serve            Serve archives (PMTiles or MBTiles) over HTTP for a
+                   preview: tiles, TileJSON, a MapLibre style for each, and
+                   the glyphs and sprite of an offline style pack
 
 Compile options:
   --area <NAME>         Instead of INPUT.pbf, compile Geofabrik's extract of a
@@ -220,6 +227,19 @@ Update options (experimental):
   Changes to objects the input holds are always kept; new objects are kept
   when they are inside the box or reach into the extract. Rewritten blocks
   carry no object metadata.
+
+Serve options:
+  --style-pack <DIR>    A pack 'style --offline' wrote: its style is served for
+                        every archive, with its glyphs and sprite, so the map
+                        needs no network [default: none, glyphs and sprite
+                        from the network]
+  --host <ADDR>         Address to listen on; 0.0.0.0 for other devices on the
+                        network too [default: 127.0.0.1]
+  --port <N>            Port to listen on; 0 picks a free one [default: 8080]
+  Each archive is served under its file name without the extension:
+  /styles/<NAME>.json (its style), /tiles/<NAME>.json (TileJSON),
+  /tiles/<NAME>/<Z>/<X>/<Y>.mvt and /maps/<NAME>, a page that shows the map
+  (it loads MapLibre GL JS from unpkg.com). Runs until Ctrl-C.
 
 Building levels options:
   --threads <N>         Worker threads [default: available cores]; the archive
@@ -403,6 +423,7 @@ enum Command {
     Diff(DeltaArgs),
     Apply(DeltaArgs),
     Update(Box<UpdateArgs>),
+    Serve(serve::ServeArgs),
 }
 
 #[derive(Debug)]
@@ -459,6 +480,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::Diff(args) => diff(args),
         Command::Apply(args) => apply(args),
         Command::Update(args) => update(*args),
+        Command::Serve(args) => serve::run(args),
     };
     match result {
         Ok(()) => 0,
@@ -489,6 +511,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("extract") => parse_extract(rest),
         Some(name @ ("diff" | "apply")) => parse_delta_command(name, rest),
         Some("update") => parse_update(rest),
+        Some("serve") => serve::parse(rest),
         _ => Err(format!("unknown command '{}'", first.to_string_lossy())),
     }
 }
