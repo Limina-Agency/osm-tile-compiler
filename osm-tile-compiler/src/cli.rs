@@ -1,10 +1,11 @@
 //! The human command line: `compile`, `building-levels`, `search-index`,
 //! `search`, `fetch-sources`, `style`, `inspect`, `verify`, `extract`, `diff`,
-//! `apply`, `update`, `serve`, `keygen`, `sign`, `verify-signature`,
+//! `apply`, `update`, `serve`, `martin-config`, `keygen`, `sign`, `verify-signature`,
 //! `completions`, `help`, `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
 //! the version, `--json`). Usage errors exit with 2, failures with 1, and
 //! a command stopped by Ctrl-C with 130 (see `interrupt`).
+mod martin;
 mod serve;
 
 use crate::interrupt;
@@ -51,9 +52,10 @@ Usage:
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--sign <KEY>] [--changed-tiles <FILE>] [--json]
-  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--trusted-key <KEY>]... [--json]
+  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> (--output <NEW.pmtiles> | --in-place) [--trusted-key <KEY>]... [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
   osm-tile-compiler serve <ARCHIVE>... [--style-pack <DIR>] [--host <ADDR>] [--port <N>]
+  osm-tile-compiler martin-config <ARCHIVE|DIR>... --output <DIR> [--fonts <DIR>] [--sprites <DIR>] [--json]
   osm-tile-compiler keygen <FILE.key>
   osm-tile-compiler sign <FILE> --key <FILE.key> [--json]
   osm-tile-compiler verify-signature <FILE> [--trusted-key <KEY>]... [--signature <FILE.sig>] [--json]
@@ -78,9 +80,10 @@ Usage:
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--sign <KEY>] [--changed-tiles <FILE>] [--json]
-  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--trusted-key <KEY>]... [--json]
+  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> (--output <NEW.pmtiles> | --in-place) [--trusted-key <KEY>]... [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
   osm-tile-compiler serve <ARCHIVE>... [--style-pack <DIR>] [--host <ADDR>] [--port <N>]
+  osm-tile-compiler martin-config <ARCHIVE|DIR>... --output <DIR> [--fonts <DIR>] [--sprites <DIR>] [--json]
   osm-tile-compiler keygen <FILE.key>
   osm-tile-compiler sign <FILE> --key <FILE.key> [--json]
   osm-tile-compiler verify-signature <FILE> [--trusted-key <KEY>]... [--signature <FILE.sig>] [--json]
@@ -127,6 +130,9 @@ Commands:
   serve            Serve archives (PMTiles or MBTiles) over HTTP for a
                    preview: tiles, TileJSON, a MapLibre style for each, and
                    the glyphs and sprite of an offline style pack
+  martin-config    Experimental: write a Martin tile server config that
+                   serves the archives (and any later added to a directory
+                   given), with an OSM Bright style for each
   keygen           Write a new ed25519 signing key to FILE.key and its public
                    key to FILE.key.pub, for sign, diff --sign and
                    --trusted-key
@@ -269,6 +275,11 @@ Diff and apply options:
                         several. The signature is checked before anything is
                         written. Without it, an unsigned delta applies, but
                         one whose signature does not match never does
+  --in-place            apply: replace OLD.pmtiles with the result instead of
+                        writing --output. It is written beside it and renamed
+                        over it once checked, so a server reading it, such as
+                        Martin, sees the old archive or the new one, never a
+                        mix; on failure OLD.pmtiles is left as it was
   --json                Print the delta's manifest and size as JSON on stdout
   The delta format is experimental and may change between releases; a delta
   applies only with a build that reads its version.
@@ -324,6 +335,22 @@ Serve options:
   /tiles/<NAME>/<Z>/<X>/<Y>.mvt (.mlt for MapLibre Tiles) and /maps/<NAME>,
   a page that shows the map (it loads MapLibre GL JS from unpkg.com). Runs
   until Ctrl-C.
+
+Martin config options (experimental):
+  ARCHIVE|DIR...        PMTiles or MBTiles archives, or directories of them.
+                        Martin watches a directory: archives added, replaced
+                        (apply --in-place) or removed there are served at once
+  --output <DIR>        Directory to write martin.yaml and styles/<NAME>.json
+                        to; must not exist yet
+  --fonts <DIR>         TrueType or OpenType fonts (Noto Sans Regular, Bold and
+                        Italic) for Martin to serve the glyphs from [default:
+                        glyphs from the network]
+  --sprites <DIR>       SVG icons for Martin to build the sprite from [default:
+                        OSM Bright's sprite from the network]
+  --json                Print what was written as JSON on stdout
+  Give DIR/martin.yaml to martin as its config file. Each archive's style is
+  /style/<NAME>; its tiles are /<NAME>/<Z>/<X>/<Y>. The styles name Martin by
+  relative URLs, which Martin makes absolute for each client.
 
 Building levels options:
   --threads <N>         Worker threads [default: available cores]; the archive
@@ -542,6 +569,7 @@ enum Command {
     Apply(DeltaArgs),
     Update(Box<UpdateArgs>),
     Serve(serve::ServeArgs),
+    MartinConfig(martin::MartinArgs),
     Completions(String),
     Keygen(PathBuf),
     Sign {
@@ -590,6 +618,8 @@ struct DeltaArgs {
     changed_tiles: Option<PathBuf>,
     /// `apply --trusted-key`.
     trusted: Vec<PublicKey>,
+    /// `apply --in-place`: `output` is `base`, replaced atomically.
+    in_place: bool,
 }
 
 /// Runs the command line on `args` (without the program name) and returns the
@@ -629,6 +659,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::Apply(args) => apply(args),
         Command::Update(args) => update(*args),
         Command::Serve(args) => serve::run(args),
+        Command::MartinConfig(args) => martin::run(args),
         Command::Keygen(path) => keygen(&path),
         Command::Sign { file, key, json } => sign(&file, &key, json),
         Command::VerifySignature {
@@ -682,6 +713,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some(name @ ("diff" | "apply")) => parse_delta_command(name, rest),
         Some("update") => parse_update(rest),
         Some("serve") => serve::parse(rest),
+        Some("martin-config") => martin::parse(rest),
         Some("keygen") => parse_keygen(rest),
         Some(name @ ("sign" | "verify-signature")) => parse_signature_command(name, rest),
         Some("completions") => parse_completions(rest),
@@ -1325,6 +1357,7 @@ fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String>
     let mut output = None;
     let mut json = false;
     let (mut sign, mut changed_tiles, mut trusted) = (None, None, Vec::new());
+    let mut in_place = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match option(arg).as_deref() {
@@ -1340,6 +1373,7 @@ fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String>
             Some(flag @ "--trusted-key") if name == "apply" => {
                 trusted.push(trusted_key(value(&mut args, flag)?)?);
             }
+            Some("--in-place") if name == "apply" => in_place = true,
             Some(flag) => return Err(format!("unknown {name} option '{flag}'")),
             None => paths.push(PathBuf::from(arg)),
         }
@@ -1352,7 +1386,17 @@ fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String>
     let [base, other]: [PathBuf; 2] = paths
         .try_into()
         .map_err(|_| format!("{name} takes two files: OLD.pmtiles and {second}"))?;
-    let output = output.ok_or_else(|| format!("{name} needs --output"))?;
+    let output = match (output, in_place) {
+        (Some(_), true) => return Err("apply takes --output or --in-place, not both".into()),
+        (None, true) => base.clone(),
+        (output, false) => output.ok_or_else(|| {
+            if name == "apply" {
+                "apply needs --output or --in-place".to_string()
+            } else {
+                format!("{name} needs --output")
+            }
+        })?,
+    };
     let args = DeltaArgs {
         base,
         other,
@@ -1361,6 +1405,7 @@ fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String>
         sign,
         changed_tiles,
         trusted,
+        in_place,
     };
     Ok(if name == "diff" {
         Command::Diff(args)
@@ -2538,7 +2583,11 @@ fn signed_summary(signed_by: &[String]) -> String {
 
 fn apply(args: DeltaArgs) -> Result<(), String> {
     let _partial = interrupt::remove_on_exit(archive::partial_path(&args.output));
-    let report = archive::apply_trusted(&args.base, &args.other, &args.output, &args.trusted)?;
+    let report = if args.in_place {
+        archive::apply_in_place(&args.base, &args.other, &args.trusted)?
+    } else {
+        archive::apply_trusted(&args.base, &args.other, &args.output, &args.trusted)?
+    };
     if args.json {
         println!(
             "{}",

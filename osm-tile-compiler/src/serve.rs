@@ -240,6 +240,32 @@ impl TileServer {
     }
 }
 
+/// What another server needs to know about an archive to serve it as
+/// `serve` would: see [`crate::martin`].
+pub(crate) struct ArchiveSummary {
+    pub info: ServedArchive,
+    /// The TileJSON without `tiles`: its `center` places a style's view.
+    pub tilejson: Value,
+    /// Whether the tiles are MapLibre Tiles.
+    pub mlt: bool,
+    /// The `Content-Encoding` of the stored tiles.
+    pub encoding: Option<&'static str>,
+    /// Whether the archive holds the `sar` layer.
+    pub sar: bool,
+}
+
+/// Opens the archive at `path` as `serve` does and describes it.
+pub(crate) fn summarize(path: &Path) -> Result<ArchiveSummary, String> {
+    let archive = Archive::open(path)?;
+    Ok(ArchiveSummary {
+        mlt: archive.extension == "mlt",
+        encoding: archive.encoding,
+        sar: archive.sar,
+        tilejson: archive.tilejson,
+        info: archive.info,
+    })
+}
+
 fn refuse(mut stream: TcpStream) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;

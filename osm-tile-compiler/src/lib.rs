@@ -92,6 +92,7 @@ mod extracts;
 #[doc(hidden)]
 pub mod fuzzing;
 mod generalization;
+pub mod martin;
 mod memory;
 mod mlt;
 mod omt;

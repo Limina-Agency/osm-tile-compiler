@@ -175,6 +175,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         arguments: File,
         options: &[
             ("--output", File),
+            ("--in-place", Flag),
             ("--trusted-key", File),
             ("--json", Flag),
         ],
@@ -202,6 +203,17 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "Serve archives, TileJSON and styles over HTTP",
         arguments: File,
         options: &[("--style-pack", Dir), ("--host", Text), ("--port", Text)],
+    },
+    Command {
+        name: "martin-config",
+        about: "Write a Martin tile server config for archives",
+        arguments: File,
+        options: &[
+            ("--output", Dir),
+            ("--fonts", Dir),
+            ("--sprites", Dir),
+            ("--json", Flag),
+        ],
     },
     Command {
         name: "keygen",
