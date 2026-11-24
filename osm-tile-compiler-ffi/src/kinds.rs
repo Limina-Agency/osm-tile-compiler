@@ -9,6 +9,7 @@
 //! mirror can go.
 
 use crate::job::{JobError, Progress, Work};
+use crate::{archive_jobs, fetch_jobs, update_job};
 use osm_tile_compiler::{
     ArchiveCenter, Area, AreaPolygon, BasemapRequest, CompileBounds, CompileError, LayerSelection,
     OutputFormat, ReadScope, SourcesPolicy, StylePackEvent, StylePackRequest, SupplementalDataset,
@@ -33,7 +34,18 @@ struct Envelope {
 }
 
 /// The kinds this library runs, in the order the docs list them.
-pub const KINDS: &[&str] = &["compile_basemap", "write_style_pack"];
+pub const KINDS: &[&str] = &[
+    "compile_basemap",
+    "write_style_pack",
+    "extract",
+    "update",
+    "diff",
+    "apply",
+    "inspect",
+    "verify",
+    "fetch_sources",
+    "fetch_extract",
+];
 
 /// Parses an envelope and its request: the kind and the work to run.
 pub fn parse(json: &str) -> Result<(&'static str, Work), JobError> {
@@ -49,6 +61,26 @@ pub fn parse(json: &str) -> Result<(&'static str, Work), JobError> {
     match envelope.kind.as_str() {
         "compile_basemap" => Ok(("compile_basemap", compile_basemap_work(envelope.request)?)),
         "write_style_pack" => Ok(("write_style_pack", write_style_pack_work(envelope.request)?)),
+        "extract" => Ok(("extract", archive_jobs::extract_work(envelope.request)?)),
+        "update" => Ok(("update", update_job::update_work(envelope.request)?)),
+        "diff" => Ok(("diff", archive_jobs::diff_work(envelope.request)?)),
+        "apply" => Ok(("apply", archive_jobs::apply_work(envelope.request)?)),
+        "inspect" => Ok((
+            "inspect",
+            archive_jobs::archive_report_work("inspect", envelope.request)?,
+        )),
+        "verify" => Ok((
+            "verify",
+            archive_jobs::archive_report_work("verify", envelope.request)?,
+        )),
+        "fetch_sources" => Ok((
+            "fetch_sources",
+            fetch_jobs::fetch_sources_work(envelope.request)?,
+        )),
+        "fetch_extract" => Ok((
+            "fetch_extract",
+            fetch_jobs::fetch_extract_work(envelope.request)?,
+        )),
         other => Err(JobError::invalid_request(format!(
             "Unknown request kind '{other}'; this library runs: {}",
             KINDS.join(", ")
@@ -78,13 +110,40 @@ enum SourcesPolicyJson {
     FetchAndVerify,
 }
 
+/// A box in degrees; one whose west is greater than its east crosses the
+/// antimeridian.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BoundsJson {
+pub(crate) struct BoundsJson {
     north: f64,
     south: f64,
     east: f64,
     west: f64,
+}
+
+impl BoundsJson {
+    /// The box, refused as the command line's `--bounds` refuses it.
+    pub(crate) fn checked(self) -> Result<CompileBounds, JobError> {
+        let Self {
+            north,
+            south,
+            east,
+            west,
+        } = self;
+        if ![north, south, east, west].iter().all(|v| v.is_finite())
+            || west == east
+            || south >= north
+            || west.abs() > 180.0
+            || east.abs() > 180.0
+        {
+            return Err(JobError::invalid_request(format!(
+                "bounds must be within -180..180 with south < north and west different \
+                 from east (west > east crosses the antimeridian), got north {north}, \
+                 south {south}, east {east}, west {west}"
+            )));
+        }
+        Ok(CompileBounds::new(north, south, east, west))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,9 +165,9 @@ struct ArchiveJson {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ZoomJson {
-    min: Option<u8>,
-    max: Option<u8>,
+pub(crate) struct ZoomJson {
+    pub(crate) min: Option<u8>,
+    pub(crate) max: Option<u8>,
 }
 
 /// Which layers to write: `{"only": [...]}` or `{"except": [...]}`; left
