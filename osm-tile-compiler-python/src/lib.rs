@@ -563,7 +563,9 @@ fn extract(
             request.polygon = Some(CompileArea::read(polygon)?);
         }
         if min_zoom.is_some() || max_zoom.is_some() {
-            request.zoom = Some(zoom_range(min_zoom, max_zoom)?);
+            // Without `max_zoom`, up to whatever the source holds.
+            let max = max_zoom.unwrap_or(ZoomRange::LIMIT);
+            request.zoom = Some(ZoomRange::new(min_zoom.unwrap_or(0).min(max), max)?);
         }
         Ok(())
     })();

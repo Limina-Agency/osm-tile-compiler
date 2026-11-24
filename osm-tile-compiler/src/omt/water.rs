@@ -2,7 +2,7 @@
 //! commit 91516fdf477915b1a985015811049b9b96c7f87e (BSD-3-Clause).
 //! See the upstream license and policy attribution in the OMT module.
 
-use super::types::{Feature, Source, SourceKind, add_names};
+use super::types::{Feature, Source, SourceKind, TOP, add_names};
 use geo::{Area, BooleanOps, BoundingRect, Distance, Euclidean, MapCoords};
 use geo_types::{Coord, Geometry, LineString, MultiLineString, MultiPolygon, Rect};
 use serde_json::json;
@@ -207,7 +207,8 @@ impl State {
                     "waterway",
                     source.geometry.clone(),
                     zoom,
-                    zoom,
+                    // z14 has no override, so it stands for every zoom above.
+                    if zoom == 14 { TOP } else { zoom },
                 );
                 f.attrs
                     .insert("class".into(), json!(source.tag("waterway")));
@@ -248,7 +249,7 @@ impl State {
             brunnel(source, &mut f);
             let mut high = f.clone();
             high.min_zoom = 12;
-            high.max_zoom = 14;
+            high.max_zoom = TOP;
             high.min_size = 1.;
             output.extend([f, high]);
             self.match_ne_lakes(source, &mut contribution.lakes);
@@ -274,7 +275,7 @@ impl State {
                         .extend(lines(&source.geometry));
                 }
             }
-            "water_polygons" => output.push(make_water(source, "ocean", 6, 14)),
+            "water_polygons" => output.push(make_water(source, "ocean", 6, TOP)),
             "ne_110m_ocean" => output.push(make_water(source, "ocean", 0, 1)),
             "ne_50m_ocean" => output.push(make_water(source, "ocean", 2, 4)),
             "ne_10m_ocean" => output.push(make_water(source, "ocean", 5, 5)),
@@ -449,10 +450,10 @@ impl State {
         } else {
             8
         };
-        if min > 14 {
+        if min > TOP {
             return;
         }
-        let mut f = Feature::new(source, "water_name", source.geometry.clone(), min, 14);
+        let mut f = Feature::new(source, "water_name", source.geometry.clone(), min, TOP);
         f.buffer_pixels = 256.;
         add_names(source, &mut f);
         let class = if source.tag("natural").is_empty() {
@@ -494,9 +495,11 @@ impl State {
         if let Some(line) = centerline {
             let mut f = setup(Geometry::MultiLineString(line.clone()), centerline_min, 13);
             f.min_size = 6. * source.tag("name").encode_utf16().count() as f64;
+            // setMinPixelSizeBelowZoom(13, ..): from z14 the default size.
             let mut high = f.clone();
             high.min_zoom = 14;
-            high.max_zoom = 14;
+            high.max_zoom = TOP;
+            high.min_size = 1.;
             output.extend([f, high]);
         }
         let min = if matches!(source.tag("place"), "sea" | "ocean") {
@@ -527,9 +530,15 @@ impl State {
                 f.min_size = 128.;
                 f.min_size_source_geometry = Some(source.geometry.clone());
                 if max == 14 {
+                    // Planetiler stops this point at a literal z14; it goes on
+                    // to the archive's top here, so that a lake keeps its
+                    // label at z15 and z16 as it does overzoomed from z14.
+                    // setMinPixelSizeBelowZoom(13, 128) on a point: from z14
+                    // a point feature's default size, 0.
                     let mut high = f.clone();
                     high.min_zoom = 14;
-                    high.max_zoom = 14;
+                    high.max_zoom = TOP;
+                    high.min_size = 0.;
                     output.push(high);
                 }
                 output.push(f);
@@ -661,7 +670,7 @@ mod tests {
         assert_eq!(output.first().unwrap().min_zoom, 9);
         assert_eq!(output.first().unwrap().attr_minzoom["brunnel"], 12);
         assert_eq!(output.first().unwrap().min_size, 0.);
-        assert_eq!(output.last().unwrap().max_zoom, 14);
+        assert_eq!(output.last().unwrap().max_zoom, TOP);
     }
     #[test]
     fn lake_label_preserves_polygon_size_and_ne_id_join() {

@@ -336,8 +336,11 @@ fn default_center(
 
 /// Checks the request's settings without reading anything.
 pub(crate) fn validate(request: &OpenMapTilesRequest) -> Result<(), String> {
-    if request.min_zoom > request.max_zoom || request.max_zoom > 14 {
-        return Err("OpenMapTiles port supports zooms 0 through 14".into());
+    if request.min_zoom > request.max_zoom || request.max_zoom > crate::ZoomRange::LIMIT {
+        return Err(format!(
+            "OpenMapTiles port supports zooms 0 through {}",
+            crate::ZoomRange::LIMIT
+        ));
     }
     if request.threads == 0 {
         return Err("threads must be positive".into());

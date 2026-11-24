@@ -173,9 +173,9 @@ fn usage_errors_exit_with_2() {
         ),
         (
             &["compile", "in.pbf", "--center", "7.4", "43.7", "12.5"],
-            "whole number 0-14",
+            "whole number 0-16",
         ),
-        (&["compile", "in.pbf", "--max-zoom", "15"], "<= 14"),
+        (&["compile", "in.pbf", "--max-zoom", "17"], "<= 16"),
         (
             &["compile", "in.pbf", "--min-zoom", "9", "--max-zoom", "4"],
             "--min-zoom <= --max-zoom",

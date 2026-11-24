@@ -34,7 +34,9 @@ Design license: CC-BY 4.0
 See https://github.com/openmaptiles/openmaptiles/blob/master/LICENSE.md for details on usage
 */
 // Native port of pinned planetiler-openmaptiles 91516fdf label layer rules.
-use super::types::{Feature, Source, add_names, java_meters, parse_number, parse_profile_long};
+use super::types::{
+    Feature, Source, TOP, add_names, java_meters, parse_number, parse_profile_long,
+};
 use geo::{Area, BoundingRect, Centroid, Intersects, MapCoords};
 use geo_types::{Coord, Geometry};
 use icu_experimental::transliterate::Transliterator;
@@ -572,10 +574,10 @@ fn quantize_label_source(source: &Source) -> bool {
 fn point_feature(source: &Source, layer: &str, minzoom: u8) -> Option<Feature> {
     if quantize_label_source(source) {
         let world = super::interior_point::osm_point_world(&source.geometry)?;
-        Some(Feature::new_world_point(source, layer, world, minzoom, 14))
+        Some(Feature::new_world_point(source, layer, world, minzoom, TOP))
     } else {
         let point = source.point()?;
-        Some(Feature::new(source, layer, point, minzoom, 14))
+        Some(Feature::new(source, layer, point, minzoom, TOP))
     }
 }
 
@@ -583,7 +585,7 @@ pub(super) fn centroid_label_feature(source: &Source, layer: &str, minzoom: u8) 
     if quantize_label_source(source) {
         let world =
             super::interior_point::osm_point_then_centroid_if_convex_world(&source.geometry)?;
-        Some(Feature::new_world_point(source, layer, world, minzoom, 14))
+        Some(Feature::new_world_point(source, layer, world, minzoom, TOP))
     } else {
         let point = super::interior_point::point_then_centroid_if_convex(&source.geometry)?;
         Some(Feature::new(
@@ -591,7 +593,7 @@ pub(super) fn centroid_label_feature(source: &Source, layer: &str, minzoom: u8) 
             layer,
             Geometry::Point(point),
             minzoom,
-            14,
+            TOP,
         ))
     }
 }
@@ -804,7 +806,7 @@ fn peak(source: &Source, out: &mut Vec<Feature>) {
         && matches!(natural, "ridge" | "cliff" | "arete")
         && let Some(g) = source.line()
     {
-        let mut f = Feature::new_original_geometry(source, "mountain_peak", g, 13, 14);
+        let mut f = Feature::new_original_geometry(source, "mountain_peak", g, 13, TOP);
         let rank = 3
             - i64::from(!source.tag("name").is_empty())
             - i64::from(!source.tag("wikipedia").is_empty());
@@ -834,7 +836,7 @@ fn park(source: &Source, out: &mut Vec<Feature>) {
     } else {
         source.tag("leisure").into()
     };
-    let mut shape = Feature::new(source, "park", source.geometry.clone(), 4, 14);
+    let mut shape = Feature::new(source, "park", source.geometry.clone(), 4, TOP);
     shape.osm_outline_projection = matches!(
         source.kind,
         super::types::SourceKind::Way | super::types::SourceKind::Relation
@@ -1115,6 +1117,9 @@ fn poi(source: &Source, out: &mut Vec<Feature>) {
     f.grid_max_zoom = 14;
     f.rank = true;
     if matches!(raw, "university" | "college") {
+        // setMinPixelSizeBelowZoom(13, 80) on a point: above z13 a point
+        // feature's default size, 0, below the archive's top.
+        f.min_size = 0.0;
         f.min_size_source_geometry = Some(source.geometry.clone());
         f.attrs.insert("__university_min_size".into(), json!(80));
     }
