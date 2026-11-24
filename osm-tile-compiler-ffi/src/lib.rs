@@ -10,8 +10,10 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod archive_jobs;
 mod job;
 mod kinds;
+mod update_job;
 
 use job::{JobError, JobState, Shared};
 use std::ffi::{CStr, CString, c_char};

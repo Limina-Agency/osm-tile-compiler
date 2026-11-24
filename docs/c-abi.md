@@ -22,8 +22,8 @@ The header is [`osm-tile-compiler-ffi/include/osm_tile_compiler.h`](../osm-tile-
   UI wants. The compile already throttles its own progress to 200 ms, so a
   poll every 100 to 500 ms misses nothing that matters.
 - **One job type for every request kind.** Starting, polling, cancelling and
-  collecting a result work the same for a compile, a dataset download or,
-  later, an extract download or a delta apply. Wrappers write that once.
+  collecting a result work the same for a compile, an extract, an update or
+  a delta apply. Wrappers write that once.
 
 ## Lifecycle
 
@@ -90,8 +90,10 @@ protocol does: a host and its library ship together.
 
 `state` is `running`, `succeeded`, `failed` or `cancelled`. `updates` counts
 the reports so far, so a host can skip redrawing when it has not moved.
-`stage` is one of `CompileStage::id`'s identifiers, `fraction` the stage's
-share done (or `null`), and `overall` the whole job's (1 once it succeeded).
+`stage` is a stable identifier: for `compile_basemap` one of
+`CompileStage::id`'s, for the other kinds those their sections list.
+`fraction` is the stage's share done (or `null`), and `overall` the whole
+job's (1 once it succeeded).
 Before the first report, `stage` is `null` and `message` empty.
 
 ### Result (from `otc_job_result`)
@@ -206,6 +208,116 @@ files` with a fraction and no stage. The result is the `StylePackReport`:
 sprite), which are left out; a missing 1x sprite fails the job with
 `download`. A failed or cancelled job leaves no directory behind.
 
+### Archives and updates
+
+These kinds do what the command line's `extract`, `update`, `diff`, `apply`,
+`inspect` and `verify` do. Their results are the same reports the commands
+print with `--json`, so their fields are `snake_case`. Paths to write must
+not exist yet; one that does fails `otc_job_start`. Unknown fields are
+refused, and so is anything else wrong that needs no reading: zooms outside
+0 to 14 or the wrong way round, a bad box, an unknown replication source.
+
+| Kind | Request | Result |
+|---|---|---|
+| `extract` | `source`, `output`, and optionally `bounds`, `polygon`, `zoom` | `ExtractReport` |
+| `update` | `input`, `output`, `changeFiles` and/or `replication`, optionally `until`, `maxDiffs`, `bounds` or `noClip`, `threads` | `UpdateReport` |
+| `diff` | `base`, `target`, `output` (the delta) | `DiffReport` |
+| `apply` | `base`, `delta`, `output` | `ApplyReport` |
+| `inspect` | `archive` | `ArchiveReport` |
+| `verify` | `archive` | `ArchiveReport`, or a failed job |
+
+#### `extract`
+
+```json
+{
+  "source": "/…/maps/poland.pmtiles",
+  "output": "/…/maps/krakow.pmtiles",
+  "bounds": { "north": 50.13, "south": 49.97, "east": 20.22, "west": 19.79 },
+  "polygon": "/…/krakow.geojson",
+  "zoom": { "min": 0, "max": 14 }
+}
+```
+
+Cuts the tiles that meet the box, the polygon (a GeoJSON or Osmosis
+`.poly` file) and the zooms out of a PMTiles archive, byte for byte. With
+none of the three it copies every tile; `zoom.min` defaults to 0 and
+`zoom.max` to 14. A polygon that cannot be read, a source that is not
+PMTiles v3, or an area or zooms with none of its tiles fail the job with
+`invalid_request`. Progress has the stage `extract` and no fraction; a cancel
+stops it within 4096 directory entries and leaves no output. The result has
+`tiles`, `tile_contents`, `source_tiles`, `bytes`, `tile_bytes`, `zooms`,
+`bounds` (west, south, east, north) and `center`.
+
+#### `update`
+
+```json
+{
+  "input": "/…/malopolskie.osm.pbf",
+  "output": "/…/malopolskie-new.osm.pbf",
+  "changeFiles": ["/…/124335.osc.gz"],
+  "replication": "header",
+  "until": 124347,
+  "maxDiffs": 2000,
+  "bounds": { "north": 50.6, "south": 49.1, "east": 21.5, "west": 19.0 },
+  "threads": 2
+}
+```
+
+Experimental, like the command. Applies the change files in order, then
+the diffs a replication server has beyond the input: `replication` is
+`header` (the server the PBF's header names, as Geofabrik's do), `minute`,
+`hour`, `day` (the planet servers) or a server's URL. At least one of
+`changeFiles` and `replication` is needed; `until` and `maxDiffs` need
+`replication`. Changes are kept only within the input header's box, or
+`bounds`; `noClip: true` keeps every change, for diffs already cut to the
+extract. The output is a PBF to compile like any other, and `diff` then
+turns the old and new archives into a delta.
+
+Progress goes through `read_input`, `read_changes` (the fraction counts
+change files and diffs read) and `write_output`. A cancel is seen between
+steps: after the input is read and before each file or diff, not while the
+output is written. Failed downloads fail with `download`. The result has
+`changes_read`, `changes_kept`, `created`, `modified`, `deleted`, the
+`diffs` applied (first and last sequence), the header's
+`replication_timestamp` and `replication_sequence_number` after the update,
+`output_bytes` and `seconds`.
+
+#### `diff` and `apply`
+
+```json
+{ "base": "/…/old.pmtiles", "target": "/…/new.pmtiles", "output": "/…/new.delta" }
+{ "base": "/…/old.pmtiles", "delta": "/…/new.delta", "output": "/…/new.pmtiles" }
+```
+
+Experimental, like the commands. `diff` writes the delta that turns `base`
+into `target` and checks it by rebuilding `target` from it; `apply` checks
+`base` against the delta's manifest, writes the new archive and checks its
+SHA-256. Both report the stage `diff` or `apply` with no fraction, and both
+leave nothing at `output` when they fail. Neither can stop part way: a
+cancel before they start ends the job at once, and one that arrives while
+they run takes effect when they end, removing the output and ending
+`cancelled`. The result is the delta's manifest, flattened, plus
+`delta_bytes`: `format`, `version`, `base` and `target` (`bytes`, `sha256`),
+`copied_bytes`, `literal_bytes`, `patched_bytes`, `patched_tiles` and
+`tiles` (`unchanged`, `changed`, `added`, `removed`).
+
+#### `inspect` and `verify`
+
+```json
+{ "archive": "/…/maps/krakow.pmtiles" }
+```
+
+Both read every part of the archive: header, directories, metadata and
+every tile. `inspect` succeeds for any readable PMTiles v3 file and lists
+what is wrong in `problems` (the first 50) and `problem_count`; `verify`
+fails the job with `failed` when `problem_count` is not 0, naming the first
+five problems in the message, so a host that only needs a yes or no checks
+`ok`. A file that is not PMTiles v3 fails either. The stage is `inspect` or
+`verify`, with no fraction. The report also has the header's fields
+(`tile_type`, `tile_compression`, `zooms`, `bounds`, `center`,
+`addressed_tiles`, `tile_entries`, `tile_contents`), `file_bytes`, the
+parsed `metadata` and `tile_stats`.
+
 ## Versioning
 
 `OTC_ABI_VERSION` covers the function signatures, the status and state
@@ -217,8 +329,7 @@ semantic versioning, like the Rust API.
 ## Planned next
 
 - Request kinds: `fetch_sources` (download the supplemental datasets ahead of
-  a compile, with byte progress), `fetch_extract` (a Geofabrik area), then
-  `verify`/`inspect` and delta `apply`.
+  a compile, with byte progress) and `fetch_extract` (a Geofabrik area).
 - `otc_validate(json, &error)`: the same checks as `otc_job_start` without
   starting a job, for forms that check as the user types.
 - Packaging: an XCFramework for iOS and a JNI-ready `.so` per Android ABI
