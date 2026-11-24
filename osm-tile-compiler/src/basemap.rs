@@ -140,6 +140,12 @@ pub struct BasemapRequest {
     /// [`CompileStage::WriteTiles`]), each pass of the sort's merge, the
     /// archive, and the building levels.
     pub resume: bool,
+    /// The schema the tiles follow [default: OpenMapTiles]. With another
+    /// schema, `layers` names that schema's layers; `sar`, `languages`, the
+    /// building levels, the search index and the merge cache, which go by
+    /// OpenMapTiles' layers, are refused; and only the supplemental datasets
+    /// the schema reads are used. See `docs/schemas.md`.
+    pub schema: crate::TileSchema,
 }
 
 impl BasemapRequest {
@@ -180,6 +186,7 @@ impl BasemapRequest {
             sort_memory: None,
             merge_cache: crate::MergeCacheOptions::default(),
             resume: false,
+            schema: crate::TileSchema::OpenMapTiles,
         }
     }
 
@@ -192,9 +199,16 @@ impl BasemapRequest {
 
     /// The datasets the compile reads.
     pub fn used_sources(&self) -> Vec<SupplementalDataset> {
+        let schema = self.schema.configured();
         SupplementalDataset::ALL
             .into_iter()
             .filter(|dataset| !self.omit_sources.contains(dataset))
+            .filter(|dataset| match &schema {
+                None => true,
+                Some(schema) => {
+                    *dataset == SupplementalDataset::WaterPolygons && schema.reads_water_polygons()
+                }
+            })
             .collect()
     }
 
@@ -212,7 +226,10 @@ impl BasemapRequest {
     /// takes them.
     fn check(&self) -> Result<Option<Vec<String>>, CompileError> {
         let invalid = CompileError::InvalidRequest;
-        let layers = self.layers.names(self.sar).map_err(invalid)?;
+        let layers = match self.schema.configured() {
+            None => self.layers.names(self.sar).map_err(invalid)?,
+            Some(schema) => self.check_schema(&schema)?,
+        };
         if let Some(languages) = &self.languages {
             omt::resolve_languages(languages).map_err(invalid)?;
         }
@@ -297,6 +314,67 @@ impl BasemapRequest {
         }
         Ok(layers)
     }
+
+    /// The checks a configured schema adds, returning its layers to write.
+    fn check_schema(&self, schema: &crate::Schema) -> Result<Option<Vec<String>>, CompileError> {
+        let name = schema.name();
+        let refuse = |what: &str| {
+            Err(CompileError::InvalidRequest(format!(
+                "{what} go by OpenMapTiles' layers and do not apply to the {name} schema"
+            )))
+        };
+        if self.sar {
+            return refuse("the sar layer and its tags");
+        }
+        if self.languages.is_some() {
+            return refuse("languages");
+        }
+        if self.building_levels {
+            return refuse("building levels");
+        }
+        if self.search_index {
+            return refuse("search indexes");
+        }
+        if self.merge_cache.write || self.merge_cache.reuse_from.is_some() {
+            return refuse("merge caches");
+        }
+        let all = schema.layers();
+        let known = |names: &[crate::LayerName]| {
+            for layer in names {
+                if !all.contains(&layer.as_str()) {
+                    return Err(CompileError::InvalidRequest(format!(
+                        "unknown layer '{}'; the {name} schema's layers are {}",
+                        layer,
+                        all.join(", ")
+                    )));
+                }
+            }
+            Ok(())
+        };
+        let layers = match &self.layers {
+            LayerSelection::All => return Ok(None),
+            LayerSelection::Only(names) => {
+                known(names)?;
+                all.iter()
+                    .filter(|l| names.iter().any(|n| n.as_str() == **l))
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+            }
+            LayerSelection::Except(names) => {
+                known(names)?;
+                all.iter()
+                    .filter(|l| !names.iter().any(|n| n.as_str() == **l))
+                    .map(|l| l.to_string())
+                    .collect()
+            }
+        };
+        if layers.is_empty() {
+            return Err(CompileError::InvalidRequest(
+                "no layer is left to write".into(),
+            ));
+        }
+        Ok(Some(layers))
+    }
 }
 
 /// What a compile wrote.
@@ -322,6 +400,8 @@ pub struct BasemapOutput {
     /// For a resumed compile, the stage it continued from; an earlier,
     /// interrupted attempt did the stages before it.
     pub resumed_from: Option<CompileStage>,
+    /// The schema the tiles follow.
+    pub schema: crate::TileSchema,
 }
 
 /// The scratch directory where a resumable compile of `request` keeps its
@@ -349,15 +429,21 @@ pub const MANIFEST_FORMAT: &str = "basemap-manifest";
 pub const MANIFEST_VERSION: u32 = 1;
 
 impl BasemapOutput {
-    /// The manifest the desktop worker writes beside its output. `version`
-    /// is the OpenMapTiles schema's; `formatVersion` is the manifest's own.
+    /// The manifest the desktop worker writes beside its output. `schema`
+    /// and `version` are the tile schema's (`OpenMapTiles` and
+    /// [`OMT_SCHEMA_VERSION`](crate::OMT_SCHEMA_VERSION) by default; a
+    /// configured schema's version is `null` when it gives none);
+    /// `formatVersion` is the manifest's own.
     /// `omittedSources` is there only when a dataset was left out.
     pub fn manifest(&self) -> serde_json::Value {
         let mut manifest = json!({
             "format": MANIFEST_FORMAT,
             "formatVersion": MANIFEST_VERSION,
-            "schema": "OpenMapTiles",
-            "version": omt::OMT_SCHEMA_VERSION,
+            "schema": self.schema.name(),
+            "version": match self.schema.configured() {
+                None => Some(omt::OMT_SCHEMA_VERSION.to_owned()),
+                Some(schema) => schema.version.clone(),
+            },
             "result": self.result,
             "supplementalInputs": self.supplemental_inputs,
         });
@@ -463,6 +549,7 @@ fn compile(
         sort_memory: request.sort_memory,
         format: request.output_format(),
         merge_cache: request.merge_cache.clone(),
+        schema: request.schema.configured(),
     };
     omt::validate(&compile_request)?;
     let used = request.used_sources();
@@ -623,7 +710,6 @@ fn compile(
         guard.keep();
     }
     Ok(BasemapOutput {
-        result,
         archive: request.output.clone(),
         format: request.output_format(),
         building_levels,
@@ -633,8 +719,11 @@ fn compile(
         omitted_sources: SupplementalDataset::ALL
             .into_iter()
             .filter(|dataset| request.omit_sources.contains(dataset))
+            .filter(|dataset| result.omitted_sources.iter().any(|id| id == dataset.id()))
             .collect(),
         resumed_from: resumed.map(ResumePoint::stage),
+        schema: request.schema.clone(),
+        result,
     })
 }
 

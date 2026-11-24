@@ -277,6 +277,19 @@ adds the whole list and `-ru` leaves one out, so `default,-ru` keeps all but
 Russian. `name`, `name_en`, `name_de`, `name_int`, `name:latin` and
 `name:nonlatin` are always written.
 
+### Schemas: OpenMapTiles, Shortbread or your own
+
+`--schema shortbread` writes [Shortbread](https://shortbread-tiles.org)
+instead of OpenMapTiles, and `--schema my-map.yml` a schema of your own in
+Planetiler's custom map YAML: which layers, which OSM tags go into them,
+which attributes and from which zoom. A schema written for Planetiler's
+`generate-custom` compiles as it is, within the subset
+[docs/schemas.md](docs/schemas.md) lists, and `schema verify my-map.yml`
+runs the examples it carries. Shortbread is Planetiler 0.10.2's own
+`shortbread.yml`; on Berlin the archive has the same features and geometry
+as Planetiler's in all 26 layers. Schemas are data, not scripts, so they are
+as safe to load on a phone as any other input.
+
 ### Without the supplemental datasets
 
 `--omit-sources water_polygons,natural_earth,lake_centerlines` (or `all`)

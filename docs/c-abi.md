@@ -135,7 +135,8 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
   "threads": 2,
   "buildingLevels": false,
   "sar": false,
-  "resume": false
+  "resume": false,
+  "schema": "openmaptiles"
 }
 ```
 
@@ -152,7 +153,11 @@ PMTiles. `sar` also writes the search-and-rescue layer
 naming `sar` writes it too. `resume` makes the compile resumable
 (`BasemapRequest::resume`): when the app is killed or the job cancelled, its
 checkpoints stay in `tempDir`, and starting the same request again continues
-from the last stage completed, with the same archive.
+from the last stage completed, with the same archive. `schema` is
+`openmaptiles` (the default), `shortbread`, the path of a YAML schema, or
+`{"yaml": "..."}` holding the schema's text ([schemas.md](schemas.md)); with
+another schema, `layers` names its layers, and `sar`, `languages` and
+`buildingLevels` are refused.
 
 The result is the basemap manifest the worker writes (`format`,
 `formatVersion`, `schema`, `version`, `result`, `supplementalInputs`,

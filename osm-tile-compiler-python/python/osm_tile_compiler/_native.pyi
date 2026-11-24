@@ -74,6 +74,7 @@ def compile(
     building_levels: bool = False,
     sar: bool = False,
     sort_memory: int | None = None,
+    schema: str | None = None,
     progress: Callable[[Progress], object] | None = None,
     cancel: _Cancel = None,
 ) -> _Report: ...

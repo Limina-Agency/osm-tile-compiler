@@ -12,8 +12,8 @@ use crate::job::{JobError, Progress, Work};
 use crate::{archive_jobs, fetch_jobs, update_job};
 use osm_tile_compiler::{
     ArchiveCenter, Area, AreaPolygon, BasemapRequest, CompileBounds, CompileError, LayerSelection,
-    OutputFormat, ReadScope, SourcesPolicy, StylePackEvent, StylePackRequest, SupplementalDataset,
-    ZoomRange, compile_basemap, write_style_pack,
+    OutputFormat, ReadScope, Schema, SourcesPolicy, StylePackEvent, StylePackRequest,
+    SupplementalDataset, TileSchema, ZoomRange, compile_basemap, write_style_pack,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -208,6 +208,16 @@ struct AreaJson {
     read: ReadScopeJson,
 }
 
+/// The tile schema: `"openmaptiles"`, `"shortbread"` or a YAML file's path,
+/// or `{"yaml": "..."}` holding a schema's text, as an app that bundles its
+/// schema passes it.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SchemaJson {
+    NameOrPath(String),
+    Text { yaml: String },
+}
+
 /// `compile_basemap`'s request. Every field but the four paths is optional
 /// and defaults as `BasemapRequest::new` does. Its shape follows the request
 /// types (`ZoomRange`, `LayerSelection`, `Area`).
@@ -245,6 +255,8 @@ struct CompileBasemapJson {
     /// from them (`BasemapRequest::resume`).
     #[serde(default)]
     resume: bool,
+    /// The tile schema [default: OpenMapTiles].
+    schema: Option<SchemaJson>,
 }
 
 fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
@@ -315,6 +327,15 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
     request.building_levels = json.building_levels;
     request.sar = json.sar;
     request.resume = json.resume;
+    request.schema = match json.schema {
+        None => TileSchema::OpenMapTiles,
+        Some(SchemaJson::NameOrPath(name)) => TileSchema::from_name_or_path(&name)
+            .map_err(|e| JobError::invalid_request(format!("Invalid schema: {e}")))?,
+        Some(SchemaJson::Text { yaml }) => TileSchema::Custom(std::sync::Arc::new(
+            Schema::from_yaml(&yaml)
+                .map_err(|e| JobError::invalid_request(format!("Invalid schema: {e}")))?,
+        )),
+    };
     // Everything that needs no reading or network fails the start, not the job.
     request.validate()?;
     Ok(request)

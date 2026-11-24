@@ -187,8 +187,12 @@ pub(super) struct ArchiveHeader<'a> {
     pub options: &'a ArchiveOptions,
     pub min_zoom: u8,
     pub max_zoom: u8,
-    /// The layers the metadata declares, in `LAYERS` order.
-    pub layers: &'a [&'static str],
+    /// The layers the metadata declares, in `LAYERS` order (or the
+    /// schema's).
+    pub layers: &'a [&'a str],
+    /// The configured schema the tiles follow, or `None` for OpenMapTiles,
+    /// whose post-processing and metadata apply only then.
+    pub schema: Option<&'a super::schema::Schema>,
     /// The ids of the supplemental datasets left out, for the metadata.
     pub omitted_sources: &'a [&'static str],
     /// How current the OSM data is, for the metadata.
@@ -217,6 +221,7 @@ impl ArchiveHeader<'static> {
             min_zoom,
             max_zoom,
             layers: &super::LAYERS,
+            schema: None,
             omitted_sources: &[],
             osm_data: &OSM_DATA,
         }
@@ -1188,8 +1193,10 @@ impl Store {
         }
         drop(merge_phase);
         drop(merge_stage);
+        let omt_rules = header.schema.is_none();
         let metadata = metadata(
             header.layers,
+            header.schema,
             (minzoom, maxzoom),
             &self.fields,
             &self.zooms,
@@ -1243,6 +1250,7 @@ impl Store {
                             timings,
                             options.gzip_level,
                             options.tile_format,
+                            omt_rules,
                             control,
                         )
                     })
@@ -1824,6 +1832,7 @@ fn merge_controlled(
 pub(super) fn metadata_for_test(header: &ArchiveHeader) -> serde_json::Value {
     serde_json::from_str(&metadata(
         header.layers,
+        header.schema,
         (header.min_zoom, header.max_zoom),
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -1837,8 +1846,10 @@ pub(super) fn metadata_for_test(header: &ArchiveHeader) -> serde_json::Value {
 /// The metadata's `generator`: this crate and its version.
 pub(crate) const GENERATOR: &str = concat!("osm-tile-compiler ", env!("CARGO_PKG_VERSION"));
 
+#[allow(clippy::too_many_arguments)]
 fn metadata(
     layers: &[&str],
+    schema: Option<&super::schema::Schema>,
     (min, max): (u8, u8),
     fields: &BTreeMap<String, BTreeMap<String, String>>,
     zooms: &BTreeMap<String, (u8, u8)>,
@@ -1846,6 +1857,17 @@ fn metadata(
     omitted_sources: &[&str],
     osm_data: &super::OsmDataInfo,
 ) -> String {
+    if let Some(schema) = schema {
+        return schema_metadata(
+            schema,
+            layers,
+            (min, max),
+            (fields, zooms),
+            options,
+            omitted_sources,
+            osm_data,
+        );
+    }
     let layers_written = layers;
     let layers = layers
         .iter()
@@ -1872,16 +1894,7 @@ fn metadata(
         "generator": GENERATOR,
         "vector_layers": layers,
     });
-    // Each is written only when the extract's header gives it.
-    if let Some(time) = osm_data.timestamp_rfc3339() {
-        metadata["osm_data_timestamp"] = serde_json::json!(time);
-    }
-    if let Some(sequence) = osm_data.replication_sequence_number {
-        metadata["osm_replication_sequence"] = serde_json::json!(sequence);
-    }
-    if let Some(url) = &osm_data.replication_base_url {
-        metadata["osm_replication_url"] = serde_json::json!(url);
-    }
+    osm_metadata(&mut metadata, osm_data);
     // Only an archive built without some supplemental datasets says so, so
     // a full build's metadata is as before.
     if !omitted_sources.is_empty() {
@@ -1893,6 +1906,92 @@ fn metadata(
     }
     metadata.to_string()
 }
+
+/// Adds how current the OSM data is: each key only when the extract's
+/// header gives it.
+fn osm_metadata(metadata: &mut serde_json::Value, osm_data: &super::OsmDataInfo) {
+    if let Some(time) = osm_data.timestamp_rfc3339() {
+        metadata["osm_data_timestamp"] = serde_json::json!(time);
+    }
+    if let Some(sequence) = osm_data.replication_sequence_number {
+        metadata["osm_replication_sequence"] = serde_json::json!(sequence);
+    }
+    if let Some(url) = &osm_data.replication_base_url {
+        metadata["osm_replication_url"] = serde_json::json!(url);
+    }
+}
+
+/// The metadata of an archive a configured schema made. Its name,
+/// description and attribution are the schema's unless the request set
+/// them; there is no OpenMapTiles version or Planetiler commit to give.
+fn schema_metadata(
+    schema: &super::schema::Schema,
+    layers: &[&str],
+    (min, max): (u8, u8),
+    (fields, zooms): (&LayerFields, &BTreeMap<String, (u8, u8)>),
+    options: &ArchiveOptions,
+    omitted_sources: &[&str],
+    osm_data: &super::OsmDataInfo,
+) -> String {
+    let defaults = ArchiveOptions::default();
+    let pick = |set: &str, default: &str, own: Option<&str>, fallback: &str| -> String {
+        if set != default {
+            set.to_owned()
+        } else {
+            own.unwrap_or(fallback).to_owned()
+        }
+    };
+    let layers = layers
+        .iter()
+        .map(|id| {
+            let (lo, hi) = zooms.get(*id).copied().unwrap_or((min, max));
+            serde_json::json!({
+                "id": id,
+                "minzoom": lo,
+                "maxzoom": hi,
+                "fields": fields.get(*id).cloned().unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut metadata = serde_json::json!({
+        "name": pick(&options.name, &defaults.name, Some(schema.name()), ""),
+        "type": if schema.overlay { "overlay" } else { "baselayer" },
+        "format": options.tile_format.metadata_format(),
+        "minzoom": min,
+        "maxzoom": max,
+        "description": pick(
+            &options.description,
+            &defaults.description,
+            schema.description.as_deref(),
+            &format!("{} schema", schema.name()),
+        ),
+        "attribution": pick(
+            &options.attribution,
+            &defaults.attribution,
+            schema.attribution.as_deref(),
+            OSM_ATTRIBUTION,
+        ),
+        "schema": schema.name(),
+        "schema_digest": schema.digest,
+        "generator": GENERATOR,
+        "vector_layers": layers,
+    });
+    if let Some(version) = &schema.version {
+        metadata["version"] = serde_json::json!(version);
+    }
+    osm_metadata(&mut metadata, osm_data);
+    if !omitted_sources.is_empty() {
+        metadata["omitted_sources"] = serde_json::json!(omitted_sources);
+    }
+    metadata.to_string()
+}
+
+/// Each layer's attribute names and their types, as the metadata lists them.
+type LayerFields = BTreeMap<String, BTreeMap<String, String>>;
+
+/// The attribution of a schema that gives none: the data's own.
+const OSM_ATTRIBUTION: &str = "<a href=\"https://www.openstreetmap.org/copyright\" \
+target=\"_blank\">&copy; OpenStreetMap contributors</a>";
 
 struct EncodeTimings {
     decode: crate::profiling::Accumulator,
@@ -1931,14 +2030,19 @@ fn encode_layer_records(
     mut records: Vec<Record>,
     timings: &mut EncodeTimings,
     tile_format: TileFormat,
+    omt_rules: bool,
     control: &Control,
 ) -> Result<Option<Vec<u8>>, String> {
     control.check()?;
     records.sort_by(order);
-    records = timings.density.measure(|| point_density(records));
-    records = timings
-        .geometry
-        .measure(|| merge_geometries_controlled(records, control))?;
+    // OpenMapTiles' post-processing goes by its layer names, which another
+    // schema's layers may share.
+    if omt_rules {
+        records = timings.density.measure(|| point_density(records));
+        records = timings
+            .geometry
+            .measure(|| merge_geometries_controlled(records, control))?;
+    }
     let layer = timings
         .dictionaries
         .measure(|| encode_layer(name, &records))
@@ -1993,6 +2097,7 @@ fn encode_job(
     timings: &mut EncodeTimings,
     gzip_level: u32,
     tile_format: TileFormat,
+    omt_rules: bool,
     control: &Control,
 ) -> Result<(Option<EncodedTile>, Option<TileEntry>), String> {
     let id = job.id;
@@ -2106,7 +2211,7 @@ fn encode_job(
                         .map(EncodedRecord::decode)
                         .collect::<Result<Vec<_>, _>>()
                 })?;
-                encode_layer_records(name, records, timings, tile_format, control)?
+                encode_layer_records(name, records, timings, tile_format, omt_rules, control)?
             }
         };
         let size = bytes.as_ref().map_or(0, Vec::len);

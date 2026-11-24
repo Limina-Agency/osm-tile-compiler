@@ -46,6 +46,8 @@ Usage:
   osm-tile-compiler search-index <INPUT.pmtiles> [--output <FILE.idx>] [--threads <N>] [--json]
   osm-tile-compiler search <FILE.idx|FILE.pmtiles> <QUERY>... [--near <LON LAT>] [OPTIONS]
   osm-tile-compiler fetch-sources <DIR>
+  osm-tile-compiler schema verify <FILE.yml|shortbread> [--json]
+  osm-tile-compiler schema layers <FILE.yml|shortbread|openmaptiles>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar] [--tile-format <F>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
@@ -73,6 +75,8 @@ Usage:
   osm-tile-compiler search-index <INPUT.pmtiles> [--output <FILE.idx>] [--threads <N>] [--json]
   osm-tile-compiler search <FILE.idx|FILE.pmtiles> <QUERY>... [--near <LON LAT>] [OPTIONS]
   osm-tile-compiler fetch-sources <DIR>
+  osm-tile-compiler schema verify <FILE.yml|shortbread> [--json]
+  osm-tile-compiler schema layers <FILE.yml|shortbread|openmaptiles>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar] [--tile-format <F>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
@@ -103,6 +107,9 @@ Commands:
   fetch-sources    Download, or verify, the supplemental datasets into DIR:
                    lake_centerline.shp.zip, natural_earth_vector.sqlite.zip and
                    water-polygons-split-3857.zip
+  schema           Check a tile schema (docs/schemas.md): 'verify' runs the
+                   examples it lists and exits with 1 if any fails; 'layers'
+                   lists its layers
   style            Print a MapLibre style (OSM Bright) for an archive that
                    MapLibre loads from ARCHIVE_URL through the PMTiles protocol;
                    'pmtiles://' is prepended unless present. With --offline,
@@ -210,6 +217,13 @@ Compile options:
   --tile-format <F>     mvt, or mlt for MapLibre Tiles (experimental: MapLibre
                         GL JS 5.12+, Android 12.1+, iOS 6.2+ read them, given
                         encoding mlt on the source) [default: mvt]
+  --schema <S>          The tile schema: openmaptiles, shortbread, or a YAML
+                        file in Planetiler's custom map format
+                        (docs/schemas.md) [default: openmaptiles]. With
+                        another schema, --layers names its layers, only the
+                        supplemental datasets it reads are needed, and
+                        --sar, --languages, --building-levels,
+                        --search-index and the merge cache do not apply
   --layers <A,B,...>    Write only these layers [default: all]; each is the
                         same as in a full build. Naming sar writes it, as
                         --sar does
@@ -416,6 +430,7 @@ struct CompileArgs {
     delta_from: Option<PathBuf>,
     sign_delta: Option<PathBuf>,
     merge_cache: osm_tile_compiler::MergeCacheOptions,
+    schema: osm_tile_compiler::TileSchema,
 }
 
 /// The change files and replication server `compile` and `update` apply.
@@ -528,6 +543,11 @@ enum Command {
     SearchIndex(search::SearchIndexArgs),
     Search(search::SearchArgs),
     FetchSources(PathBuf),
+    SchemaVerify {
+        schema: osm_tile_compiler::TileSchema,
+        json: bool,
+    },
+    SchemaLayers(osm_tile_compiler::TileSchema),
     Style(StyleArgs),
     Inspect {
         archive: PathBuf,
@@ -621,6 +641,14 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::SearchIndex(args) => search::search_index(args),
         Command::Search(args) => search::search(args),
         Command::FetchSources(directory) => fetch_sources(&directory),
+        Command::SchemaVerify { schema, json } => schema_verify(&schema, json),
+        Command::SchemaLayers(schema) => {
+            match schema.configured() {
+                None => LAYERS.iter().for_each(|layer| println!("{layer}")),
+                Some(schema) => schema.layers().iter().for_each(|layer| println!("{layer}")),
+            }
+            Ok(())
+        }
         Command::Style(args) => style(args),
         Command::Inspect { archive, json } => inspect(&archive, json),
         Command::Verify { archive, json } => verify(&archive, json),
@@ -676,6 +704,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("search-index") => search::parse_search_index(rest),
         Some("search") => search::parse_search(rest),
         Some("fetch-sources") => parse_fetch_sources(rest),
+        Some("schema") => parse_schema(rest),
         Some("style") => parse_style(rest),
         Some(name @ ("inspect" | "verify")) => parse_archive_command(name, rest),
         Some("extract") => parse_extract(rest),
@@ -838,6 +867,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut only_layers = None;
     let mut excluded_layers = None;
     let mut languages = None;
+    let mut schema = osm_tile_compiler::TileSchema::OpenMapTiles;
     let mut changes = ChangeArgs::default();
     let mut delta_from = None;
     let mut sign_delta = None;
@@ -950,6 +980,11 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 omit_sources.dedup();
             }
             "--json" => json = true,
+            "--schema" => {
+                let name = value(&mut args, &flag)?.to_string_lossy().into_owned();
+                schema = osm_tile_compiler::TileSchema::from_name_or_path(&name)
+                    .map_err(|e| format!("--schema: {e}"))?;
+            }
             "--layers" => only_layers = Some(list(value(&mut args, &flag)?)),
             "--exclude-layers" => excluded_layers = Some(list(value(&mut args, &flag)?)),
             "--languages" => {
@@ -982,9 +1017,12 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         (None, Some(except)) => (LayerSelection::except(except), "--exclude-layers"),
         (None, None) => (LayerSelection::All, ""),
     };
-    layers
-        .resolve()
-        .map_err(|e| format!("{flag}: {}", e.message()))?;
+    // A configured schema's layers are checked with the request.
+    if schema.configured().is_none() {
+        layers
+            .resolve()
+            .map_err(|e| format!("{flag}: {}", e.message()))?;
+    }
     if area_only && bounds.is_none() && polygon.is_none() {
         return Err("--area-only needs --bounds or --polygon".into());
     }
@@ -1037,6 +1075,12 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         Some(sources) => sources,
         // Nothing is read from it.
         None if omit_sources.len() == SupplementalDataset::ALL.len() => PathBuf::new(),
+        None if schema
+            .configured()
+            .is_some_and(|schema| !schema.reads_water_polygons()) =>
+        {
+            PathBuf::new()
+        }
         None => return Err("compile needs --sources <DIR>".into()),
     };
     if resume && !changes.is_empty() {
@@ -1090,7 +1134,79 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         delta_from,
         sign_delta,
         merge_cache,
+        schema,
     })))
+}
+
+/// `schema verify <SCHEMA> [--json]` and `schema layers <SCHEMA>`.
+fn parse_schema(args: &[OsString]) -> Result<Command, String> {
+    let mut action = None;
+    let mut name = None;
+    let mut json = false;
+    for arg in args {
+        match option(arg).as_deref() {
+            Some("--help" | "-h") => return Ok(Command::Help),
+            Some("--json") => json = true,
+            Some(flag) => return Err(format!("unknown schema option '{flag}'")),
+            None if action.is_none() => action = Some(arg.to_string_lossy().into_owned()),
+            None if name.is_none() => name = Some(arg.to_string_lossy().into_owned()),
+            None => return Err(format!("unexpected argument '{}'", arg.to_string_lossy())),
+        }
+    }
+    let action = action.ok_or("schema needs 'verify' or 'layers'")?;
+    let name = name.ok_or_else(|| format!("schema {action} needs a schema file or name"))?;
+    let schema = osm_tile_compiler::TileSchema::from_name_or_path(&name)?;
+    match action.as_str() {
+        "verify" if schema.configured().is_none() => {
+            Err("the OpenMapTiles schema is built in and has no examples to verify".into())
+        }
+        "verify" => Ok(Command::SchemaVerify { schema, json }),
+        "layers" if !json => Ok(Command::SchemaLayers(schema)),
+        "layers" => Err("schema layers takes no --json".into()),
+        other => Err(format!(
+            "unknown schema action '{other}'; use verify or layers"
+        )),
+    }
+}
+
+/// Runs a schema's examples and prints what fails.
+fn schema_verify(schema: &osm_tile_compiler::TileSchema, json: bool) -> Result<(), String> {
+    let schema = schema.configured().expect("checked when parsed");
+    let results = schema.verify();
+    let failed = results.iter().filter(|r| !r.issues.is_empty()).count();
+    if json {
+        let value = serde_json::json!({
+            "schema": schema.name(),
+            "examples": results.len(),
+            "failed": failed,
+            "warnings": schema.warnings(),
+            "results": results
+                .iter()
+                .map(|r| serde_json::json!({"name": r.name, "issues": r.issues}))
+                .collect::<Vec<_>>(),
+        });
+        println!("{value}");
+    } else {
+        for warning in schema.warnings() {
+            eprintln!("warning: {warning}");
+        }
+        for result in results.iter().filter(|r| !r.issues.is_empty()) {
+            println!("FAIL {}", result.name);
+            for issue in &result.issues {
+                println!("  {issue}");
+            }
+        }
+        println!(
+            "{}: {} of {} examples pass",
+            schema.name(),
+            results.len() - failed,
+            results.len()
+        );
+    }
+    if failed > 0 {
+        return Err(format!("{failed} schema examples failed"));
+    }
+    Ok(())
 }
 
 fn parse_update(args: &[OsString]) -> Result<Command, String> {
@@ -2102,6 +2218,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.sar = args.sar;
     request.sort_memory = args.sort_memory;
     request.merge_cache = args.merge_cache;
+    request.schema = args.schema;
     request.resume = args.resume;
     if args.resume && osm_tile_compiler::checkpoint_directory(&request).is_dir() {
         status.line(&format!(

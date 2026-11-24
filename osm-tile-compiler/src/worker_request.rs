@@ -53,6 +53,10 @@ struct CompilerProcessRequest {
     /// The tiles' encoding, `mvt` or (experimental) `mlt` [default: mvt].
     #[serde(default)]
     tile_format: osm_tile_compiler::TileFormat,
+    /// The tile schema: `openmaptiles`, `shortbread` or a YAML file's path
+    /// [default: openmaptiles].
+    #[serde(default)]
+    schema: Option<String>,
 }
 
 /// Reads the request at `path`: the compile it asks for, and where to write
@@ -101,5 +105,8 @@ pub fn read(path: &Path) -> Result<(BasemapRequest, PathBuf), String> {
     compile.sar = request.sar;
     compile.resume = request.resume;
     compile.archive.tile_format = request.tile_format;
+    if let Some(name) = request.schema {
+        compile.schema = osm_tile_compiler::TileSchema::from_name_or_path(&name)?;
+    }
     Ok((compile, request.manifest_path))
 }
