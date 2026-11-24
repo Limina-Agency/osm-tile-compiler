@@ -1,0 +1,9 @@
+{
+  "name": "mlt-conformance",
+  "private": true,
+  "description": "The TypeScript MLT decoder MapLibre GL JS uses, for scripts/check-mlt-conformance.sh",
+  "type": "module",
+  "dependencies": {
+    "@maplibre/mlt": "1.3.0"
+  }
+}

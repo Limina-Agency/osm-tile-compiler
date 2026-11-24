@@ -50,7 +50,7 @@ struct CompilerProcessRequest {
     /// from them on the next request for the same output [default: no].
     #[serde(default)]
     resume: bool,
-    /// The tiles' encoding, `mvt` or (experimental) `mlt` [default: mvt].
+    /// The tiles' encoding, `mvt` or `mlt` [default: mvt].
     #[serde(default)]
     tile_format: osm_tile_compiler::TileFormat,
 }

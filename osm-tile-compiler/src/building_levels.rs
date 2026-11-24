@@ -97,6 +97,7 @@ const HEADER_BYTES: usize = 127;
 const COMPRESSION_NONE: u8 = 1;
 const COMPRESSION_GZIP: u8 = 2;
 const TILE_TYPE_MVT: u8 = 1;
+const TILE_TYPE_MLT: u8 = 6;
 
 /// What one level of the archive holds.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -187,9 +188,10 @@ pub(crate) fn write_levels(
     let scan_stage = crate::stage_profile::Stage::start("building_levels.scan");
     let archive = Archive::open(input)?;
     let header = Header::parse(&archive.section(0, HEADER_BYTES as u64)?)?;
-    if header.tile_type != TILE_TYPE_MVT {
+    if !matches!(header.tile_type, TILE_TYPE_MVT | TILE_TYPE_MLT) {
         return Err(format!("{} holds no vector tiles", input.display()));
     }
+    let mlt = header.tile_type == TILE_TYPE_MLT;
     let mut tiles = source_tiles(&archive, &header)?;
     tiles.sort_unstable_by_key(|tile| (tile.x >> 3, tile.y >> 3, tile.x, tile.y));
     let groups: Vec<&[SourceTile]> = tiles
@@ -203,7 +205,7 @@ pub(crate) fn write_levels(
             .par_iter()
             .map_init(OpenGrids::default, |grids, group| {
                 control.check()?;
-                let levels = group_levels(&archive, header.tile_compression, group, grids);
+                let levels = group_levels(&archive, header.tile_compression, mlt, group, grids);
                 control.add_done(1);
                 levels
             })
@@ -1410,6 +1412,7 @@ fn quadrant_order(tile: &SourceTile) -> u32 {
 fn group_levels(
     archive: &Archive,
     compression: u8,
+    mlt: bool,
     z14: &[SourceTile],
     grids: &mut OpenGrids,
 ) -> Result<GroupLevels, String> {
@@ -1424,7 +1427,13 @@ fn group_levels(
         let tile = z14[source];
         grids.finish_unless(Some((tile.x, tile.y)), &sources, &mut group)?;
         archive.section_into(tile.offset, tile.length, &mut grids.stored)?;
-        let bytes = unpack_into(&grids.stored, compression, &mut grids.raw)?;
+        let mut bytes = unpack_into(&grids.stored, compression, &mut grids.raw)?;
+        let transcoded;
+        if mlt {
+            transcoded = crate::mlt::to_mvt(bytes)
+                .map_err(|e| format!("Malformed tile 14/{}/{}: {e}", tile.x, tile.y))?;
+            bytes = &transcoded;
+        }
         let footprints = parse_footprints(bytes)
             .ok_or_else(|| format!("Malformed tile 14/{}/{}", tile.x, tile.y))?;
         if footprints.is_empty() {
