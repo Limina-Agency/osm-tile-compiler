@@ -131,7 +131,8 @@ struct Archive {
 type StoredTile = (Vec<u8>, Option<&'static str>);
 
 enum Source {
-    PmTiles(Mutex<PmTiles>),
+    // Boxed: the reader is far larger than the MBTiles connection.
+    PmTiles(Box<Mutex<PmTiles>>),
     MbTiles(Mutex<rusqlite::Connection>),
 }
 
@@ -312,11 +313,11 @@ impl Archive {
                 4 => Some("zstd"),
                 _ => None,
             },
-            source: Source::PmTiles(Mutex::new(PmTiles {
+            source: Source::PmTiles(Box::new(Mutex::new(PmTiles {
                 reader,
                 root: Arc::new(root.into_iter().map(|(entry, _)| entry).collect()),
                 leaves: HashMap::new(),
-            })),
+            }))),
         })
     }
 
@@ -1248,6 +1249,7 @@ mod tests {
             metadata_json: metadata,
             min_zoom: 8,
             max_zoom: 8,
+            tile_format: crate::TileFormat::Mvt,
         };
         let file = File::create(dir.join("test.pmtiles")).unwrap();
         let mut writers: Vec<Box<dyn TileWriter + '_>> = vec![
