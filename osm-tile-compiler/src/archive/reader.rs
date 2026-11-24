@@ -1,6 +1,7 @@
 //! A synchronous reader of PMTiles v3 archives that exposes their layout:
 //! header fields, directory entries with their offsets, and stored tile bytes.
 //! Spec: <https://github.com/protomaps/PMTiles/blob/main/spec/v3/spec.md>.
+use super::http::HttpFile;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -9,6 +10,8 @@ const HEADER_BYTES: usize = 127;
 /// Directories nest at most this deep: the spec has a root and one level of
 /// leaves, and writers may nest leaves further; deeper means a cycle.
 const MAX_DIRECTORY_DEPTH: usize = 4;
+/// Range requests in flight at once when an archive is read over HTTP.
+const HTTP_PARALLEL_REQUESTS: usize = 8;
 
 /// The header, field by field.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,10 +55,17 @@ pub struct Entry {
     pub run_length: u32,
 }
 
-/// Reads a PMTiles v3 archive. Test support: not part of the stable API.
+/// Where an archive's bytes come from.
+enum Source {
+    File(File),
+    Http(HttpFile),
+}
+
+/// Reads a PMTiles v3 archive, from a file or over HTTP. Test support: not
+/// part of the stable API.
 #[doc(hidden)]
 pub struct ArchiveReader {
-    file: File,
+    source: Source,
     pub file_length: u64,
     pub header: Header,
 }
@@ -128,28 +138,48 @@ impl ArchiveReader {
         let mut bytes = [0u8; HEADER_BYTES];
         file.read_exact(&mut bytes)
             .map_err(|_| format!("{} is too short for a PMTiles header", path.display()))?;
+        Self::new(
+            Source::File(file),
+            file_length,
+            &bytes,
+            &path.display().to_string(),
+        )
+    }
+
+    /// Opens the archive at an `http://` or `https://` URL, which must answer
+    /// range requests.
+    pub fn open_url(url: &str) -> Result<Self, String> {
+        let mut http = HttpFile::open(url)?;
+        let file_length = http.length;
+        if file_length < HEADER_BYTES as u64 {
+            return Err(format!("{url} is too short for a PMTiles header"));
+        }
+        let bytes = http.read(0, HEADER_BYTES as u64)?;
+        Self::new(Source::Http(http), file_length, &bytes, url)
+    }
+
+    fn new(source: Source, file_length: u64, bytes: &[u8], name: &str) -> Result<Self, String> {
         if &bytes[..7] != b"PMTiles" {
-            return Err(format!("{} is not a PMTiles archive", path.display()));
+            return Err(format!("{name} is not a PMTiles archive"));
         }
         if bytes[7] != 3 {
             return Err(format!(
-                "{} is PMTiles version {}; only version 3 is supported",
-                path.display(),
+                "{name} is PMTiles version {}; only version 3 is supported",
                 bytes[7]
             ));
         }
         let header = Header {
-            root_offset: u64_at(&bytes, 8),
-            root_length: u64_at(&bytes, 16),
-            metadata_offset: u64_at(&bytes, 24),
-            metadata_length: u64_at(&bytes, 32),
-            leaf_offset: u64_at(&bytes, 40),
-            leaf_length: u64_at(&bytes, 48),
-            data_offset: u64_at(&bytes, 56),
-            data_length: u64_at(&bytes, 64),
-            addressed_tiles: u64_at(&bytes, 72),
-            tile_entries: u64_at(&bytes, 80),
-            tile_contents: u64_at(&bytes, 88),
+            root_offset: u64_at(bytes, 8),
+            root_length: u64_at(bytes, 16),
+            metadata_offset: u64_at(bytes, 24),
+            metadata_length: u64_at(bytes, 32),
+            leaf_offset: u64_at(bytes, 40),
+            leaf_length: u64_at(bytes, 48),
+            data_offset: u64_at(bytes, 56),
+            data_length: u64_at(bytes, 64),
+            addressed_tiles: u64_at(bytes, 72),
+            tile_entries: u64_at(bytes, 80),
+            tile_contents: u64_at(bytes, 88),
             clustered: bytes[96] == 1,
             internal_compression: bytes[97],
             tile_compression: bytes[98],
@@ -157,23 +187,35 @@ impl ArchiveReader {
             min_zoom: bytes[100],
             max_zoom: bytes[101],
             bounds: [
-                e7_at(&bytes, 102),
-                e7_at(&bytes, 106),
-                e7_at(&bytes, 110),
-                e7_at(&bytes, 114),
+                e7_at(bytes, 102),
+                e7_at(bytes, 106),
+                e7_at(bytes, 110),
+                e7_at(bytes, 114),
             ],
             center_zoom: bytes[118],
-            center: [e7_at(&bytes, 119), e7_at(&bytes, 123)],
+            center: [e7_at(bytes, 119), e7_at(bytes, 123)],
         };
         Ok(Self {
-            file,
+            source,
             file_length,
             header,
         })
     }
 
-    /// Reads `length` bytes at `offset` of the file.
-    pub fn read(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+    /// Whether the archive is read over HTTP, where each read is a request.
+    pub(crate) fn is_remote(&self) -> bool {
+        matches!(self.source, Source::Http(_))
+    }
+
+    /// The range requests made and the bytes they returned; zero for a file.
+    pub(crate) fn transferred(&self) -> (u64, u64) {
+        match &self.source {
+            Source::File(_) => (0, 0),
+            Source::Http(http) => (http.requests, http.bytes_read),
+        }
+    }
+
+    fn check_range(&self, offset: u64, length: u64) -> Result<(), String> {
         if offset
             .checked_add(length)
             .is_none_or(|end| end > self.file_length)
@@ -183,12 +225,37 @@ impl ArchiveReader {
                 self.file_length
             ));
         }
-        let mut bytes = vec![0; length as usize];
-        self.file
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| self.file.read_exact(&mut bytes))
-            .map_err(|e| e.to_string())?;
-        Ok(bytes)
+        Ok(())
+    }
+
+    /// The bytes of each `(offset, length)` of the file, in order. Over
+    /// HTTP, several ranges are requested at a time.
+    pub(crate) fn read_many(&mut self, ranges: &[(u64, u64)]) -> Result<Vec<Vec<u8>>, String> {
+        for &(offset, length) in ranges {
+            self.check_range(offset, length)?;
+        }
+        match &mut self.source {
+            Source::Http(http) => http.read_many(ranges, HTTP_PARALLEL_REQUESTS),
+            Source::File(_) => ranges
+                .iter()
+                .map(|&(offset, length)| self.read(offset, length))
+                .collect(),
+        }
+    }
+
+    /// Reads `length` bytes at `offset` of the file.
+    pub fn read(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+        self.check_range(offset, length)?;
+        match &mut self.source {
+            Source::Http(http) => http.read(offset, length),
+            Source::File(file) => {
+                let mut bytes = vec![0; length as usize];
+                file.seek(SeekFrom::Start(offset))
+                    .and_then(|_| file.read_exact(&mut bytes))
+                    .map_err(|e| e.to_string())?;
+                Ok(bytes)
+            }
+        }
     }
 
     /// The metadata JSON text.
@@ -217,7 +284,11 @@ impl ArchiveReader {
         self.read(offset, u64::from(entry.length))
     }
 
-    fn directory(&mut self, offset: u64, length: u64) -> Result<Vec<(Entry, bool)>, String> {
+    pub(crate) fn directory(
+        &mut self,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<(Entry, bool)>, String> {
         let bytes = self.read(offset, length)?;
         let bytes = decompress(&bytes, self.header.internal_compression)?;
         let at = &mut 0;
@@ -283,6 +354,65 @@ impl ArchiveReader {
         self.walk(|reader, entry, leaf| if leaf { Ok(()) } else { visit(reader, entry) })
     }
 
+    /// Calls `visit` with every tile entry in directory order, as
+    /// [`visit_entries`](Self::visit_entries) does, except under leaf
+    /// directories that `descend` turns down. `descend` gets the tile IDs a
+    /// leaf may address, `first..end`: from its pointer's tile ID to the
+    /// next entry's, or to the end of its parent's span.
+    pub(crate) fn visit_entries_within(
+        &mut self,
+        mut descend: impl FnMut(u64, u64) -> bool,
+        mut visit: impl FnMut(&mut Self, Entry) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let root = self.directory(self.header.root_offset, self.header.root_length)?;
+        // Each level: its entries, the next to visit, and the end of its span.
+        let mut stack = vec![(root, 0usize, u64::MAX)];
+        while let Some((entries, next, end)) = stack.last_mut() {
+            let Some(&(entry, leaf)) = entries.get(*next) else {
+                stack.pop();
+                continue;
+            };
+            *next += 1;
+            let span_end = entries.get(*next).map_or(*end, |(e, _)| e.tile_id);
+            if !leaf {
+                visit(self, entry)?;
+                continue;
+            }
+            if !descend(entry.tile_id, span_end) {
+                continue;
+            }
+            if stack.len() >= MAX_DIRECTORY_DEPTH {
+                return Err("leaf directories nest too deep".into());
+            }
+            let leaf = self.leaf(entry)?;
+            stack.push((leaf, 0, span_end));
+        }
+        Ok(())
+    }
+
+    /// The entries of the leaf directory a pointer addresses.
+    fn leaf(&mut self, pointer: Entry) -> Result<Vec<(Entry, bool)>, String> {
+        let beyond = || {
+            format!(
+                "leaf directory at {} lies beyond the leaf section",
+                pointer.offset
+            )
+        };
+        if pointer
+            .offset
+            .checked_add(u64::from(pointer.length))
+            .is_none_or(|end| end > self.header.leaf_length)
+        {
+            return Err(beyond());
+        }
+        let offset = self
+            .header
+            .leaf_offset
+            .checked_add(pointer.offset)
+            .ok_or_else(beyond)?;
+        self.directory(offset, u64::from(pointer.length))
+    }
+
     /// Calls `visit` with every directory entry in directory order, tile
     /// entries with `false` and leaf directory pointers with `true`, each
     /// pointer before its leaf's entries. A pointer's offset is relative to
@@ -306,25 +436,7 @@ impl ArchiveReader {
             if depth + 1 >= MAX_DIRECTORY_DEPTH {
                 return Err("leaf directories nest too deep".into());
             }
-            let beyond = || {
-                format!(
-                    "leaf directory at {} lies beyond the leaf section",
-                    entry.offset
-                )
-            };
-            if entry
-                .offset
-                .checked_add(u64::from(entry.length))
-                .is_none_or(|end| end > self.header.leaf_length)
-            {
-                return Err(beyond());
-            }
-            let offset = self
-                .header
-                .leaf_offset
-                .checked_add(entry.offset)
-                .ok_or_else(beyond)?;
-            let leaf = self.directory(offset, u64::from(entry.length))?;
+            let leaf = self.leaf(entry)?;
             stack.push((leaf.into_iter(), depth + 1));
         }
         Ok(())

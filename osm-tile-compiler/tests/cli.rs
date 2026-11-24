@@ -1,7 +1,8 @@
 //! Runs the built `osm-tile-compiler` binary: the command line's usage
 //! handling, a real `compile` of `fixtures/monaco.osm.pbf` against synthetic
 //! supplemental inputs, the `style` it is drawn with, a delta between two
-//! compiles, an area cut out of a compile, and the desktop worker protocol's argument errors.
+//! compiles, an area cut out of a compile, locally and over HTTP range
+//! requests, and the desktop worker protocol's argument errors.
 
 mod common;
 
@@ -57,6 +58,20 @@ fn usage_errors_exit_with_2() {
         (&["frobnicate"], "unknown command 'frobnicate'"),
         (&["--bogus"], "unknown command '--bogus'"),
         (&["compile"], "compile needs an input PBF"),
+        (
+            &["compile", "--request", "r.json", "--output", "o.pmtiles"],
+            "only --threads and --json go with it, not '--output'",
+        ),
+        (
+            &["compile", "in.pbf", "--request", "r.json"],
+            "takes its input from the request, not 'in.pbf'",
+        ),
+        (&["compile", "--request"], "--request needs a value"),
+        (
+            &["completions"],
+            "completions needs a shell: bash, zsh or fish",
+        ),
+        (&["completions", "tcsh"], "unknown shell 'tcsh'"),
         (
             &["extract", "a.pmtiles", "--output", "b.pmtiles"],
             "extract needs --bounds, --polygon, --min-zoom or --max-zoom",
@@ -214,6 +229,37 @@ fn usage_errors_exit_with_2() {
         (
             &["apply", "a", "b", "--frob"],
             "unknown apply option '--frob'",
+        ),
+        (
+            &["apply", "a", "b", "-o", "c", "--trusted-key", "abc"],
+            "--trusted-key: abc is neither a public key nor a readable file",
+        ),
+        (
+            &["apply", "a", "b", "-o", "c", "--sign", "k"],
+            "unknown apply option '--sign'",
+        ),
+        (&["keygen"], "keygen needs a key file"),
+        (&["sign", "a"], "sign needs --key"),
+        (
+            &["verify-signature", "a", "--key", "k"],
+            "unknown verify-signature option '--key'",
+        ),
+        (
+            &["update", "a.pbf", "c.osc", "-o", "b", "--max-zoom", "3"],
+            "--min-zoom and --max-zoom choose the zooms of --changed-tiles",
+        ),
+        (
+            &[
+                "compile",
+                "in.pbf",
+                "--output",
+                "out.pmtiles",
+                "--sources",
+                "s",
+                "--sign-delta",
+                "k",
+            ],
+            "--sign-delta signs the --delta-from delta",
         ),
         (
             &["compile", "in.pbf", "--gzip-level", "10"],
@@ -796,6 +842,183 @@ fn diff_and_apply_rebuild_a_compiled_archive() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(text(&output.stderr).contains("is not the archive this delta applies to"));
     assert!(!wrong.exists());
+
+    // A key signs the delta; apply then trusts it, or refuses another key.
+    let key = path("release.key");
+    let output = run(["keygen".as_ref(), key.as_os_str()]);
+    assert!(output.status.success(), "{output:?}");
+    let public = text(&output.stdout).trim().to_string();
+    assert_eq!(public.len(), 64);
+    let public_file = path("release.key.pub");
+    assert_eq!(
+        std::fs::read_to_string(&public_file).unwrap().trim(),
+        public
+    );
+    let output = run([
+        "sign".as_ref(),
+        delta.as_os_str(),
+        "--key".as_ref(),
+        key.as_os_str(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let trusted = path("trusted.pmtiles");
+    let output = run([
+        "apply".as_ref(),
+        old.as_os_str(),
+        delta.as_os_str(),
+        "-o".as_ref(),
+        trusted.as_os_str(),
+        "--trusted-key".as_ref(),
+        public_file.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["trusted"], true);
+    assert_eq!(report["signed_by"][0], public.as_str());
+    let stranger = path("stranger.key");
+    assert!(
+        run(["keygen".as_ref(), stranger.as_os_str()])
+            .status
+            .success()
+    );
+    let refused = path("refused.pmtiles");
+    let output = run([
+        "apply".as_ref(),
+        old.as_os_str(),
+        delta.as_os_str(),
+        "-o".as_ref(),
+        refused.as_os_str(),
+        "--trusted-key".as_ref(),
+        path("stranger.key.pub").as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(text(&output.stderr).contains("not trusted"), "{output:?}");
+    assert!(!refused.exists());
+    let output = run([
+        "verify-signature".as_ref(),
+        delta.as_os_str(),
+        "--trusted-key".as_ref(),
+        public.as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+
+    // An archive gets a detached signature beside it.
+    let output = run([
+        "sign".as_ref(),
+        new.as_os_str(),
+        "--key".as_ref(),
+        key.as_os_str(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(path("new.pmtiles.sig").exists());
+    let output = run([
+        "verify-signature".as_ref(),
+        new.as_os_str(),
+        "--trusted-key".as_ref(),
+        public.as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let output = run([
+        "verify-signature".as_ref(),
+        old.as_os_str(),
+        "--signature".as_ref(),
+        path("new.pmtiles.sig").as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+}
+
+/// Serves one file on 127.0.0.1 as a static file server or object store
+/// does: `Range` requests get `206 Partial Content`, unless `ranges` is
+/// false, when every request gets the whole file. Counts the requests.
+struct RangeServer {
+    url: String,
+    requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RangeServer {
+    fn start(file: &Path, ranges: bool) -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/archive.pmtiles", listener.local_addr().unwrap());
+        let bytes = std::sync::Arc::new(std::fs::read(file).unwrap());
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = std::sync::Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let (bytes, counted) = (bytes.clone(), counted.clone());
+                std::thread::spawn(move || -> std::io::Result<()> {
+                    let mut reader = BufReader::new(stream.try_clone()?);
+                    let mut range = None;
+                    let mut line = String::new();
+                    reader.read_line(&mut line)?;
+                    loop {
+                        let mut header = String::new();
+                        if reader.read_line(&mut header)? == 0 || header == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            header.to_ascii_lowercase().strip_prefix("range: bytes=")
+                        {
+                            let (first, last) = value.trim().split_once('-').unwrap();
+                            range = Some((
+                                first.parse::<usize>().unwrap(),
+                                last.parse::<usize>().unwrap(),
+                            ));
+                        }
+                    }
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    let mut stream = stream;
+                    match range.filter(|_| ranges) {
+                        Some((first, last)) => {
+                            let last = last.min(bytes.len() - 1);
+                            let body = &bytes[first..=last];
+                            write!(
+                                stream,
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+                                 Content-Range: bytes {first}-{last}/{}\r\nETag: \"v1\"\r\n\
+                                 Connection: close\r\n\r\n",
+                                body.len(),
+                                bytes.len()
+                            )?;
+                            stream.write_all(body)?;
+                        }
+                        None => {
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                bytes.len()
+                            )?;
+                            stream.write_all(&bytes)?;
+                        }
+                    }
+                    stream.flush()
+                });
+            }
+        });
+        Self { url, requests }
+    }
+
+    fn requests(&self) -> u64 {
+        self.requests.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Runs the binary with no proxy, so that requests to 127.0.0.1 go straight
+/// to a [`RangeServer`].
+fn run_direct<I, S>(args: I) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new(env!("CARGO_BIN_EXE_osm-tile-compiler"));
+    command.args(args);
+    for proxy in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+        command.env_remove(proxy).env_remove(proxy.to_lowercase());
+    }
+    command.output().unwrap()
 }
 
 /// Every tile of a PMTiles archive: tile ID and stored bytes.
@@ -948,6 +1171,68 @@ async fn extract_cuts_the_tiles_a_bounded_compile_writes() {
         "{output:?}"
     );
     assert!(!path("nowhere.pmtiles").exists());
+
+    // Over HTTP, by range requests: the same archive as from the file.
+    let server = RangeServer::start(&path("full.pmtiles"), true);
+    let remote = |output: &std::path::Path, extra: &[&str]| {
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "extract".into(),
+            server.url.clone().into(),
+            "--output".into(),
+            output.as_os_str().to_owned(),
+        ];
+        args.extend(extra.iter().map(Into::into));
+        run_direct(args)
+    };
+    let output = remote(&path("remote-cut.pmtiles"), &boxed_args);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("range requests"),
+        "{output:?}"
+    );
+    assert_eq!(
+        std::fs::read(path("remote-cut.pmtiles")).unwrap(),
+        std::fs::read(path("cut.pmtiles")).unwrap()
+    );
+    let mut json_args = boxed_args.clone();
+    json_args.push("--json");
+    let output = remote(&path("remote-cut-2.pmtiles"), &json_args);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["requests"].as_u64().unwrap() >= 2, "{report}");
+    // Monaco is small enough that its nearby tiles come in one range.
+    let full_bytes = std::fs::metadata(path("full.pmtiles")).unwrap().len();
+    assert!(
+        report["bytes_read"].as_u64().unwrap() <= full_bytes,
+        "{report}, of {full_bytes} bytes"
+    );
+    let output = remote(
+        &path("remote-polygon-cut.pmtiles"),
+        &["--polygon", polygon, "--min-zoom", "10"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read(path("remote-polygon-cut.pmtiles")).unwrap(),
+        std::fs::read(path("polygon-cut.pmtiles")).unwrap()
+    );
+    assert!(server.requests() >= 6);
+    // A server that ignores ranges is refused, before anything is written.
+    let whole = RangeServer::start(&path("full.pmtiles"), false);
+    let output = run_direct([
+        "extract".as_ref(),
+        whole.url.as_ref(),
+        "--output".as_ref(),
+        path("whole.pmtiles").as_os_str(),
+        "--max-zoom".as_ref(),
+        "8".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("does not answer range requests"),
+        "{output:?}"
+    );
+    assert!(!path("whole.pmtiles").exists());
+
     let output = extract(&path("cut.pmtiles"), &boxed_args);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(
@@ -1242,6 +1527,60 @@ fn worker_mode_still_reports_bad_arguments_as_error_events() {
             .unwrap()
             .starts_with("Failed to read compiler request"),
         "{event}"
+    );
+}
+
+/// `compile --request` runs the compile a worker request describes, with the
+/// command line's progress instead of JSON lines, and writes its manifest.
+#[test]
+fn compile_request_runs_a_worker_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("out.pmtiles");
+    let manifest = temp.path().join("manifest.json");
+    let request = serde_json::json!({
+        "inputPbfPath": monaco_pbf(),
+        "sourcesDir": temp.path().join("sources"),
+        "outputPmtilesPath": archive,
+        "tempDir": temp.path().join("temp"),
+        "manifestPath": manifest,
+        "omitSources": ["water_polygons", "natural_earth", "lake_centerlines"],
+        "layers": ["water", "transportation"],
+    });
+    let path = temp.path().join("request.json");
+    std::fs::write(&path, request.to_string()).unwrap();
+    let output = run([
+        "compile".as_ref(),
+        "--request".as_ref(),
+        path.as_os_str(),
+        "--threads".as_ref(),
+        "2".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("as "), "{stderr}");
+    assert!(stderr.contains("2 threads"), "{stderr}");
+    assert!(stderr.contains("Wrote"), "{stderr}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["tiles"].as_u64().unwrap() > 0, "{result}");
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(written["format"], "basemap-manifest");
+    assert!(archive.exists());
+
+    // A request the worker refuses is refused here too.
+    let output = run(["compile".as_ref(), "--request".as_ref(), path.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("refusing to replace"),
+        "{output:?}"
+    );
+    std::fs::write(&path, r#"{"inputPbfPath": "a.pbf"}"#).unwrap();
+    let output = run(["compile".as_ref(), "--request".as_ref(), path.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("Invalid compiler request"),
+        "{output:?}"
     );
 }
 

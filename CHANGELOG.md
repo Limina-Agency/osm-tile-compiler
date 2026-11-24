@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Breaking
+
+- Deltas are format version 2 (`DELTA_VERSION`): after the end operation
+  comes a footer of ed25519 signatures, ending in the magic `OTCSIGNS`. This
+  build still applies version 1 deltas, as unsigned deltas, but an older
+  build cannot apply a version 2 delta.
+- `archive::ApplyReport` gains `signed_by` and `trusted`, and
+  `archive::DiffReport` gains `signed_by` and `changed_tiles`.
+  `UpdateRequest` gains `changed_tiles` and `UpdateReport` gains
+  `changed_tiles`, so code that builds either with a struct literal needs the
+  new field (`UpdateRequest::new` sets it to `None`).
+
 ### New
 
 - Resumable compiles: `BasemapRequest::resume` and `compile --resume`. A
@@ -15,6 +27,66 @@
   `BasemapOutput::resumed_from` names the stage a compile continued from;
   `checkpoint_directory` and `discard_checkpoint` find and remove a
   checkpoint. The desktop worker's request takes `resume` too.
+- `serve` runs a small local HTTP server for previews: each PMTiles or
+  MBTiles archive's tiles, TileJSON 3.0.0, MapLibre style and a map page,
+  plus the glyphs and sprite of an offline style pack (`--style-pack`), so a
+  browser or a phone on the same network (`--host 0.0.0.0`) draws the map
+  with no other network. From Rust, `TileServer` and `ServeRequest`.
+- `extract` reads a remote archive: give it an `http://` or `https://` URL
+  instead of a file, on any server that answers range requests. Only the
+  header, the root directory, the leaf directories that may address kept
+  tiles and the kept tiles are downloaded, nearby tiles in one range and
+  eight ranges at a time; the output is the same, byte for byte, as from a
+  local copy. A server that ignores ranges, or an archive that changes
+  while it is read, is an error and nothing is written. From Rust,
+  `ExtractRequest::remote` (the new field `ExtractRequest::source_url`) and
+  `archive::is_remote_source`. `ExtractReport` gains `requests` and
+  `bytes_read`. Local extracts skip the leaf directories outside the area
+  too.
+- `compile --request <request.json>` runs a worker request from the command
+  line, with its progress printed as `compile` prints it, and writes the
+  request's manifest. Only `--threads` and `--json` go with it.
+- `completions <bash|zsh|fish>` prints a shell completion script for the
+  commands, their options and the values the tool knows (formats, layers,
+  datasets, replication sources).
+- Signed deltas, so a device can tell an update came from someone it trusts
+  before applying it. `keygen FILE.key` writes an ed25519 key and
+  `FILE.key.pub`; `diff --sign FILE.key`, `compile --delta-from OLD
+  --sign-delta FILE.key` and `sign FILE.delta --key FILE.key` sign a delta
+  in its footer, beside any other signatures; `apply --trusted-key KEY`
+  (repeatable, 64 hex digits or a `.pub` file) refuses a delta without a
+  valid signature by a trusted key before it writes anything, and checks the
+  signed bytes again as it applies them. Without `--trusted-key` an unsigned
+  delta applies as before, but one whose signature doesn't match never does.
+  Each signature signs the SHA-256 of everything before the footer,
+  manifest included, so it vouches for both archives' digests and every
+  operation. From Rust: `archive::{PublicKey, SecretKey, diff_with,
+  DiffOptions, apply_trusted, verify_delta, sign_delta}`.
+- Signed archives: `sign FILE --key FILE.key` on anything other than a
+  delta writes a detached signature file, `FILE.sig` (JSON, format
+  `osm-tile-compiler-signature` version 1), and `verify-signature FILE
+  [--trusted-key KEY]...` checks a delta's signatures or a file's `.sig`
+  (`archive::{sign_file, verify_file_signature}`).
+- `update --changed-tiles FILE` also writes the tiles the changes reach,
+  one `z/x/y` per line as osm2pgsql's expire lists are, at zooms 0 to 14 or
+  `--min-zoom`/`--max-zoom`: the boxes of every changed object before and
+  after, of ways whose node moved and of multipolygons and boundaries whose
+  member changed, widened by 64 pixels (`CHANGED_TILE_BUFFER_PIXELS`) for
+  labels and cut to the extract's box. On Małopolskie with 13 hours of
+  planet diffs it listed 5,112 tiles, every one of the 278 a recompile
+  changed among them. The boxes come from osm-pbf-ingest's
+  new `changes::changed_area`. `UpdateRequest::changed_tiles`
+  (`ChangedTilesRequest`) does the same from Rust, and the report's
+  `changed_tiles` says how many tiles at each zoom.
+- `diff --changed-tiles FILE` writes the tiles that differ between the two
+  archives (changed, added or removed), in the same format.
+- C ABI: `apply` takes `trustedKeys`, and the new `verify_delta` kind checks
+  a delta's signatures without applying it.
+- `scripts/build-xcframework.sh` builds the C ABI as an iOS XCFramework
+  (`aarch64-apple-ios` and `aarch64-apple-ios-sim`, header and module map).
+- `ios/DeviceTest`, a SwiftUI app that compiles a region on an iPhone
+  through the C ABI, writes its style pack, renders it with MapLibre Native,
+  and reports time and peak memory per run.
 
 ## 0.3.0 (2026-11-23)
 

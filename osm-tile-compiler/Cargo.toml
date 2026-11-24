@@ -61,6 +61,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 osm-pbf-ingest = { workspace = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+getrandom = "0.4"
 
 # The stage profiler's CPU clocks (getrusage, clock_gettime).
 [target.'cfg(unix)'.dependencies]

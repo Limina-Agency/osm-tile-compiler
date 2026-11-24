@@ -65,7 +65,8 @@
 //! ([`write_building_levels`]), inspects, cuts, diffs and patches archives
 //! ([`archive`]), and writes the MapLibre style for an archive
 //! ([`maplibre_style`]) or an offline pack of it with its fonts and icons
-//! ([`write_style_pack`]).
+//! ([`write_style_pack`]), and serves archives and a pack over HTTP for a
+//! preview ([`TileServer`]).
 
 /// The message a panic was raised with, for errors that report a caught
 /// panic. Shared with the binary.
@@ -96,10 +97,12 @@ mod output;
 mod profiling;
 mod request;
 mod resume;
+mod serve;
 mod sources;
 pub mod stage_profile;
 mod style_pack;
 mod tile_geometry;
+mod tile_list;
 mod tile_slicer;
 mod tile_stats;
 mod updates;
@@ -127,15 +130,17 @@ pub use omt::{
 };
 pub use output::OutputFormat;
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
+pub use serve::{ServeRequest, ServedArchive, TileServer};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
 pub use style_pack::{
     DEFAULT_GLYPHS_URL, DEFAULT_SPRITE_URL, STYLE_FONTSTACKS, StylePackEvent, StylePackReport,
     StylePackRequest, maplibre_style, with_sar_layers, write_style_pack,
 };
+pub use tile_list::{CHANGED_TILE_BUFFER_PIXELS, TileAddress, read_tile_list};
 pub use tile_stats::{LayerStats, TILE_WARNING_BYTES, TileSize, TileStats, ZoomStats};
 pub use updates::{
-    ClipTo, DEFAULT_MAX_DIFFS, PLANET_REPLICATION, Replication, UpdateEvent, UpdateReport,
-    UpdateRequest, update_extract,
+    ChangedTilesReport, ChangedTilesRequest, ClipTo, DEFAULT_MAX_DIFFS, PLANET_REPLICATION,
+    Replication, UpdateEvent, UpdateReport, UpdateRequest, update_extract,
 };
 
 /// The languages whose `name:<lang>` attributes a

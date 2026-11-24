@@ -62,6 +62,14 @@ const char *otc_version(void);
  */
 int32_t otc_job_start(const char *request_json, OtcJob **job_out, char **error_out);
 
+/*
+ * Checks request_json as otc_job_start does, without starting a job.
+ * Returns OTC_OK when otc_job_start would start it; otherwise returns the
+ * status otc_job_start would and sets *error_out (when error_out is not
+ * NULL) to {"kind", "message", "stage"}. *error_out is NULL on OTC_OK.
+ */
+int32_t otc_validate(const char *request_json, char **error_out);
+
 /* The job's state, an OTC_JOB_* value; -OTC_ERROR_INVALID_ARGUMENT for NULL. */
 int32_t otc_job_state(const OtcJob *job);
 
