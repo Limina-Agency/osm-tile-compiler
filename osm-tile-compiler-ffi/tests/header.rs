@@ -33,7 +33,7 @@ fn the_header_declares_every_exported_function() {
             Some(rest[..rest.find('(')?].to_string())
         })
         .collect();
-    assert_eq!(exported.len(), 10, "{exported:?}");
+    assert_eq!(exported.len(), 11, "{exported:?}");
     assert_eq!(declared, exported);
 }
 

@@ -47,6 +47,13 @@
   `changed_tiles` says how many tiles at each zoom.
 - `diff --changed-tiles FILE` writes the tiles that differ between the two
   archives (changed, added or removed), in the same format.
+- C ABI: `apply` takes `trustedKeys`, and the new `verify_delta` kind checks
+  a delta's signatures without applying it.
+- `scripts/build-xcframework.sh` builds the C ABI as an iOS XCFramework
+  (`aarch64-apple-ios` and `aarch64-apple-ios-sim`, header and module map).
+- `ios/DeviceTest`, a SwiftUI app that compiles a region on an iPhone
+  through the C ABI, writes its style pack, renders it with MapLibre Native,
+  and reports time and peak memory per run.
 
 ## 0.3.0 (2026-11-23)
 
