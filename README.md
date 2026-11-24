@@ -212,6 +212,11 @@ with no network but the server's:
 osm-tile-compiler serve berlin.pmtiles --style-pack berlin-style --host 0.0.0.0
 ```
 
+For a production tile server, [Martin](https://github.com/maplibre/martin)
+serves the archives as they are; `martin-config` writes its config and a style
+for each archive, and `apply --in-place` updates an archive while Martin
+serves it (experimental, see [docs/martin.md](docs/martin.md)).
+
 ### Shell completions
 
 ```sh

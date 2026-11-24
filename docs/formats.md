@@ -52,7 +52,7 @@ These belong to other projects and follow them:
 | This crate | its version | written as the archive metadata's `generator`, `osm-tile-compiler <version>`; `tests/monaco.rs` records it as `osm-tile-compiler <version>` so a release doesn't change the fingerprint |
 | OSM replication | the extract's header | written as `osm_data_timestamp` (RFC 3339, UTC), `osm_replication_sequence` and `osm_replication_url` when the header gives them |
 | Planetiler (comparison) | 0.10.2 | `benchmarks/compiler-parity/` |
-| PMTiles | specification v3 | the archive header |
+| PMTiles | specification v3 | the archive header; tile compression gzip (2), or none (1) with `--tile-compression none` (`tileCompression: "none"` in the worker request) |
 | MBTiles | specification 1.3 | `application_id` 0x4d504258 and the `metadata` table of `--format mbtiles` archives |
 | Mapbox Vector Tiles | specification 2.1 | every tile, unless the compile asks for MLT |
 | MapLibre Tiles | specification v1, frame tag `0x01` | every tile of a `--tile-format mlt` compile (`tileFormat: "mlt"` in the worker request and the C ABI, `tile_format="mlt"` in Python): PMTiles tile type 6, metadata `format` `mlt`. Written by our own encoder (`src/mlt/`) from each finished MVT layer, so the features are the MVT ones, in the plain encodings only. Checked against the specification's fixtures and, in CI, decoded by mlt-core, @maplibre/mlt and MapLibre Native's C++ decoder ([mlt.md](mlt.md)) |

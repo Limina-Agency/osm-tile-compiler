@@ -244,6 +244,20 @@ impl BasemapRequest {
             )));
         }
         let caching = self.merge_cache.write || self.merge_cache.reuse_from.is_some();
+        if self.archive.tile_compression == crate::TileCompression::None {
+            if self.output_format() != OutputFormat::PmTiles {
+                return Err(invalid(format!(
+                    "uncompressed tiles are written to PMTiles archives only, not {}",
+                    self.output_format().name()
+                )));
+            }
+            if caching {
+                return Err(invalid(
+                    "the merge cache needs gzipped tiles; leave the tile compression at gzip"
+                        .into(),
+                ));
+            }
+        }
         if caching && self.output_format() != OutputFormat::PmTiles {
             return Err(invalid(format!(
                 "the merge cache works with PMTiles archives only, not {}",
@@ -813,5 +827,27 @@ impl Drop for Scratch {
         if let Some(parent) = &self.parent {
             let _ = std::fs::remove_dir(parent);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uncompressed_tiles_go_to_pmtiles_without_the_merge_cache() {
+        let request = |output: &str| {
+            let mut request = BasemapRequest::new("in.osm.pbf", output, "sources", "tmp");
+            request.archive.tile_format = crate::TileFormat::Mlt;
+            request.archive.tile_compression = crate::TileCompression::None;
+            request
+        };
+        assert!(request("out.pmtiles").validate().is_ok());
+        let error = request("out.mbtiles").validate().unwrap_err().to_string();
+        assert!(error.contains("PMTiles archives only"), "{error}");
+        let mut cached = request("out.pmtiles");
+        cached.merge_cache.write = true;
+        let error = cached.validate().unwrap_err().to_string();
+        assert!(error.contains("merge cache needs gzipped tiles"), "{error}");
     }
 }

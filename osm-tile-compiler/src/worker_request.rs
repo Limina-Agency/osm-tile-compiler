@@ -53,6 +53,9 @@ struct CompilerProcessRequest {
     /// The tiles' encoding, `mvt` or `mlt` [default: mvt].
     #[serde(default)]
     tile_format: osm_tile_compiler::TileFormat,
+    /// How each tile is compressed, `gzip` or `none` [default: gzip].
+    #[serde(default)]
+    tile_compression: osm_tile_compiler::TileCompression,
 }
 
 /// Reads the request at `path`: the compile it asks for, and where to write
@@ -101,5 +104,6 @@ pub fn read(path: &Path) -> Result<(BasemapRequest, PathBuf), String> {
     compile.sar = request.sar;
     compile.resume = request.resume;
     compile.archive.tile_format = request.tile_format;
+    compile.archive.tile_compression = request.tile_compression;
     Ok((compile, request.manifest_path))
 }

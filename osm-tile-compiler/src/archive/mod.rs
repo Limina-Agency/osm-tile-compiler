@@ -78,7 +78,25 @@ pub fn apply_trusted(
     output: &Path,
     trusted: &[PublicKey],
 ) -> Result<ApplyReport, CompileError> {
-    delta::apply(base, delta, output, trusted).map_err(CompileError::other)
+    delta::apply(base, delta, output, trusted, false).map_err(CompileError::other)
+}
+
+/// [`apply_trusted`], replacing the archive at `archive` with the result.
+/// The new archive is written beside it (`<archive>.partial`) and renamed
+/// over it only once its SHA-256 matches the delta's promise, so a tile
+/// server that has the archive open, such as Martin watching its directory,
+/// sees the old archive or the new one, never a half-written file. On any
+/// failure the old archive is left as it was.
+///
+/// A detached signature beside the archive (`<archive>.sig`) signs the old
+/// bytes; it is not carried over, since the delta's signature is what
+/// vouched for the new archive.
+pub fn apply_in_place(
+    archive: &Path,
+    delta: &Path,
+    trusted: &[PublicKey],
+) -> Result<ApplyReport, CompileError> {
+    delta::apply(archive, delta, archive, trusted, true).map_err(CompileError::other)
 }
 
 /// Checks the signatures of the delta at `path` without applying it: every
@@ -147,6 +165,9 @@ pub struct ArchiveOptions {
     pub gzip_level: u32,
     /// How the tiles are encoded: MVT or MLT.
     pub tile_format: crate::TileFormat,
+    /// How each tile is compressed: gzip, or none (PMTiles only, and not
+    /// with the merge cache).
+    pub tile_compression: crate::TileCompression,
 }
 
 impl Default for ArchiveOptions {
@@ -157,6 +178,7 @@ impl Default for ArchiveOptions {
             attribution: DEFAULT_ATTRIBUTION.into(),
             gzip_level: 6,
             tile_format: crate::TileFormat::Mvt,
+            tile_compression: crate::TileCompression::Gzip,
         }
     }
 }

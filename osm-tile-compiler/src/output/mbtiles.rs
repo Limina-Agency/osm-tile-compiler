@@ -195,6 +195,7 @@ mod tests {
             min_zoom: 0,
             max_zoom: 14,
             tile_format: crate::TileFormat::Mvt,
+            tile_compression: crate::TileCompression::Gzip,
         }
     }
 
