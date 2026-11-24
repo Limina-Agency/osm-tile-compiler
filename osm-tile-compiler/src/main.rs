@@ -80,6 +80,10 @@ struct CompilerProcessRequest {
     /// [default: no].
     #[serde(default)]
     sar: bool,
+    /// Whether the compile keeps checkpoints when interrupted and continues
+    /// from them on the next request for the same output [default: no].
+    #[serde(default)]
+    resume: bool,
 }
 
 fn emit(event: serde_json::Value) -> Result<(), String> {
@@ -217,6 +221,7 @@ fn run() -> Result<(), WorkerError> {
     compile.languages = request.languages;
     compile.building_levels = request.building_levels;
     compile.sar = request.sar;
+    compile.resume = request.resume;
     // Each stage is reported once, as before; downloads also with their
     // fraction.
     let mut last = None;

@@ -129,6 +129,13 @@ Compile options:
                         to scratch, at least 8 MiB per thread [default: half
                         of the memory available when rendering starts]
   --temp-dir <DIR>      Scratch space [default: <FILE>.tmp, removed afterwards]
+  --resume              Make the compile resumable: it records each stage it
+                        completes in the scratch space and keeps them when it
+                        is interrupted (killed, crashed, Ctrl-C, out of
+                        space). Run the same command again, with --resume, to
+                        continue from the last stage done; the archive is the
+                        same as an uninterrupted compile's. Not with --changes
+                        or --replication
   --fetch               Download any supplemental dataset missing from --sources
   --building-levels     Also write the building levels beside the archive, as
                         <NAME>-buildings.pmtiles
@@ -280,6 +287,8 @@ struct CompileArgs {
     sort_memory: Option<u64>,
     temp_dir: Option<PathBuf>,
     fetch: bool,
+    /// Keep checkpoints when interrupted, and continue from them.
+    resume: bool,
     building_levels: bool,
     sar: bool,
     json: bool,
@@ -592,6 +601,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut sort_memory = None;
     let mut temp_dir = None;
     let mut fetch = false;
+    let mut resume = false;
     let mut building_levels = false;
     let mut sar = false;
     let mut omit_sources = Vec::new();
@@ -681,6 +691,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 );
             }
             "--fetch" => fetch = true,
+            "--resume" => resume = true,
             "--building-levels" => building_levels = true,
             "--sar" => sar = true,
             "--omit-sources" => {
@@ -786,6 +797,11 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         None if omit_sources.len() == SupplementalDataset::ALL.len() => PathBuf::new(),
         None => return Err("compile needs --sources <DIR>".into()),
     };
+    if resume && !changes.is_empty() {
+        // The updated extract is written again by every attempt, so no
+        // checkpoint would match it.
+        return Err("--resume does not work with change files or --replication yet".into());
+    }
     if !extra_inputs.is_empty() && !changes.is_empty() {
         return Err(
             "change files and --replication apply to one input PBF; update each extract first"
@@ -817,6 +833,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         sort_memory,
         temp_dir,
         fetch,
+        resume,
         building_levels,
         sar,
         json,
@@ -1325,7 +1342,7 @@ fn pbf_bounds(input: &Path) -> Result<CompileBounds, String> {
 /// Creates the default scratch directory, or reuses one an interrupted
 /// compile left, and returns its marker file, locked until
 /// `release_scratch`.
-fn claim_scratch(directory: &Path, status: &mut Status) -> Result<File, String> {
+fn claim_scratch(directory: &Path, resume: bool, status: &mut Status) -> Result<File, String> {
     let marker_path = directory.join(SCRATCH_MARKER);
     if directory.exists() && !marker_path.is_file() {
         return Err(format!(
@@ -1356,8 +1373,10 @@ fn claim_scratch(directory: &Path, status: &mut Status) -> Result<File, String> 
             return Err(format!("Failed to lock {}: {e}", marker_path.display()));
         }
     }
-    if remove_all_but(directory, &marker_path)
-        .map_err(|e| format!("Failed to clear {}: {e}", directory.display()))?
+    // A resumable compile keeps what it finds: its checkpoint decides.
+    if !resume
+        && remove_all_but(directory, &marker_path)
+            .map_err(|e| format!("Failed to clear {}: {e}", directory.display()))?
     {
         status.line(&format!(
             "Removed what an interrupted compile left in {}",
@@ -1533,7 +1552,9 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     // Downloads and the compile stop when asked, removing what they wrote.
     let _cooperating = interrupt::cooperate();
     let levels = building_levels_path(&args.output);
-    for archive in [&args.output, &levels] {
+    // A resumable compile checks them against its checkpoint: an attempt
+    // that was interrupted may have written them.
+    for archive in [&args.output, &levels].into_iter().filter(|_| !args.resume) {
         if archive.exists() {
             return Err(format!(
                 "refusing to replace existing archive {}",
@@ -1624,13 +1645,15 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         args.output.with_file_name(name)
     });
     let scratch = if owned_temp {
-        Some(claim_scratch(&temp_dir, &mut status)?)
+        Some(claim_scratch(&temp_dir, args.resume, &mut status)?)
     } else {
         None
     };
     // A second Ctrl-C ends the process without waiting for the compile to
-    // clean up; a default scratch directory is then removed at least.
-    let _scratch_on_exit = owned_temp.then(|| interrupt::remove_on_exit(temp_dir.clone()));
+    // clean up; a default scratch directory is then removed at least, unless
+    // it holds checkpoints to resume from.
+    let _scratch_on_exit =
+        (owned_temp && !args.resume).then(|| interrupt::remove_on_exit(temp_dir.clone()));
     let threads = args
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -1697,6 +1720,13 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.sar = args.sar;
     request.sort_memory = args.sort_memory;
     request.merge_cache = args.merge_cache;
+    request.resume = args.resume;
+    if args.resume && osm_tile_compiler::checkpoint_directory(&request).is_dir() {
+        status.line(&format!(
+            "Resuming from the checkpoint in {}",
+            osm_tile_compiler::checkpoint_directory(&request).display()
+        ));
+    }
     if args.profile.is_some() {
         osm_tile_compiler::stage_profile::start(threads);
     }
@@ -1726,17 +1756,27 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     if let Some(updated) = &updated_input {
         let _ = std::fs::remove_file(updated);
     }
+    // A resumable compile that did not finish keeps its checkpoints.
     let cleanup = match scratch {
-        Some(marker) => release_scratch(&temp_dir, marker),
-        None => Ok(()),
+        Some(marker) if !args.resume || output.is_ok() => release_scratch(&temp_dir, marker),
+        _ => Ok(()),
+    };
+    let resume_hint = if args.resume {
+        "; run the same command again to resume it"
+    } else {
+        ""
     };
     let output = output.map_err(|error| match error {
         CompileError::Cancelled => format!(
-            "the compile was cancelled; {} was not written",
+            "the compile was cancelled; {} was not written{resume_hint}",
             args.output.display()
         ),
+        error if args.resume => format!("{error}{resume_hint}"),
         error => error.to_string(),
     })?;
+    if let Some(stage) = output.resumed_from {
+        status.line(&format!("Resumed an interrupted compile at {}", stage.id()));
+    }
     cleanup?;
     let result = &output.result;
     status.line(&format!(

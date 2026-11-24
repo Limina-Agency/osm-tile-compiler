@@ -95,6 +95,7 @@ mod omt;
 mod output;
 mod profiling;
 mod request;
+mod resume;
 mod sources;
 pub mod stage_profile;
 mod style_pack;
@@ -105,7 +106,7 @@ mod updates;
 
 pub use basemap::{
     BasemapOutput, BasemapRequest, MANIFEST_FORMAT, MANIFEST_VERSION, SourcesPolicy,
-    compile_basemap, pbf_bounds,
+    checkpoint_directory, compile_basemap, discard_checkpoint, pbf_bounds,
 };
 pub use building_levels::{
     BUILDING_LEVELS_FORMAT, BUILDING_LEVELS_VERSION, BuildingLevelReport, BuildingLevelsReport,

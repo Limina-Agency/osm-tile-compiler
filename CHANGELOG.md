@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- Resumable compiles: `BasemapRequest::resume` and `compile --resume`. A
+  resumable compile records the stages it completes in its scratch
+  directory (the merged extracts, the sorted tile features once every source
+  is read, each pass of the sort's merge, the archive and the building
+  levels) and keeps them when it is killed, crashes, fails or is cancelled;
+  the next resumable compile of the same request continues from the last
+  one, and writes the same archive byte for byte. A checkpoint for a changed
+  request or changed inputs is discarded with a warning.
+  `BasemapOutput::resumed_from` names the stage a compile continued from;
+  `checkpoint_directory` and `discard_checkpoint` find and remove a
+  checkpoint. The desktop worker's request takes `resume` too.
+
 ## 0.3.0 (2026-11-23)
 
 ### Breaking

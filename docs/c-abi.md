@@ -131,7 +131,8 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
   "archive": { "name": "Monaco", "description": "…", "attribution": "…", "gzipLevel": 6 },
   "threads": 2,
   "buildingLevels": false,
-  "sar": false
+  "sar": false,
+  "resume": false
 }
 ```
 
@@ -145,13 +146,16 @@ default) or `near_area`, which reads only the OSM data in and near the area.
 `.mbtiles` is MBTiles and anything else PMTiles. Building levels need
 PMTiles. `sar` also writes the search-and-rescue layer
 ([sar.md](sar.md)); `layers` may still leave it out, and `{"only": [...]}`
-naming `sar` writes it too.
+naming `sar` writes it too. `resume` makes the compile resumable
+(`BasemapRequest::resume`): when the app is killed or the job cancelled, its
+checkpoints stay in `tempDir`, and starting the same request again continues
+from the last stage completed, with the same archive.
 
 The result is the basemap manifest the worker writes (`format`,
 `formatVersion`, `schema`, `version`, `result`, `supplementalInputs`,
 `omittedSources`), plus `archive`, `archiveFormat` (`pmtiles` or
-`mbtiles`), `buildingLevels` (a path or `null`) and
-the `bounds` compiled.
+`mbtiles`), `buildingLevels` (a path or `null`), `resumedFrom` (the stage
+id a resumed compile continued from, or `null`) and the `bounds` compiled.
 
 The field layout follows the 0.2 request types (`ZoomRange`,
 `LayerSelection`, `Area` with its `ReadScope`), and the library maps it onto

@@ -394,10 +394,14 @@ pub(crate) fn check_center(center: ArchiveCenter, zoom: crate::ZoomRange) -> Res
     Ok(())
 }
 
+/// Compiles `request`. With `checkpoints`, the compile records the sort's
+/// runs once every source is rendered, and takes them up again when an
+/// earlier attempt recorded them, going straight to writing the tiles.
 pub(crate) fn compile(
     request: &OpenMapTilesRequest,
     control: &Control,
     mut progress: impl FnMut(&str),
+    checkpoints: Option<&crate::resume::Checkpoints>,
 ) -> Result<CompileResult, String> {
     validate(request)?;
     let selection =
@@ -436,39 +440,6 @@ pub(crate) fn compile(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let start = Instant::now();
-    let mut store = store::Store::new(&request.temp_dir)?;
-    let mut pipeline = pipeline::Pipeline::new(
-        &store,
-        request.threads,
-        pipeline::sort_budget(
-            request.threads,
-            request.sort_memory,
-            std::fs::metadata(&request.input_pbf)
-                .ok()
-                .map(|metadata| metadata.len()),
-        ),
-        region,
-        (request.min_zoom, request.max_zoom),
-        Arc::new(selection.clone()),
-        control.flag(),
-    )?;
-    let mut profile = Profile {
-        sar: selection.has_layer(SAR_LAYER),
-        ..Profile::default()
-    };
-    let mut sources_processed = 0;
-    let mut profile_features = 0;
-    // Supplement sources run here, in order, because they fill the state that
-    // OSM sources read; their ordinals are plain counters, below every OSM
-    // source's. Reuse the small output buffer across source callbacks.
-    let mut features = Vec::with_capacity(8);
-    let mut process = |source: types::Source| -> Result<(), String> {
-        profile.process(&source, &mut features);
-        profile_features += features.len() as u64;
-        pipeline.push_source(sources_processed, &mut features)?;
-        sources_processed += 1;
-        Ok(())
-    };
     let mut warnings = Vec::new();
     // Opened first, so that an index that cannot be used fails at once.
     let mut cache = merge_cache::MergeCache::open(
@@ -477,63 +448,42 @@ pub(crate) fn compile(
         request.archive.gzip_level,
         &mut warnings,
     )?;
-    let omitted = |dataset| request.omit_sources.contains(&dataset);
-    let message = "Reading supplemental sources";
-    progress(message);
-    control.stage(CompileStage::ReadSources, message)?;
-    let sources_stage = crate::stage_profile::Stage::start("read_sources");
-    supplements::read_sources(
-        &request.sources,
-        &request.temp_dir,
-        bounds,
-        supplements::Read {
-            // The ocean polygons only make water features.
-            water_polygons: selection.has_layer("water")
-                && !omitted(SupplementalDataset::WaterPolygons),
-            natural_earth: !omitted(SupplementalDataset::NaturalEarth),
-            lake_centerlines: !omitted(SupplementalDataset::LakeCenterlines),
-        },
-        control,
-        &mut process,
-        &mut warnings,
-    )?;
-    drop(sources_stage);
-    let supplement_seconds = start.elapsed().as_secs_f64();
-    control.stage(CompileStage::IndexOsm, "Indexing the OSM extract")?;
-    let osm_start = Instant::now();
-    // Workers assemble and evaluate OSM sources against the now read-only
-    // profile, then everything they accumulated is replayed in source order.
-    let profile = Arc::new(profile);
-    let osm_header = ingest::read_osm(
-        &request.input_pbf,
-        &request.temp_dir,
-        request.threads,
-        &mut pipeline,
-        &profile,
-        control,
-        request
-            .area_only
-            .then(|| input_area::InputArea::new(bounds, request.max_zoom)),
-        &mut progress,
-        &mut warnings,
-    )?;
-    let mut profile = Arc::into_inner(profile).ok_or("Render workers still hold the profile")?;
-    for (_, contribution) in pipeline.take_contributions() {
-        profile.apply(contribution);
-    }
-    let osm_seconds = osm_start.elapsed().as_secs_f64();
-    control.check()?;
-    let drain_stage = crate::stage_profile::Stage::start("render_drain");
-    let mut deferred = Vec::new();
-    profile.finish(&mut deferred);
-    profile_features += deferred.len() as u64;
-    // The deferred features follow every source.
-    pipeline.push_source(u64::MAX, &mut deferred)?;
-    let totals = pipeline.finish(&mut store)?;
-    sources_processed += totals.sources;
-    profile_features += totals.features;
-    drop(pipeline);
-    drop(drain_stage);
+    let cache_warnings = warnings.len();
+    let (store, rendered) = match checkpoints.and_then(|c| Some((c, c.rendered()?))) {
+        Some((checkpoints, rendered)) => {
+            let store =
+                store::Store::resume(&request.temp_dir, &rendered.sort, checkpoints.clone())?;
+            warnings.extend(rendered.warnings.iter().cloned());
+            (store, rendered)
+        }
+        None => {
+            let mut store = store::Store::new(&request.temp_dir)?;
+            let mut rendered = render(
+                request,
+                control,
+                &mut progress,
+                &selection,
+                bounds,
+                region,
+                &mut store,
+                &mut warnings,
+            )?;
+            if let Some(checkpoints) = checkpoints {
+                rendered.sort = store.checkpoint(checkpoints.clone())?;
+                rendered.warnings = warnings[cache_warnings..].to_vec();
+                checkpoints.commit_rendered(rendered.clone())?;
+            }
+            (store, rendered)
+        }
+    };
+    let crate::resume::Rendered {
+        sources_processed,
+        profile_features,
+        supplement_seconds,
+        osm_seconds,
+        osm_data,
+        ..
+    } = rendered;
     let finish_start = Instant::now();
     let message = format!("Sorting, encoding and writing {}", request.format.name());
     progress(&message);
@@ -544,13 +494,9 @@ pub(crate) fn compile(
     let partial = PartialArchive::create(&request.output, request.format)?;
     let omitted_sources = SupplementalDataset::ALL
         .into_iter()
-        .filter(|dataset| omitted(*dataset))
+        .filter(|dataset| request.omit_sources.contains(dataset))
         .map(SupplementalDataset::id)
         .collect::<Vec<_>>();
-    let osm_data = osm_header
-        .as_ref()
-        .map(OsmDataInfo::from_header)
-        .unwrap_or_default();
     let header = store::ArchiveHeader {
         bounds,
         center,
@@ -612,6 +558,124 @@ pub(crate) fn compile(
         omitted_sources: omitted_sources.into_iter().map(String::from).collect(),
         merge_cache,
         osm_data,
+    })
+}
+
+/// Reads the supplemental datasets and the OSM extract and renders every
+/// source into `store`'s sort, returning the counts and the OSM data's
+/// currency. The sort checkpoint it returns is empty.
+#[allow(clippy::too_many_arguments)]
+fn render(
+    request: &OpenMapTilesRequest,
+    control: &Control,
+    mut progress: impl FnMut(&str),
+    selection: &selection::Selection,
+    bounds: CompileBounds,
+    region: Region,
+    store: &mut store::Store,
+    warnings: &mut Vec<String>,
+) -> Result<crate::resume::Rendered, String> {
+    let start = Instant::now();
+    let mut pipeline = pipeline::Pipeline::new(
+        store,
+        request.threads,
+        pipeline::sort_budget(
+            request.threads,
+            request.sort_memory,
+            std::fs::metadata(&request.input_pbf)
+                .ok()
+                .map(|metadata| metadata.len()),
+        ),
+        region,
+        (request.min_zoom, request.max_zoom),
+        Arc::new(selection.clone()),
+        control.flag(),
+    )?;
+    let mut profile = Profile {
+        sar: selection.has_layer(SAR_LAYER),
+        ..Profile::default()
+    };
+    let mut sources_processed = 0;
+    let mut profile_features = 0;
+    // Supplement sources run here, in order, because they fill the state that
+    // OSM sources read; their ordinals are plain counters, below every OSM
+    // source's. Reuse the small output buffer across source callbacks.
+    let mut features = Vec::with_capacity(8);
+    let mut process = |source: types::Source| -> Result<(), String> {
+        profile.process(&source, &mut features);
+        profile_features += features.len() as u64;
+        pipeline.push_source(sources_processed, &mut features)?;
+        sources_processed += 1;
+        Ok(())
+    };
+    let omitted = |dataset| request.omit_sources.contains(&dataset);
+    let message = "Reading supplemental sources";
+    progress(message);
+    control.stage(CompileStage::ReadSources, message)?;
+    let sources_stage = crate::stage_profile::Stage::start("read_sources");
+    supplements::read_sources(
+        &request.sources,
+        &request.temp_dir,
+        bounds,
+        supplements::Read {
+            // The ocean polygons only make water features.
+            water_polygons: selection.has_layer("water")
+                && !omitted(SupplementalDataset::WaterPolygons),
+            natural_earth: !omitted(SupplementalDataset::NaturalEarth),
+            lake_centerlines: !omitted(SupplementalDataset::LakeCenterlines),
+        },
+        control,
+        &mut process,
+        warnings,
+    )?;
+    drop(sources_stage);
+    let supplement_seconds = start.elapsed().as_secs_f64();
+    control.stage(CompileStage::IndexOsm, "Indexing the OSM extract")?;
+    let osm_start = Instant::now();
+    // Workers assemble and evaluate OSM sources against the now read-only
+    // profile, then everything they accumulated is replayed in source order.
+    let profile = Arc::new(profile);
+    let osm_header = ingest::read_osm(
+        &request.input_pbf,
+        &request.temp_dir,
+        request.threads,
+        &mut pipeline,
+        &profile,
+        control,
+        request
+            .area_only
+            .then(|| input_area::InputArea::new(bounds, request.max_zoom)),
+        &mut progress,
+        warnings,
+    )?;
+    let mut profile = Arc::into_inner(profile).ok_or("Render workers still hold the profile")?;
+    for (_, contribution) in pipeline.take_contributions() {
+        profile.apply(contribution);
+    }
+    let osm_seconds = osm_start.elapsed().as_secs_f64();
+    control.check()?;
+    let drain_stage = crate::stage_profile::Stage::start("render_drain");
+    let mut deferred = Vec::new();
+    profile.finish(&mut deferred);
+    profile_features += deferred.len() as u64;
+    // The deferred features follow every source.
+    pipeline.push_source(u64::MAX, &mut deferred)?;
+    let totals = pipeline.finish(store)?;
+    sources_processed += totals.sources;
+    profile_features += totals.features;
+    drop(pipeline);
+    drop(drain_stage);
+    Ok(crate::resume::Rendered {
+        sort: Default::default(),
+        sources_processed,
+        profile_features,
+        supplement_seconds,
+        osm_seconds,
+        warnings: Vec::new(),
+        osm_data: osm_header
+            .as_ref()
+            .map(OsmDataInfo::from_header)
+            .unwrap_or_default(),
     })
 }
 

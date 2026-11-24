@@ -177,6 +177,10 @@ struct CompileBasemapJson {
     /// Whether to also write the search-and-rescue layer `sar`.
     #[serde(default)]
     sar: bool,
+    /// Whether the compile keeps checkpoints when interrupted, and continues
+    /// from them (`BasemapRequest::resume`).
+    #[serde(default)]
+    resume: bool,
 }
 
 fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
@@ -246,6 +250,7 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
     request.languages = json.languages;
     request.building_levels = json.building_levels;
     request.sar = json.sar;
+    request.resume = json.resume;
     // Everything that needs no reading or network fails the start, not the job.
     request.validate()?;
     Ok(request)
@@ -271,6 +276,7 @@ fn compile_basemap_work(request: Value) -> Result<Work, JobError> {
         result["archive"] = json!(output.archive);
         result["archiveFormat"] = json!(output.format.id());
         result["buildingLevels"] = json!(output.building_levels.as_ref().map(|(path, _)| path));
+        result["resumedFrom"] = json!(output.resumed_from.map(|stage| stage.id()));
         result["bounds"] = json!({
             "north": output.bounds.north,
             "south": output.bounds.south,
