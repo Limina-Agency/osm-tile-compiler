@@ -6,6 +6,11 @@ Mapbox Vector Tile. The C ABI takes `"tileFormat": "mlt"` in
 request `tileFormat`, and Python `compile(..., tile_format="mlt")`. MVT stays
 the default.
 
+MLT is a supported output format from 1.0: the layout below and the minimum
+renderer versions in [Renderers](#renderers) are part of the compatibility
+promise. Earlier MapLibre releases that read MLT may draw it with small
+differences, or not at all.
+
 An MLT archive is about 20% smaller than the MVT one, gzipped (Berlin:
 33.3 MB against 41.9 MB), and holds exactly the same features.
 
@@ -38,13 +43,13 @@ A style for an MLT archive needs `"encoding": "mlt"` on its vector source;
 and `serve` sets it for an `.mlt` archive. Without it, MapLibre reads the
 tiles as MVT and fails.
 
-| Renderer | MLT since | Checked |
+| Renderer | Supported from | Notes |
 |---|---|---|
 | MapLibre GL JS | 5.12 | 5.24.1 and 6.19.0 render Berlin pixel for pixel as from MVT |
-| MapLibre Native, Android | 12.1 | use 13.4.0 or later (see below) |
-| MapLibre Native, iOS | 6.2 | use 6.28.0 or later (see below) |
-| MapLibre Native, Node (`@maplibre/maplibre-gl-native`) | 6.4 | 6.4.1 draws the same map, with polygon edges 1 to 3 levels off (see below) |
-| Martin | 1.3 | |
+| MapLibre Native, Android | 13.4.0 | reads MLT from 12.1, with the decoder issues below |
+| MapLibre Native, iOS | 6.28.0 | reads MLT from 6.2, with the decoder issues below |
+| MapLibre Native, Node (`@maplibre/maplibre-gl-native`) | none yet | 6.4.1 draws the same map, with polygon edges 1 to 3 levels off (see below) |
+| Martin | 1.3 | serves MLT archives as they are |
 
 MapLibre Native bundles the C++ decoder of maplibre-tile-spec. Before
 maplibre-tile-spec#816 (February 2026) that decoder left polygon rings

@@ -207,8 +207,8 @@ Compile options:
   --attribution <HTML>  Attribution viewers show; must keep crediting
                         OpenMapTiles and OpenStreetMap [default: both]
   --gzip-level <N>      Tile compression, 0 (none) to 9 (smallest) [default: 6]
-  --tile-format <F>     mvt, or mlt for MapLibre Tiles (experimental: MapLibre
-                        GL JS 5.12+, Android 12.1+, iOS 6.2+ read them, given
+  --tile-format <F>     mvt, or mlt for MapLibre Tiles, about 20% smaller
+                        (MapLibre GL JS 5.12+, Android 13.4+, iOS 6.28+, given
                         encoding mlt on the source) [default: mvt]
   --layers <A,B,...>    Write only these layers [default: all]; each is the
                         same as in a full build. Naming sar writes it, as

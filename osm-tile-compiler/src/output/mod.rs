@@ -69,9 +69,9 @@ pub enum TileFormat {
     #[default]
     Mvt,
     /// MapLibre Tiles (MLT) v1, which MapLibre GL JS 5.12, MapLibre
-    /// Android 12.1 and MapLibre iOS 6.2 read, given `"encoding": "mlt"` on
-    /// the source. The tiles hold the same features as the MVT ones;
-    /// experimental.
+    /// Android 13.4 and MapLibre iOS 6.28 and later read, given
+    /// `"encoding": "mlt"` on the source. The tiles hold the same features as
+    /// the MVT ones (`docs/mlt.md`).
     Mlt,
 }
 
