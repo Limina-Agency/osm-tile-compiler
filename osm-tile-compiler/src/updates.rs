@@ -13,10 +13,12 @@
 //! extract: see `osm_pbf_ingest::changes::Clip` for what is kept.
 
 use crate::sources::agent;
-use crate::{CompileBounds, CompileError};
+use crate::tile_list::{self, CHANGED_TILE_BUFFER_PIXELS, Degrees};
+use crate::{CompileBounds, CompileError, ZoomRange};
 use osm_pbf_ingest::blob_index::PbfHeaderBounds;
 use osm_pbf_ingest::changes::{
-    ApplyOptions, ApplyReport, BaseIndex, ChangeSet, Clip, ReadReport, apply_changes,
+    ApplyOptions, ApplyReport, AreaOptions, BaseIndex, ChangeSet, Clip, ReadReport, apply_changes,
+    changed_area_with,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -90,6 +92,59 @@ pub struct UpdateRequest {
     pub max_diffs: u64,
     pub clip: ClipTo,
     pub threads: usize,
+    /// Also write which tiles the changes reach.
+    pub changed_tiles: Option<ChangedTilesRequest>,
+}
+
+/// Where to write the tiles an update's changes reach, and at which zooms.
+///
+/// The list holds, one `z/x/y` per line, every tile at `zooms` that a changed
+/// object reaches, before or after the change, widened by
+/// [`CHANGED_TILE_BUFFER_PIXELS`](crate::CHANGED_TILE_BUFFER_PIXELS) and cut
+/// to the area the update clips to (or the input's header box). A changed
+/// object is a created, modified or deleted node, way or relation; a way
+/// whose node moved; and a multipolygon or boundary whose member changed. It
+/// is the list a renderer regenerates tiles from, and covers every tile a
+/// compile of the updated extract writes differently, with some to spare.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangedTilesRequest {
+    /// Must not exist yet.
+    pub output: PathBuf,
+    pub zooms: ZoomRange,
+}
+
+impl ChangedTilesRequest {
+    /// Every zoom, 0 to 14.
+    pub fn new(output: impl Into<PathBuf>) -> Self {
+        Self {
+            output: output.into(),
+            zooms: ZoomRange::ALL,
+        }
+    }
+}
+
+/// What [`update_extract`] wrote to a [`ChangedTilesRequest`]'s list.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangedTilesReport {
+    pub output: PathBuf,
+    /// Tiles listed.
+    pub tiles: u64,
+    /// Tiles listed at each zoom, from zoom 0.
+    pub tiles_per_zoom: Vec<u64>,
+    /// Boxes of changed objects, before and after.
+    pub boxes: usize,
+    /// Ways the change files don't hold whose node moved.
+    pub ways_moved: usize,
+    /// Multipolygons and boundaries the change files don't hold whose member
+    /// changed.
+    pub relations_moved: usize,
+    /// Ways in two or more routes, whose routes a changed relation can
+    /// reorder.
+    pub ways_reordered: usize,
+    /// Nodes a changed object needs that neither the input nor the changes
+    /// place; the object's box leaves them out.
+    pub nodes_missing: usize,
+    pub seconds: f64,
 }
 
 impl UpdateRequest {
@@ -103,6 +158,7 @@ impl UpdateRequest {
             max_diffs: DEFAULT_MAX_DIFFS,
             clip: ClipTo::HeaderBounds { fallback: None },
             threads: std::thread::available_parallelism().map_or(4, |n| n.get()),
+            changed_tiles: None,
         }
     }
 }
@@ -155,6 +211,8 @@ pub struct UpdateReport {
     pub deleted: usize,
     pub output_bytes: u64,
     pub seconds: f64,
+    /// The changed-tile list, when the request asked for one.
+    pub changed_tiles: Option<ChangedTilesReport>,
 }
 
 /// Write `request.input` with the change files and downloaded diffs applied
@@ -175,6 +233,14 @@ pub fn update_extract(
         return Err(CompileError::InvalidRequest(
             "no change files and no replication server given".to_string(),
         ));
+    }
+    if let Some(tiles) = &request.changed_tiles
+        && tiles.output.exists()
+    {
+        return Err(CompileError::InvalidRequest(format!(
+            "refusing to replace existing file {}",
+            tiles.output.display()
+        )));
     }
     for file in &request.change_files {
         if !file.is_file() {
@@ -353,12 +419,31 @@ fn update(
         }
     }
     cancelled()?;
+    // Worked out before the PBF is written, so a failure leaves nothing.
+    let changed_tiles = match &request.changed_tiles {
+        Some(tiles) => Some(find_changed_tiles(
+            &base,
+            &changes,
+            tiles,
+            tile_clip(request.clip, &base),
+            pool,
+        )?),
+        None => None,
+    };
+    cancelled()?;
     on_event(UpdateEvent::Applying {
         changes: changes.len(),
     });
     let report: ApplyReport = pool
         .install(|| apply_changes(&base, &changes, &request.output, &options))
         .map_err(|message| CompileError::classify(message, None))?;
+    let changed_tiles = match (changed_tiles, &request.changed_tiles) {
+        (Some((tiles, mut report)), Some(asked)) => {
+            report.tiles = tile_list::write(&asked.output, tiles).map_err(CompileError::other)?;
+            Some(report)
+        }
+        _ => None,
+    };
     Ok(UpdateReport {
         input: request.input.clone(),
         output: request.output.clone(),
@@ -381,7 +466,76 @@ fn update(
         deleted: report.deleted,
         output_bytes: report.output_bytes,
         seconds: started.elapsed().as_secs_f64(),
+        changed_tiles,
     })
+}
+
+/// The area tiles are listed for: the clip's box, or the input's header box
+/// when every change is applied.
+fn tile_clip(clip: ClipTo, base: &BaseIndex) -> Option<CompileBounds> {
+    let header = base
+        .header()
+        .bounds
+        .map(|bounds| CompileBounds::new(bounds.north, bounds.south, bounds.east, bounds.west));
+    match clip {
+        ClipTo::Bounds(bounds) => Some(bounds),
+        ClipTo::HeaderBounds { fallback } => header.or(fallback),
+        ClipTo::Nothing => header,
+    }
+}
+
+/// The tiles the changes reach, and the report on them but for the count
+/// written.
+fn find_changed_tiles(
+    base: &BaseIndex,
+    changes: &ChangeSet,
+    request: &ChangedTilesRequest,
+    clip: Option<CompileBounds>,
+    pool: &rayon::ThreadPool,
+) -> Result<
+    (
+        std::collections::BTreeSet<tile_list::TileAddress>,
+        ChangedTilesReport,
+    ),
+    CompileError,
+> {
+    let started = Instant::now();
+    // The profile lists a way's routes in the order of an index over every
+    // eligible relation membership, whose size any such relation's change
+    // moves, so a changed relation can reorder the routes of ways anywhere.
+    let mut options = AreaOptions::default();
+    options.indexed_relations = Some(&crate::omt::profile_relation_tags_eligible);
+    options.ordered_relations = Some(&crate::omt::profile_route_relation);
+    let area = pool
+        .install(|| changed_area_with(base, changes, options))
+        .map_err(CompileError::other)?;
+    let boxes: Vec<Degrees> = area
+        .boxes
+        .iter()
+        .map(|b| Degrees {
+            west: b.west,
+            south: b.south,
+            east: b.east,
+            north: b.north,
+        })
+        .collect();
+    let tiles = tile_list::tiles_reached(&boxes, request.zooms, CHANGED_TILE_BUFFER_PIXELS, clip);
+    let mut tiles_per_zoom = vec![0; usize::from(request.zooms.max()) + 1];
+    for (zoom, _, _) in &tiles {
+        tiles_per_zoom[usize::from(*zoom)] += 1;
+    }
+    let report = ChangedTilesReport {
+        output: request.output.clone(),
+        tiles: tiles.len() as u64,
+        tiles_per_zoom,
+        boxes: boxes.len(),
+        ways_moved: area.ways_moved,
+        relations_moved: area.relations_moved,
+        ways_reordered: area.ways_reordered,
+        nodes_missing: area.nodes_missing,
+        seconds: started.elapsed().as_secs_f64(),
+    };
+    Ok((tiles, report))
 }
 
 fn clip_to<'a>(base: &'a BaseIndex, bounds: CompileBounds) -> Result<Clip<'a>, CompileError> {

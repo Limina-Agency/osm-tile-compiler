@@ -1,5 +1,140 @@
 # Changelog
 
+## 0.4.0 (2026-11-24)
+
+### Breaking
+
+- Deltas are format version 2 (`DELTA_VERSION`): after the end operation
+  comes a footer of ed25519 signatures, ending in the magic `OTCSIGNS`. This
+  build still applies version 1 deltas, as unsigned deltas, but an older
+  build cannot apply a version 2 delta.
+- `archive::ApplyReport` gains `signed_by` and `trusted`, and
+  `archive::DiffReport` gains `signed_by` and `changed_tiles`.
+  `UpdateRequest` gains `changed_tiles` and `UpdateReport` gains
+  `changed_tiles`, so code that builds either with a struct literal needs the
+  new field (`UpdateRequest::new` sets it to `None`).
+- `CompileStage` has a new `SearchIndex` stage, after `BuildingLevels`, and
+  `CompileStage::ALL` lists eight stages. Like `FetchSources` it is not part
+  of `overall`.
+- `ExtractReport` gains `requests` and `bytes_read`.
+- Depends on osm-pbf-ingest 0.7.0.
+
+### New
+
+- An offline search index beside the archive: `compile --search-index`
+  (`BasemapRequest::search_index`) and the new `search-index` command write
+  `<NAME>-search.idx`, the names of the archive's highest zoom: places, POIs,
+  streets, peaks, lakes, rivers and the `sar` layer's huts, springs and
+  emergency points (also by ref), each with the nearest city, town or
+  village as its context. `search` and `SearchIndex::open`/`search` match
+  words regardless of case and diacritics (`fold_search_text`: Łódź = lodz),
+  the last word as a prefix, and rank by prominence, whole-name match and
+  distance from an optional point, within an optional box and layers. On
+  Małopolskie the index is 4.9 MB beside a 153.7 MB archive, built in 2.5 s,
+  and queries take 0.3 to 2 ms. The format (version 1) is in
+  [docs/search.md](docs/search.md). PMTiles and MVT archives only.
+- Python bindings: the new `osm-tile-compiler-python` crate builds the
+  `osm_tile_compiler` module (PyO3, abi3 wheels for CPython 3.10 and later,
+  with maturin) over compile, extract, update, diff, apply,
+  read_delta_manifest, inspect and verify. Every call releases the GIL;
+  compile and update report progress to a callable, and compile, extract
+  and update stop on a `CancelToken`, a callable or Ctrl-C. Errors are an
+  exception tree under `osm_tile_compiler.Error` with stable `kind` and
+  `stage`. CI builds and tests the wheels on Linux, macOS and Windows; they
+  are not on PyPI yet.
+- C ABI: new job kinds `extract`, `update`, `diff`, `apply` (with
+  `trustedKeys`), `inspect`, `verify` and `verify_delta`, which do what their
+  commands do and return the same reports, and `fetch_sources` and
+  `fetch_extract`, which download a compile's supplemental datasets or a
+  Geofabrik region ahead of it with byte progress. `otc_validate` runs
+  `otc_job_start`'s checks without starting a job. `compile_basemap` takes
+  `resume`. See [docs/c-abi.md](docs/c-abi.md).
+- Experimental MapLibre Tile (MLT) output: `compile --tile-format mlt`
+  (`ArchiveOptions::tile_format`, `TileFormat::Mlt`, `tileFormat: "mlt"` in
+  the worker request) writes every tile as MLT instead of MVT, in PMTiles
+  (tile type 6) or MBTiles (metadata `format` `mlt`). The default stays MVT,
+  so parity and the Monaco fingerprint don't change. Our own encoder
+  transcodes each finished MVT layer, so an MLT tile holds exactly the MVT
+  tile's features; the MLT crates are still changing too fast to depend on.
+  Berlin's archive is about 20% smaller (33.3 MB against 41.9 MB, both
+  gzipped), and MapLibre GL JS 5.24 and MapLibre Native 6.4 render it the
+  same as the MVT one. `style --tile-format mlt` (and
+  `StylePackRequest::tile_format`, `with_tile_format`) sets the source's
+  `encoding` to `mlt`, which MapLibre needs to read the tiles. `verify` and
+  `inspect` decode MLT tiles, and `serve` serves them as `.mlt` with the
+  source's `encoding` set. Building levels and the C ABI request don't take
+  MLT yet, and a merge cache from an archive of the other tile format is not
+  reused.
+- Resumable compiles: `BasemapRequest::resume` and `compile --resume`. A
+  resumable compile records the stages it completes in its scratch
+  directory (the merged extracts, the sorted tile features once every source
+  is read, each pass of the sort's merge, the archive and the building
+  levels) and keeps them when it is killed, crashes, fails or is cancelled;
+  the next resumable compile of the same request continues from the last
+  one, and writes the same archive byte for byte. A checkpoint for a changed
+  request or changed inputs is discarded with a warning.
+  `BasemapOutput::resumed_from` names the stage a compile continued from;
+  `checkpoint_directory` and `discard_checkpoint` find and remove a
+  checkpoint. The desktop worker's request takes `resume` too.
+- `serve` runs a small local HTTP server for previews: each PMTiles or
+  MBTiles archive's tiles, TileJSON 3.0.0, MapLibre style and a map page,
+  plus the glyphs and sprite of an offline style pack (`--style-pack`), so a
+  browser or a phone on the same network (`--host 0.0.0.0`) draws the map
+  with no other network. From Rust, `TileServer` and `ServeRequest`.
+- `extract` reads a remote archive: give it an `http://` or `https://` URL
+  instead of a file, on any server that answers range requests. Only the
+  header, the root directory, the leaf directories that may address kept
+  tiles and the kept tiles are downloaded, nearby tiles in one range and
+  eight ranges at a time; the output is the same, byte for byte, as from a
+  local copy. A server that ignores ranges, or an archive that changes
+  while it is read, is an error and nothing is written. From Rust,
+  `ExtractRequest::remote` (the new field `ExtractRequest::source_url`) and
+  `archive::is_remote_source`. `ExtractReport` gains `requests` and
+  `bytes_read`. Local extracts skip the leaf directories outside the area
+  too.
+- `compile --request <request.json>` runs a worker request from the command
+  line, with its progress printed as `compile` prints it, and writes the
+  request's manifest. Only `--threads` and `--json` go with it.
+- `completions <bash|zsh|fish>` prints a shell completion script for the
+  commands, their options and the values the tool knows (formats, layers,
+  datasets, replication sources).
+- Signed deltas, so a device can tell an update came from someone it trusts
+  before applying it. `keygen FILE.key` writes an ed25519 key and
+  `FILE.key.pub`; `diff --sign FILE.key`, `compile --delta-from OLD
+  --sign-delta FILE.key` and `sign FILE.delta --key FILE.key` sign a delta
+  in its footer, beside any other signatures; `apply --trusted-key KEY`
+  (repeatable, 64 hex digits or a `.pub` file) refuses a delta without a
+  valid signature by a trusted key before it writes anything, and checks the
+  signed bytes again as it applies them. Without `--trusted-key` an unsigned
+  delta applies as before, but one whose signature doesn't match never does.
+  Each signature signs the SHA-256 of everything before the footer,
+  manifest included, so it vouches for both archives' digests and every
+  operation. From Rust: `archive::{PublicKey, SecretKey, diff_with,
+  DiffOptions, apply_trusted, verify_delta, sign_delta}`.
+- Signed archives: `sign FILE --key FILE.key` on anything other than a
+  delta writes a detached signature file, `FILE.sig` (JSON, format
+  `osm-tile-compiler-signature` version 1), and `verify-signature FILE
+  [--trusted-key KEY]...` checks a delta's signatures or a file's `.sig`
+  (`archive::{sign_file, verify_file_signature}`).
+- `update --changed-tiles FILE` also writes the tiles the changes reach,
+  one `z/x/y` per line as osm2pgsql's expire lists are, at zooms 0 to 14 or
+  `--min-zoom`/`--max-zoom`: the boxes of every changed object before and
+  after, of ways whose node moved and of multipolygons and boundaries whose
+  member changed, widened by 64 pixels (`CHANGED_TILE_BUFFER_PIXELS`) for
+  labels and cut to the extract's box. On Małopolskie with 13 hours of
+  planet diffs it listed 5,112 tiles, every one of the 278 a recompile
+  changed among them. The boxes come from osm-pbf-ingest's
+  new `changes::changed_area`. `UpdateRequest::changed_tiles`
+  (`ChangedTilesRequest`) does the same from Rust, and the report's
+  `changed_tiles` says how many tiles at each zoom.
+- `diff --changed-tiles FILE` writes the tiles that differ between the two
+  archives (changed, added or removed), in the same format.
+- `scripts/build-xcframework.sh` builds the C ABI as an iOS XCFramework
+  (`aarch64-apple-ios` and `aarch64-apple-ios-sim`, header and module map).
+- `ios/DeviceTest`, a SwiftUI app that compiles a region on an iPhone
+  through the C ABI, writes its style pack, renders it with MapLibre Native,
+  and reports time and peak memory per run.
+
 ## 0.3.0 (2026-11-23)
 
 ### Breaking

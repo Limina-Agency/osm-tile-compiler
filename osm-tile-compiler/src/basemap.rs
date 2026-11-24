@@ -5,6 +5,7 @@ use crate::building_levels::{BuildingLevelsReport, building_levels_path, has_bui
 use crate::control::{self, CompileError, CompileProgress, CompileStage, Control, RemoveOnDrop};
 use crate::omt::{self, CompileResult, OpenMapTilesRequest};
 use crate::request::{Area, LayerSelection, ReadScope, ZoomRange};
+use crate::resume::{Checkpoints, ResumePoint};
 use crate::sources::{self, CachedInput, FetchEvent, FetchMode, SupplementalDataset};
 use crate::{ArchiveCenter, CompileBounds, OutputFormat, archive::ArchiveOptions};
 use serde_json::json;
@@ -46,8 +47,9 @@ pub struct BasemapRequest {
     /// [`Area::bounds`], the area is the box around every extract's header
     /// box; the archive's OSM data timestamp is the oldest extract's.
     pub extra_inputs: Vec<PathBuf>,
-    /// The archive to write; it must not exist yet. Building levels, when
-    /// asked for, go beside it ([`building_levels_path`]).
+    /// The archive to write; it must not exist yet. Building levels and the
+    /// search index, when asked for, go beside it ([`building_levels_path`],
+    /// [`crate::search_index_path`]).
     pub output: PathBuf,
     /// The archive format [default: the one `output`'s extension names, see
     /// [`OutputFormat::from_path`]].
@@ -98,6 +100,13 @@ pub struct BasemapRequest {
     ///
     /// [`write_building_levels`]: crate::write_building_levels
     pub building_levels: bool,
+    /// Whether to write a search index of the archive's names beside it, at
+    /// [`search_index_path`] [default: no]. It finds places, POIs, streets,
+    /// peaks, waters and `sar` features by name offline; see
+    /// [`SearchIndex`](crate::SearchIndex).
+    ///
+    /// [`search_index_path`]: crate::search_index_path
+    pub search_index: bool,
     /// The memory, in bytes, the tile sort may hold in its buffers before it
     /// writes them to scratch runs [default: half of what the machine has
     /// available when rendering starts]. The buffers start at 8 MiB per
@@ -113,6 +122,24 @@ pub struct BasemapRequest {
     /// skip merging and encoding the tiles the update left alone; the
     /// archive is the same as without it.
     pub merge_cache: crate::MergeCacheOptions,
+    /// Whether the compile can be resumed after it is interrupted [default:
+    /// no]. A resumable compile works in a scratch directory named after its
+    /// output ([`checkpoint_directory`]) and records there each stage it
+    /// completes; when it is killed, crashes, fails or is cancelled, the
+    /// directory stays, and the next resumable compile of the same request
+    /// continues from the last stage recorded instead of starting over. The
+    /// archive is the same, byte for byte, as an uninterrupted compile's.
+    /// A checkpoint for a request that changed since, or for inputs that
+    /// changed, is discarded with a warning. `threads` and `sort_memory` may
+    /// differ between attempts. The directory is removed once the compile
+    /// succeeds; [`discard_checkpoint`] removes one no longer wanted.
+    ///
+    /// The checkpoints are the merged extracts (with `extra_inputs`), the
+    /// sorted tile features once every source is read (the end of
+    /// [`CompileStage::ReadOsm`], so resuming then starts at
+    /// [`CompileStage::WriteTiles`]), each pass of the sort's merge, the
+    /// archive, and the building levels.
+    pub resume: bool,
 }
 
 impl BasemapRequest {
@@ -149,8 +176,10 @@ impl BasemapRequest {
             sar: false,
             languages: None,
             building_levels: false,
+            search_index: false,
             sort_memory: None,
             merge_cache: crate::MergeCacheOptions::default(),
+            resume: false,
         }
     }
 
@@ -208,6 +237,24 @@ impl BasemapRequest {
                 self.output_format().name()
             )));
         }
+        if self.search_index && self.output_format() != OutputFormat::PmTiles {
+            return Err(invalid(format!(
+                "the search index is written beside PMTiles archives only, not {}",
+                self.output_format().name()
+            )));
+        }
+        if self.building_levels && self.archive.tile_format != crate::TileFormat::Mvt {
+            return Err(invalid(format!(
+                "building levels are read from MVT basemaps only, not {}",
+                self.archive.tile_format.name()
+            )));
+        }
+        if self.search_index && self.archive.tile_format != crate::TileFormat::Mvt {
+            return Err(invalid(format!(
+                "the search index is read from MVT basemaps only, not {}",
+                self.archive.tile_format.name()
+            )));
+        }
         let caching = self.merge_cache.write || self.merge_cache.reuse_from.is_some();
         if caching && self.output_format() != OutputFormat::PmTiles {
             return Err(invalid(format!(
@@ -221,8 +268,15 @@ impl BasemapRequest {
             ));
         }
         let levels = building_levels_path(&self.output);
-        let archives = [Some(&self.output), self.building_levels.then_some(&levels)];
-        for archive in archives.into_iter().flatten() {
+        let search = crate::search_index_path(&self.output);
+        let archives = [
+            Some(&self.output),
+            self.building_levels.then_some(&levels),
+            self.search_index.then_some(&search),
+        ];
+        // A resumable compile may have put them there: it checks them
+        // against its checkpoint.
+        for archive in archives.into_iter().flatten().filter(|_| !self.resume) {
             if archive.exists() {
                 return Err(invalid(format!(
                     "refusing to replace existing archive {}",
@@ -256,6 +310,8 @@ pub struct BasemapOutput {
     pub format: OutputFormat,
     /// The building levels and what they hold, if written.
     pub building_levels: Option<(PathBuf, BuildingLevelsReport)>,
+    /// The search index and what it holds, if written.
+    pub search_index: Option<(PathBuf, crate::SearchIndexReport)>,
     /// The area compiled.
     pub bounds: CompileBounds,
     /// Where each supplemental dataset read came from, when the request
@@ -263,6 +319,28 @@ pub struct BasemapOutput {
     pub supplemental_inputs: Vec<CachedInput>,
     /// The datasets left out, as the request asked.
     pub omitted_sources: Vec<SupplementalDataset>,
+    /// For a resumed compile, the stage it continued from; an earlier,
+    /// interrupted attempt did the stages before it.
+    pub resumed_from: Option<CompileStage>,
+}
+
+/// The scratch directory where a resumable compile of `request` keeps its
+/// checkpoints (see [`BasemapRequest::resume`]): `resume-<hash of the
+/// output path>` inside its `temp_dir`.
+pub fn checkpoint_directory(request: &BasemapRequest) -> PathBuf {
+    crate::resume::checkpoint_directory(&request.temp_dir, &request.output)
+}
+
+/// Removes the checkpoint an interrupted resumable compile of `request`
+/// left, if any, and returns whether there was one. A checkpoint a running
+/// compile holds is refused with [`CompileError::Failed`].
+pub fn discard_checkpoint(request: &BasemapRequest) -> Result<bool, CompileError> {
+    crate::resume::discard(&request.temp_dir, &request.output).map_err(|message| {
+        CompileError::Failed {
+            stage: None,
+            message,
+        }
+    })
 }
 
 /// The manifest's `format`.
@@ -310,7 +388,7 @@ fn read_pbf_bounds(input: &Path) -> Result<CompileBounds, String> {
 
 /// Compiles `request.input_pbf` into a basemap: fetches the supplemental
 /// datasets as the request says, compiles, and writes the building levels
-/// beside the archive if the request asks for them.
+/// and the search index beside the archive if the request asks for them.
 ///
 /// `progress` and `should_cancel` are called on the calling thread, which
 /// waits for the compile while the work runs on a rayon pool of
@@ -401,37 +479,147 @@ fn compile(
             missing.join(", ")
         ));
     }
-    let scratch = Scratch::create(&request.temp_dir)?;
+    let levels_path = request
+        .building_levels
+        .then(|| building_levels_path(&request.output));
+    let mut discarded = false;
+    let (mut scratch, checkpoints) = if request.resume {
+        let fingerprint = crate::resume::fingerprint(request, &compile_request, &used);
+        let (checkpoints, was_discarded) =
+            Checkpoints::open(&request.temp_dir, &request.output, fingerprint)?;
+        discarded = was_discarded;
+        let scratch = Scratch {
+            path: checkpoints.directory().to_path_buf(),
+            parent: checkpoints
+                .made_temp_dir()
+                .then(|| request.temp_dir.clone()),
+            resumable: true,
+        };
+        (scratch, Some(checkpoints))
+    } else {
+        (Scratch::create(&request.temp_dir)?, None)
+    };
+    let resumed = checkpoints
+        .as_ref()
+        .and_then(|c| c.resume_point(&request.output, levels_path.as_deref()));
+    if request.resume {
+        // `check` left these to the checkpoint.
+        let archive_done = matches!(
+            resumed,
+            Some(ResumePoint::BuildingLevels | ResumePoint::Done)
+        );
+        let levels_done = resumed == Some(ResumePoint::Done);
+        // The search index is written again on every attempt.
+        let search_path = crate::search_index_path(&request.output);
+        let existing = [
+            (!archive_done).then_some(request.output.as_path()),
+            levels_path.as_deref().filter(|_| !levels_done),
+            request.search_index.then_some(search_path.as_path()),
+        ];
+        if let Some(path) = existing.into_iter().flatten().find(|path| path.exists()) {
+            return Err(format!(
+                "refusing to replace existing archive {}",
+                path.display()
+            ));
+        }
+    }
     compile_request.temp_dir = scratch.path.clone();
-    if !request.extra_inputs.is_empty() {
-        compile_request.input_pbf = merge_extracts(&request.inputs(), &scratch.path, control)?;
+    if !request.extra_inputs.is_empty() && matches!(resumed, None | Some(ResumePoint::ReadSources))
+    {
+        compile_request.input_pbf = match checkpoints.as_ref().and_then(Checkpoints::merged_extract)
+        {
+            Some(merged) => merged,
+            None => {
+                let merged = merge_extracts(&request.inputs(), &scratch.path, control)?;
+                if let Some(checkpoints) = &checkpoints {
+                    checkpoints.commit_merged_extract(&merged)?;
+                }
+                merged
+            }
+        };
     }
     // The archive is moved into place only when complete; it and the
-    // levels are removed again if a later step fails or is cancelled.
-    let archive_guard = RemoveOnDrop::file(request.output.clone());
-    let result = omt::compile(&compile_request, control, |_| {});
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            // The archive was never put in place: nothing to remove.
-            archive_guard.keep();
-            return Err(error);
-        }
+    // levels are removed again if a later step fails or is cancelled,
+    // unless a checkpoint keeps them for the next attempt.
+    let archive_guard = (!request.resume).then(|| RemoveOnDrop::file(request.output.clone()));
+    let previous = checkpoints
+        .as_ref()
+        .and_then(|c| c.archive_result(&request.output));
+    let mut result = match previous {
+        Some(result) => result,
+        None => match omt::compile(&compile_request, control, |_| {}, checkpoints.as_ref()) {
+            Ok(result) => {
+                if let Some(checkpoints) = &checkpoints
+                    && let Err(error) = checkpoints.commit_archive(&request.output, &result)
+                {
+                    // Unrecorded, it would block the next attempt.
+                    let _ = std::fs::remove_file(&request.output);
+                    return Err(error);
+                }
+                result
+            }
+            Err(error) => {
+                // The archive was never put in place: nothing to remove.
+                if let Some(guard) = archive_guard {
+                    guard.keep();
+                }
+                return Err(error);
+            }
+        },
     };
+    if discarded {
+        result.warnings.push(format!(
+            "discarded the checkpoint in {}: it was left by a compile of another request or of \
+             inputs that changed since",
+            scratch.path.display()
+        ));
+    }
     let mut building_levels = None;
     let mut levels_guard = None;
-    if request.building_levels && has_building_layer(&request.output)? {
+    if let Some(path) = levels_path
+        && has_building_layer(&request.output)?
+    {
         control.stage(CompileStage::BuildingLevels, "Writing building levels")?;
-        let path = building_levels_path(&request.output);
-        let report =
-            crate::building_levels::write_levels(&request.output, &path, request.threads, control)?;
-        levels_guard = Some(RemoveOnDrop::file(path.clone()));
+        let report = match checkpoints.as_ref().and_then(|c| c.levels_report(&path)) {
+            Some(report) => report,
+            None => {
+                let report = crate::building_levels::write_levels(
+                    &request.output,
+                    &path,
+                    request.threads,
+                    control,
+                )?;
+                match &checkpoints {
+                    Some(checkpoints) => checkpoints.commit_levels(&path, &report)?,
+                    None => levels_guard = Some(RemoveOnDrop::file(path.clone())),
+                }
+                report
+            }
+        };
         building_levels = Some((path, report));
     }
+    let mut search_index = None;
+    let mut search_guard = None;
+    if request.search_index {
+        control.stage(CompileStage::SearchIndex, "Writing the search index")?;
+        let path = crate::search_index_path(&request.output);
+        let report = crate::search::write_index(&request.output, &path, request.threads, control)?;
+        search_guard = Some(RemoveOnDrop::file(path.clone()));
+        search_index = Some((path, report));
+    }
     control.check()?;
+    if let Some(checkpoints) = checkpoints {
+        checkpoints.finish();
+        scratch.resumable = false;
+    }
     drop(scratch);
-    archive_guard.keep();
+    if let Some(guard) = archive_guard {
+        guard.keep();
+    }
     if let Some(guard) = levels_guard {
+        guard.keep();
+    }
+    if let Some(guard) = search_guard {
         guard.keep();
     }
     Ok(BasemapOutput {
@@ -439,12 +627,14 @@ fn compile(
         archive: request.output.clone(),
         format: request.output_format(),
         building_levels,
+        search_index,
         bounds,
         supplemental_inputs,
         omitted_sources: SupplementalDataset::ALL
             .into_iter()
             .filter(|dataset| request.omit_sources.contains(dataset))
             .collect(),
+        resumed_from: resumed.map(ResumePoint::stage),
     })
 }
 
@@ -465,7 +655,9 @@ fn merge_extracts(inputs: &[&Path], scratch: &Path, control: &Control) -> Result
     // sort is stable, so ties keep the request's order.
     indexes.sort_by_key(|index| std::cmp::Reverse(index.header().replication_timestamp));
     let order: Vec<&BaseIndex> = indexes.iter().collect();
-    let output = scratch.join("merged.osm.pbf");
+    let output = scratch.join(crate::resume::MERGED_EXTRACT);
+    // One an interrupted attempt left unfinished.
+    let _ = std::fs::remove_file(&output);
     let options = MergeOptions {
         writing_program: Some(omt::GENERATOR.to_string()),
     };
@@ -593,6 +785,8 @@ fn fetch(
 struct Scratch {
     path: PathBuf,
     parent: Option<PathBuf>,
+    /// A resumable compile's directory, which stays until it succeeds.
+    resumable: bool,
 }
 
 impl Scratch {
@@ -612,6 +806,7 @@ impl Scratch {
                     return Ok(Self {
                         path,
                         parent: made_parent.then(|| temp_dir.to_path_buf()),
+                        resumable: false,
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -623,6 +818,9 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        if self.resumable {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.path);
         if let Some(parent) = &self.parent {
             let _ = std::fs::remove_dir(parent);

@@ -33,3 +33,13 @@ the platform's math library: with glibc's replaced by the `libm` crate's
 (musl's algorithms), which round 3–24% of results differently, the output is
 identical. It contains OpenStreetMap data, © OpenStreetMap contributors, under
 the Open Database License 1.0: https://www.openstreetmap.org/copyright.
+
+`mlt-synthetic/` holds the MapLibre Tile specification's synthetic v1
+fixtures (`test/synthetic/0x01/` of
+https://github.com/maplibre/maplibre-tile-spec at commit `698a3f7e`, dual
+licensed MIT or Apache-2.0): each `.mlt` tile with the `.json` its features
+must decode to, the JSON compacted. Only those whose encodings the
+compiler's test decoder reads are copied: none with FastPFOR, FSST, Morton,
+shared dictionaries or tessellation. `src/mlt/tests.rs` decodes every one
+and compares it with its JSON, so the decoder that checks the MLT encoder is
+itself checked against the specification.

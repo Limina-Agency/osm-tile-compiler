@@ -70,7 +70,13 @@ fn junction_highway_rank(highway: &str) -> u8 {
 // Match the four OMT preprocessOsmRelation handlers. OsmReader only adds way
 // memberships to its multimap when at least one handler returns relation info.
 fn profile_relation_eligible(relation: &NormalizedRelation) -> bool {
-    let tag = |key| relation.tags.get(key);
+    profile_relation_tags_eligible(&relation.tags)
+}
+
+/// [`profile_relation_eligible`] by the relation's tags: whether the
+/// membership index, whose size orders every way's relations, counts it.
+pub(crate) fn profile_relation_tags_eligible(tags: &osm_pbf_ingest::Tags) -> bool {
+    let tag = |key| tags.get(key);
     let building = tag("type") == Some("building");
     let waterway =
         tag("waterway") == Some("river") && tag("name").is_some_and(|name| !name.is_empty());
@@ -79,11 +85,16 @@ fn profile_relation_eligible(relation: &NormalizedRelation) -> bool {
         && tag("admin_level")
             .and_then(java_parse_round_int)
             .is_some_and(|level| (2..=10).contains(&level));
-    let route = matches!(tag("route"), Some("road" | "hiking"))
-        && (relation.tags.contains_key("network")
-            || relation.tags.contains_key("osmc:symbol")
-            || relation.tags.contains_key("colour"));
-    building || waterway || boundary || route
+    building || waterway || boundary || profile_route_relation(tags)
+}
+
+/// A route whose name, ref and colour `transportation_name` lists on its
+/// ways as `route_1`, `route_2`, ..., in the membership index's order.
+pub(crate) fn profile_route_relation(tags: &osm_pbf_ingest::Tags) -> bool {
+    matches!(tags.get("route"), Some("road" | "hiking"))
+        && (tags.contains_key("network")
+            || tags.contains_key("osmc:symbol")
+            || tags.contains_key("colour"))
 }
 
 fn java_parse_round_int(value: &str) -> Option<i32> {

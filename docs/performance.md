@@ -425,8 +425,51 @@ datasets in its Documents folder. Małopolskie is Geofabrik's extract of
   empty afterwards.
 - Monaco (`fixtures/monaco.osm.pbf`, no supplemental datasets) took 0.13 s
   in the simulator, again byte-identical to macOS.
-- A phone has not been measured: its CPU is slower than the Mac's and its
-  memory limit stricter.
+- The phone measured below is faster than this on Małopolskie (17.0 s),
+  with a newer library.
+
+## On an iPhone
+
+Measured on 2026-11-24 on an iPhone 17 (`iPhone18,3`, 6 cores, 7.5 GiB,
+iOS 27.2.1, not in Low Power Mode), with the device test app in
+`ios/DeviceTest`, which calls `compile_basemap` through the C ABI
+(`osm-tile-compiler-ffi` 0.3.0, ABI 1, release XCFramework, system
+allocator) on 4 threads. No supplemental datasets, no building levels.
+Małopolskie is Geofabrik's extract of 2026-11-18 (194 MiB), copied into the
+app's Documents. One run each, launched from the home screen without a
+debugger; the thermal state was nominal before and after every run.
+
+| Region | Time | CPU | Peak footprint | Least available | Peak resident | Archive | First render |
+|---|---|---|---|---|---|---|---|
+| Monaco (`fixtures/monaco.osm.pbf`) | 0.09 s | 0.2 s | 33 MiB | 3343 MiB | 78 MiB | 0.2 MiB | 0.64 s |
+| Kraków centre (area of Małopolskie, `near_area`) | 2.1 s | 8.6 s | 198 MiB | 3178 MiB | 488 MiB | 5.8 MiB | 0.07 s |
+| Małopolskie, whole extract | 17.0 s | 73.4 s | 171 MiB | 3205 MiB | 633 MiB | 146.4 MiB | 0.08 s |
+
+- Peak footprint is `phys_footprint` sampled every 100 ms during the
+  compile: what iOS's memory limit counts, for the whole app, SwiftUI
+  included (23 to 35 MiB before the compile). It leaves out file-backed
+  pages such as the memory-mapped extract, so it is not comparable with the
+  peak RSS of the tables above. Peak resident is the process's
+  `resident_size_max`, the nearer figure to those.
+- Least available is the lowest `os_proc_available_memory()` during the
+  compile: the app stayed more than 3 GiB under its limit, without the
+  increased-memory-limit entitlement.
+- Stages: Kraków centre `index_osm` 0.6 s, `read_osm` 1.0 s, `write_tiles`
+  0.3 s (bounds 19.88–20.01 E, 50.03–50.09 N); Małopolskie 0.3, 9.8 and
+  6.7 s. Against the simulator on the M5 (0.1.x, 8.8 s reading and 8.9 s
+  writing), the gain is in `write_tiles`.
+- The Kraków area peaks above the whole extract, plausibly because a
+  `near_area` read holds the area's tagged nodes from the first pass until
+  the second (central Kraków is dense in POIs and addresses); not measured
+  further.
+- Writing the offline style pack (`write_style_pack`, glyphs and sprite
+  fetched over Wi-Fi, 2.0 to 4.0 MB) took 0.9 to 1.6 s.
+- First render is MapLibre Native's first full render of the archive
+  through a `pmtiles://file://` URL, from opening the map.
+- The scratch directory was empty after every run. The runs are in the
+  app's `Documents/runs.jsonl`.
+- Not measured yet: the supplemental datasets on the phone, building
+  levels, other thread counts and iPhones with less memory.
 
 ## Cancelling
 

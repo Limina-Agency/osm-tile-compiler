@@ -90,6 +90,17 @@ pub fn with_sar_layers(style: &str) -> String {
     serde_json::to_string_pretty(&style).expect("a style serializes")
 }
 
+/// `style` for an archive whose tiles are in `format`: for MLT, the source
+/// says `"encoding": "mlt"`, without which MapLibre reads the tiles as MVT.
+/// The result is pretty-printed JSON.
+pub fn with_tile_format(style: &str, format: crate::TileFormat) -> String {
+    let mut style: serde_json::Value = serde_json::from_str(style).expect("the style is JSON");
+    if format == crate::TileFormat::Mlt {
+        style["sources"]["openmaptiles"]["encoding"] = "mlt".into();
+    }
+    serde_json::to_string_pretty(&style).expect("a style serializes")
+}
+
 /// What [`write_style_pack`] writes, and where it fetches from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -126,6 +137,8 @@ pub struct StylePackRequest {
     /// Also draw the opt-in `sar` layer, for an archive compiled with it
     /// (see [`with_sar_layers`]).
     pub sar: bool,
+    /// The encoding of the archive's tiles (see [`with_tile_format`]).
+    pub tile_format: crate::TileFormat,
 }
 
 impl StylePackRequest {
@@ -141,6 +154,7 @@ impl StylePackRequest {
             sprite: DEFAULT_SPRITE_URL.into(),
             base_url: None,
             sar: false,
+            tile_format: crate::TileFormat::Mvt,
         }
     }
 
@@ -405,6 +419,10 @@ fn write_pack(
         with_sar_layers(&style)
     } else {
         style
+    };
+    let style = match request.tile_format {
+        crate::TileFormat::Mvt => style,
+        format => with_tile_format(&style, format),
     };
     let license = license(request);
     for (name, contents) in [("style.json", &style), ("LICENSE.md", &license)] {

@@ -10,7 +10,7 @@ use super::render::Record;
 use super::spill::{RunReader, RunWriter};
 use crate::control::Control;
 use crate::{
-    ArchiveCenter, CompileBounds,
+    ArchiveCenter, CompileBounds, TileFormat,
     archive::ArchiveOptions,
     output::{ArchiveSpec, ArchiveTarget},
     tile_geometry::{TileGeometry, TilePoint, TileRingGroup},
@@ -233,6 +233,9 @@ pub(super) struct Store {
     sequence: usize,
     fields: BTreeMap<String, BTreeMap<String, String>>,
     zooms: BTreeMap<String, (u8, u8)>,
+    /// Set once the runs are checkpointed (`checkpoint`): the merge then
+    /// records each of its passes, and the runs stay when the compile fails.
+    checkpoints: Option<crate::resume::Checkpoints>,
 }
 
 /// Global insertion order of a record: the profile source's ordinal, the
@@ -874,10 +877,13 @@ impl Drop for Sorter {
     }
 }
 
-/// A failed or panicking compile removes the sort directory too.
+/// A failed or panicking compile removes the sort directory too, unless its
+/// runs are checkpointed for a later compile to resume from.
 impl Drop for Store {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
+        if self.checkpoints.is_none() {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
     }
 }
 
@@ -888,23 +894,7 @@ impl Store {
     /// use. The lock file itself stays: removing it would let two compiles
     /// lock different files.
     pub fn new(temp: &Path) -> Result<Self, String> {
-        let directory = temp.join("omt-tile-sort");
-        let lock_path = temp.join("omt-tile-sort.lock");
-        let lock = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|e| format!("Failed to create {}: {e}", lock_path.display()))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(format!("{} is in use by another compile", temp.display()));
-            }
-            Err(fs::TryLockError::Error(e)) => {
-                return Err(format!("Failed to lock {}: {e}", lock_path.display()));
-            }
-        }
+        let (directory, lock) = Self::lock(temp)?;
         if directory.exists() {
             fs::remove_dir_all(&directory).map_err(|e| {
                 format!(
@@ -923,7 +913,173 @@ impl Store {
             sequence: 0,
             fields: BTreeMap::new(),
             zooms: BTreeMap::new(),
+            checkpoints: None,
         })
+    }
+
+    /// Takes up the runs an interrupted compile checkpointed in `temp`,
+    /// finishing or undoing the merge pass it was in, and checks that every
+    /// run is there, whole. The checkpoint stays in use: the merge goes on
+    /// recording its passes.
+    pub(crate) fn resume(
+        temp: &Path,
+        sort: &crate::resume::SortCheckpoint,
+        checkpoints: crate::resume::Checkpoints,
+    ) -> Result<Self, String> {
+        let (directory, lock) = Self::lock(temp)?;
+        let invalid = |why: String| format!("the checkpoint cannot be resumed: {why}");
+        let mut runs: Vec<String> = sort.runs.iter().map(|(name, _)| name.clone()).collect();
+        if !sort.pending.is_empty() {
+            let mut done = vec![];
+            for (inputs, output) in &sort.pending {
+                let output_path = directory.join(output);
+                if inputs.iter().all(|run| directory.join(run).is_file()) {
+                    // Interrupted before its runs were removed: merged again.
+                    let _ = fs::remove_file(&output_path);
+                } else if output_path.is_file() {
+                    for run in inputs {
+                        let _ = fs::remove_file(directory.join(run));
+                    }
+                    done.push((inputs, output.clone()));
+                } else {
+                    return Err(invalid(format!("{output} is missing")));
+                }
+            }
+            for (inputs, output) in done {
+                runs.retain(|run| !inputs.contains(run));
+                runs.push(output);
+            }
+        }
+        let sizes = sort.runs.iter().cloned().collect::<BTreeMap<_, _>>();
+        for run in &runs {
+            let path = directory.join(run);
+            let bytes = fs::metadata(&path)
+                .map_err(|e| invalid(format!("{}: {e}", path.display())))?
+                .len();
+            if sizes.get(run).is_some_and(|expected| *expected != bytes) {
+                return Err(invalid(format!("{} was changed", path.display())));
+            }
+        }
+        // Anything else is a merge output an interrupted pass left unfinished.
+        for entry in fs::read_dir(&directory).map_err(|e| invalid(e.to_string()))? {
+            let entry = entry.map_err(|e| invalid(e.to_string()))?;
+            if !runs.iter().any(|run| entry.file_name() == run.as_str()) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let store = Self {
+            runs: runs.iter().map(|run| directory.join(run)).collect(),
+            directory,
+            _lock: lock,
+            spilled: Arc::new(AtomicU64::new(sort.spilled)),
+            sequence: sort.sequence,
+            fields: sort.fields.clone(),
+            zooms: sort.zooms.clone(),
+            checkpoints: Some(checkpoints),
+        };
+        if !sort.pending.is_empty() {
+            store.commit_sort(&[])?;
+        }
+        Ok(store)
+    }
+
+    /// Syncs the runs to disk and returns what a checkpoint of them records.
+    /// From then on the merge records each of its passes in `checkpoints`,
+    /// and the runs outlive a failed compile.
+    pub(crate) fn checkpoint(
+        &mut self,
+        checkpoints: crate::resume::Checkpoints,
+    ) -> Result<crate::resume::SortCheckpoint, String> {
+        for run in &self.runs {
+            crate::resume::sync_file(run)?;
+        }
+        self.checkpoints = Some(checkpoints);
+        self.sort_checkpoint(&[])
+    }
+
+    fn sort_checkpoint(
+        &self,
+        pending: &[(Vec<PathBuf>, PathBuf)],
+    ) -> Result<crate::resume::SortCheckpoint, String> {
+        let name = |path: &Path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        Ok(crate::resume::SortCheckpoint {
+            runs: self
+                .runs
+                .iter()
+                .map(|run| Ok((name(run), run_sizes(std::slice::from_ref(run))?[0])))
+                .collect::<Result<_, String>>()?,
+            pending: pending
+                .iter()
+                .map(|(inputs, output)| {
+                    (inputs.iter().map(|run| name(run)).collect(), name(output))
+                })
+                .collect(),
+            sequence: self.sequence,
+            spilled: self.spilled.load(AtomicOrdering::Relaxed),
+            fields: self.fields.clone(),
+            zooms: self.zooms.clone(),
+        })
+    }
+
+    /// Records the runs, and the merge pass about to start, when checkpointed.
+    fn commit_sort(&self, pending: &[(Vec<PathBuf>, PathBuf)]) -> Result<(), String> {
+        match &self.checkpoints {
+            Some(checkpoints) => checkpoints.commit_sort(self.sort_checkpoint(pending)?),
+            None => Ok(()),
+        }
+    }
+
+    /// Starts a pass of the intermediate merge as `finish_cached` does, and
+    /// stops as a kill would: after merging `groups_done` of its groups, and
+    /// with the next group's output half written.
+    #[cfg(test)]
+    pub(super) fn interrupt_merge_pass(&mut self, groups_done: usize) {
+        let plan = merge_plan(&run_sizes(&self.runs).unwrap());
+        let groups = plan
+            .iter()
+            .map(|group| group.iter().map(|&run| self.runs[run].clone()).collect())
+            .collect::<Vec<Vec<_>>>();
+        let outputs = groups.iter().map(|_| self.next_path()).collect::<Vec<_>>();
+        assert!(groups.len() > groups_done, "{} groups", groups.len());
+        let pending = groups.iter().cloned().zip(outputs.iter().cloned());
+        self.commit_sort(&pending.collect::<Vec<_>>()).unwrap();
+        let control = Control::detached();
+        merge_groups(
+            &groups[..groups_done],
+            &outputs[..groups_done],
+            1,
+            &control,
+            true,
+        )
+        .unwrap();
+        fs::write(&outputs[groups_done], b"half a run").unwrap();
+    }
+
+    /// Locks the sort directory of `temp` for this compile.
+    fn lock(temp: &Path) -> Result<(PathBuf, File), String> {
+        let directory = temp.join("omt-tile-sort");
+        let lock_path = temp.join("omt-tile-sort.lock");
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("Failed to create {}: {e}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(format!("{} is in use by another compile", temp.display()));
+            }
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(format!("Failed to lock {}: {e}", lock_path.display()));
+            }
+        }
+        Ok((directory, lock))
     }
     pub(super) fn sorter(&self, worker: usize, limits: &Arc<SortBudget>) -> Sorter {
         Sorter {
@@ -1012,16 +1168,23 @@ impl Store {
                 .map(|group| group.iter().map(|&run| self.runs[run].clone()).collect())
                 .collect::<Vec<Vec<_>>>();
             let outputs = groups.iter().map(|_| self.next_path()).collect::<Vec<_>>();
+            let pending = groups.iter().cloned().zip(outputs.iter().cloned());
+            self.commit_sort(&pending.collect::<Vec<_>>())?;
+            let durable = self.checkpoints.is_some();
             // Keys are unique, so any grouping merges to the same record order.
-            if let Err(error) = merge_groups(&groups, &outputs, threads, control) {
-                for path in &outputs {
-                    let _ = fs::remove_file(path);
+            if let Err(error) = merge_groups(&groups, &outputs, threads, control, durable) {
+                // A checkpointed pass is finished or undone on resuming.
+                if !durable {
+                    for path in &outputs {
+                        let _ = fs::remove_file(path);
+                    }
                 }
                 return Err(error);
             }
             // `merge_groups` removed the merged runs.
             self.runs = unmerged(std::mem::take(&mut self.runs), &plan);
             self.runs.extend(outputs);
+            self.commit_sort(&[])?;
         }
         drop(merge_phase);
         drop(merge_stage);
@@ -1040,6 +1203,7 @@ impl Store {
             metadata_json: &metadata,
             min_zoom: minzoom,
             max_zoom: maxzoom,
+            tile_format: options.tile_format,
         })?;
         let mut writing = crate::profiling::Accumulator::new("omt_archive_write");
         let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
@@ -1078,6 +1242,7 @@ impl Store {
                             counters,
                             timings,
                             options.gzip_level,
+                            options.tile_format,
                             control,
                         )
                     })
@@ -1148,8 +1313,10 @@ impl Store {
         drop(final_merge);
         drop(final_stage);
         if let Err(error) = encoded {
-            for path in &self.runs {
-                let _ = fs::remove_file(path);
+            if self.checkpoints.is_none() {
+                for path in &self.runs {
+                    let _ = fs::remove_file(path);
+                }
             }
             return Err(error);
         }
@@ -1228,6 +1395,7 @@ fn merge_groups(
     outputs: &[PathBuf],
     threads: usize,
     control: &Control,
+    durable: bool,
 ) -> Result<(), String> {
     let next = AtomicUsize::new(0);
     let merge_group = |group: usize| -> Result<(), String> {
@@ -1235,6 +1403,10 @@ fn merge_groups(
         let mut writer = RunWriter::create(&outputs[group])?;
         merge_controlled(batch, control, |record| writer.write(&record))?;
         writer.finish()?;
+        // A checkpointed merge's output is on disk before its runs go.
+        if durable {
+            crate::resume::sync_file(&outputs[group])?;
+        }
         for run in batch {
             fs::remove_file(run).map_err(|e| format!("Failed to remove {}: {e}", run.display()))?;
         }
@@ -1691,7 +1863,7 @@ fn metadata(
         "name": options.name,
         "version": super::OMT_SCHEMA_VERSION,
         "type": "baselayer",
-        "format": "pbf",
+        "format": options.tile_format.metadata_format(),
         "minzoom": min,
         "maxzoom": max,
         "description": options.description,
@@ -1730,6 +1902,7 @@ struct EncodeTimings {
     protobuf_gzip: crate::profiling::Accumulator,
     hash: crate::profiling::Accumulator,
     reuse: crate::profiling::Accumulator,
+    mlt: crate::profiling::Accumulator,
 }
 impl EncodeTimings {
     fn new() -> Self {
@@ -1741,6 +1914,7 @@ impl EncodeTimings {
             protobuf_gzip: crate::profiling::Accumulator::new("omt_protobuf_gzip"),
             hash: crate::profiling::Accumulator::new("omt_merge_cache_hash"),
             reuse: crate::profiling::Accumulator::new("omt_merge_cache_read"),
+            mlt: crate::profiling::Accumulator::new("omt_mlt_transcode"),
         }
     }
 }
@@ -1756,6 +1930,7 @@ fn encode_layer_records(
     name: &str,
     mut records: Vec<Record>,
     timings: &mut EncodeTimings,
+    tile_format: TileFormat,
     control: &Control,
 ) -> Result<Option<Vec<u8>>, String> {
     control.check()?;
@@ -1771,7 +1946,19 @@ fn encode_layer_records(
     if layer.num_features() == 0 {
         return Ok(None);
     }
-    Ok(Some(timings.protobuf_gzip.measure(|| layer.encode())))
+    let mvt = timings.protobuf_gzip.measure(|| layer.encode());
+    match tile_format {
+        TileFormat::Mvt => Ok(Some(mvt)),
+        // The MVT layer is transcoded, so that both formats hold the same
+        // features down to the coordinate.
+        TileFormat::Mlt => {
+            let mlt = timings
+                .mlt
+                .measure(|| crate::mlt::from_mvt(&mvt))
+                .map_err(|e| format!("Failed to encode layer {name} as MLT: {e}"))?;
+            Ok((!mlt.is_empty()).then_some(mlt))
+        }
+    }
 }
 
 /// Gzips a tile's layers; `None` when it has none.
@@ -1797,6 +1984,7 @@ fn finish_tile(
 /// Encodes a tile job. With `hashing`, also returns the tile's cache entry;
 /// with `reuse` (the old archive and this worker's handle on it), layers
 /// whose records match the old tile's are taken from it.
+#[allow(clippy::too_many_arguments)]
 fn encode_job(
     job: TileJob,
     hashing: bool,
@@ -1804,6 +1992,7 @@ fn encode_job(
     counters: Option<&merge_cache::Counters>,
     timings: &mut EncodeTimings,
     gzip_level: u32,
+    tile_format: TileFormat,
     control: &Control,
 ) -> Result<(Option<EncodedTile>, Option<TileEntry>), String> {
     let id = job.id;
@@ -1917,7 +2106,7 @@ fn encode_job(
                         .map(EncodedRecord::decode)
                         .collect::<Result<Vec<_>, _>>()
                 })?;
-                encode_layer_records(name, records, timings, control)?
+                encode_layer_records(name, records, timings, tile_format, control)?
             }
         };
         let size = bytes.as_ref().map_or(0, Vec::len);

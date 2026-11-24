@@ -172,7 +172,7 @@ fn metadata_rows(spec: &ArchiveSpec) -> Result<Vec<(String, String)>, String> {
         }
     }
     if !rows.iter().any(|(name, _)| name == "format") {
-        rows.push(("format".into(), "pbf".into()));
+        rows.push(("format".into(), spec.tile_format.metadata_format().into()));
     }
     rows.push(("json".into(), Value::Object(json).to_string()));
     Ok(rows)
@@ -194,6 +194,7 @@ mod tests {
             metadata_json: metadata,
             min_zoom: 0,
             max_zoom: 14,
+            tile_format: crate::TileFormat::Mvt,
         }
     }
 

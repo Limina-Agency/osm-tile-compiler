@@ -1,6 +1,10 @@
 //! Reads a whole archive once: its header and metadata, the sizes of its
 //! tiles, and every problem found in its layout or its tiles' encoding.
 use super::reader::{ArchiveReader, Entry, compression_name, decompress, tile_type_name};
+
+/// The PMTiles tile types this check decodes.
+const TILE_TYPE_MVT: u8 = 1;
+const TILE_TYPE_MLT: u8 = 6;
 use crate::CompileBounds;
 use crate::tile_stats::{TILE_WARNING_BYTES, TileStats, TileStatsBuilder};
 use pmtiles::{TileCoord, TileId};
@@ -159,10 +163,16 @@ pub(super) fn inspect(path: &Path) -> Result<ArchiveReport, String> {
                 return Ok(());
             }
         };
-        let mut layers = Vec::new();
-        if header.tile_type == 1 {
+        let mut layers: Vec<(String, u64)> = Vec::new();
+        type Check = fn(&[u8], Option<&BTreeSet<String>>) -> Result<Vec<(String, u64)>, String>;
+        let check: Option<Check> = match header.tile_type {
+            TILE_TYPE_MVT => Some(check_mvt),
+            TILE_TYPE_MLT => Some(check_mlt),
+            _ => None,
+        };
+        if let Some(check) = check {
             match decompress(&stored, header.tile_compression)
-                .and_then(|tile| check_mvt(&tile, layer_names.as_ref()))
+                .and_then(|tile| check(&tile, layer_names.as_ref()))
             {
                 Ok(sizes) => layers = sizes,
                 Err(e) => problems.push(format!("{name}: {e}")),
@@ -254,9 +264,12 @@ fn check_header(header: &super::reader::Header, file_length: u64, report: &mut A
             "the center {longitude} {latitude} lies outside the bounds"
         ));
     }
-    if header.tile_type == 1 && !matches!(header.tile_compression, 1 | 2) {
+    if matches!(header.tile_type, TILE_TYPE_MVT | TILE_TYPE_MLT)
+        && !matches!(header.tile_compression, 1 | 2)
+    {
         report.problem(format!(
-            "MVT tiles are {}-compressed, which viewers may not read",
+            "{} tiles are {}-compressed, which viewers may not read",
+            tile_type_name(header.tile_type).to_uppercase(),
             compression_name(header.tile_compression)
         ));
     }
@@ -272,7 +285,7 @@ fn check_metadata(
         report.problem("metadata is not a JSON object".into());
         return None;
     }
-    if tile_type != 1 {
+    if !matches!(tile_type, TILE_TYPE_MVT | TILE_TYPE_MLT) {
         return None;
     }
     let Some(layers) = metadata["vector_layers"].as_array() else {
@@ -380,16 +393,45 @@ pub(crate) fn glyph_ranges_used(
 ) -> Result<BTreeSet<u32>, String> {
     let mut reader = ArchiveReader::open(path)?;
     let compression = reader.header.tile_compression;
+    let mlt = reader.header.tile_type == TILE_TYPE_MLT;
     let mut ranges = BTreeSet::new();
     reader.visit_entries(|reader, entry| {
         if should_cancel() {
             return Err(crate::control::CANCELLED.into());
         }
         let tile = decompress(&reader.tile(&entry)?, compression)?;
-        tile_glyph_ranges(&tile, keys, &mut ranges)
-            .map_err(|e| format!("tile {}: {e}", entry.tile_id))
+        if mlt {
+            mlt_glyph_ranges(&tile, keys, &mut ranges)
+        } else {
+            tile_glyph_ranges(&tile, keys, &mut ranges)
+        }
+        .map_err(|e| format!("tile {}: {e}", entry.tile_id))
     })?;
     Ok(ranges)
+}
+
+fn mlt_glyph_ranges(
+    tile: &[u8],
+    keys: &[String],
+    ranges: &mut BTreeSet<u32>,
+) -> Result<(), String> {
+    for layer in crate::mlt::decode::decode(tile)? {
+        for feature in &layer.features {
+            for (key, value) in &feature.properties {
+                if let crate::mlt::decode::Value::String(text) = value
+                    && keys.iter().any(|k| k == key)
+                {
+                    ranges.extend(
+                        text.chars()
+                            .map(u32::from)
+                            .filter(|&c| c < 0x10000)
+                            .map(|c| c / 256 * 256),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn tile_glyph_ranges(
@@ -479,6 +521,39 @@ fn check_mvt(
             return Err(format!("layer {name} appears twice"));
         }
         layers.push((name, (at - start) as u64));
+    }
+    Ok(layers)
+}
+
+/// Checks an uncompressed MLT tile: its frames, and every v1 layer decoded
+/// in full where it uses only encodings the decoder reads (all those this
+/// compiler writes). Returns each v1 layer's name and frame size in tile
+/// order; frames of other tags are skipped, as the specification says.
+fn check_mlt(
+    tile: &[u8],
+    declared: Option<&BTreeSet<String>>,
+) -> Result<Vec<(String, u64)>, String> {
+    use crate::mlt::decode;
+    let mut layers: Vec<(String, u64)> = Vec::new();
+    for (tag, frame) in decode::frames(tile)? {
+        if tag != decode::TAG_V1 {
+            continue;
+        }
+        let name = decode::layer_name(frame)?;
+        if let Err(e) = decode::decode(frame)
+            && !e.starts_with(decode::UNSUPPORTED)
+        {
+            return Err(format!("layer {name}: {e}"));
+        }
+        if declared.is_some_and(|names| !names.contains(&name)) {
+            return Err(format!(
+                "layer {name} is not in the metadata's vector_layers"
+            ));
+        }
+        if layers.iter().any(|(other, _)| *other == name) {
+            return Err(format!("layer {name} appears twice"));
+        }
+        layers.push((name, frame.len() as u64));
     }
     Ok(layers)
 }

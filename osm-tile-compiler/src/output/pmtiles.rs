@@ -1,7 +1,7 @@
 //! The PMTiles archive writer.
 
 use super::{ArchiveSpec, TileWriter};
-use pmtiles::{Compression, PmTilesStreamWriter, PmTilesWriter, TileCoord, TileId, TileType};
+use pmtiles::{Compression, PmTilesStreamWriter, PmTilesWriter, TileCoord, TileId};
 use std::fs::File;
 
 /// Writes through a borrowed file, so the caller can hold a lock on it while
@@ -19,7 +19,7 @@ impl<'a> PmtilesArchiveWriter<'a> {
         // stored bytes rather than the writer's Mvt default.
         // Bounds crossing the antimeridian are declared as every longitude.
         let bounds = spec.bounds.archive_bounds();
-        let writer = PmTilesWriter::new(TileType::Mvt)
+        let writer = PmTilesWriter::new(spec.tile_format.pmtiles())
             .precompressed(Compression::Gzip)
             .min_zoom(spec.min_zoom)
             .max_zoom(spec.max_zoom)
@@ -87,6 +87,7 @@ mod tests {
                 metadata_json: "{}",
                 min_zoom: 0,
                 max_zoom: 0,
+                tile_format: super::super::TileFormat::Mvt,
             };
             let mut archive = Box::new(PmtilesArchiveWriter::create(&file, &spec).unwrap());
             // tile_id 0 == z0/0/0.

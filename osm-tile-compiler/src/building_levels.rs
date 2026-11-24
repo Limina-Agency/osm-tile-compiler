@@ -99,7 +99,7 @@ const COMPRESSION_GZIP: u8 = 2;
 const TILE_TYPE_MVT: u8 = 1;
 
 /// What one level of the archive holds.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct BuildingLevelReport {
     pub zoom: u8,
@@ -117,7 +117,7 @@ pub struct BuildingLevelReport {
 }
 
 /// What [`write_building_levels`] wrote.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct BuildingLevelsReport {
     /// One entry per zoom, lowest first.
