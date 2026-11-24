@@ -69,13 +69,18 @@ MLT archive is refused, and with the default `on_invalid` Martin does not
 start at all. Until that changes upstream (a one-line check in
 `martin-core/src/tiles/pmtiles/source.rs`):
 
-- serve the MVT archive and set `convert_to_mlt: auto`: Martin converts per
+- compile with `--tile-compression none`, which stores each tile as
+  encoded. Stock Martin serves those (Berlin: all 938 tiles identical to the
+  gzipped archive's, unzipped). The archive is larger (54.4 MB against
+  33.3 MB), and Martin sends the tiles uncompressed unless a proxy in front
+  of it gzips them;
+- or serve the MVT archive and set `convert_to_mlt: auto`: Martin converts per
   request for clients that send `Accept: application/vnd.maplibre-tile`. On
   Berlin, 684 tiles/s on 8 connections; the tiles are sent uncompressed
   (37.7 MB in all, against 33.3 MB for this compiler's gzipped MLT and 42.4 MB
   for gzipped MVT). MapLibre does not send that header yet, so clients add it
   with `transformRequest`;
-- or serve MLT archives with `serve`.
+- or serve gzipped MLT archives with `serve`.
 
 Martin names the MLT media type `application/vnd.maplibre-tile`; `serve` and
 the `pmtiles` crate say `application/vnd.maplibre-vector-tile`.

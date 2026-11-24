@@ -251,8 +251,8 @@ fn refused(summary: &ArchiveSummary) -> Option<String> {
     (summary.info.format == "pmtiles" && summary.mlt && summary.encoding.is_some()).then(|| {
         format!(
             "{}: Martin refuses PMTiles archives of {} compressed MapLibre Tiles \
-             (it accepts compression for MVT only); compile with --tile-format mvt and let \
-             Martin convert (convert_to_mlt: auto), or serve it with 'serve'",
+             (it accepts compression for MVT only); compile with --tile-compression none, \
+             or with --tile-format mvt and let Martin convert (convert_to_mlt: auto)",
             summary.info.path.display(),
             summary.encoding.unwrap_or_default()
         )
