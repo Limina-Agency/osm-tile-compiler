@@ -51,4 +51,5 @@ These belong to other projects and follow them:
 | Planetiler (comparison) | 0.10.2 | `benchmarks/compiler-parity/` |
 | PMTiles | specification v3 | the archive header |
 | MBTiles | specification 1.3 | `application_id` 0x4d504258 and the `metadata` table of `--format mbtiles` archives |
-| Mapbox Vector Tiles | specification 2.1 | every tile |
+| Mapbox Vector Tiles | specification 2.1 | every tile, unless the compile asks for MLT |
+| MapLibre Tiles (experimental) | specification v1, frame tag `0x01` | every tile of a `--tile-format mlt` compile (`tileFormat: "mlt"` in the worker request): PMTiles tile type 6, metadata `format` `mlt`. Written by our own encoder (`src/mlt/`), with no `mlt-core` dependency, from each finished MVT layer, so the features are the MVT ones. It writes only the plain encodings (varint, delta, run-length, string dictionaries), which every MLT 1.x reader decodes; checked against MapLibre GL JS 5.24, MapLibre Native 6.4 and `mlt-core` 0.23 |

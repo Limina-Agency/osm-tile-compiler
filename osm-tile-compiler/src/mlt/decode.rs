@@ -183,16 +183,20 @@ impl<'a> Input<'a> {
                             let header = self.header(false)?;
                             let bytes = self.take(header.byte_length)?;
                             bytes
-                                .chunks_exact(4)
-                                .map(|b| Value::Float(f32::from_le_bytes(b.try_into().unwrap())))
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|b| Value::Float(f32::from_le_bytes(*b)))
                                 .collect()
                         }
                         26 => {
                             let header = self.header(false)?;
                             let bytes = self.take(header.byte_length)?;
                             bytes
-                                .chunks_exact(8)
-                                .map(|b| Value::Double(f64::from_le_bytes(b.try_into().unwrap())))
+                                .as_chunks::<8>()
+                                .0
+                                .iter()
+                                .map(|b| Value::Double(f64::from_le_bytes(*b)))
                                 .collect()
                         }
                         28 => self
@@ -502,7 +506,7 @@ impl<'a> Input<'a> {
         }
         let mut previous = [0i32; 2];
         let mut out = Vec::with_capacity(words.len() / 2);
-        for pair in words.chunks_exact(2) {
+        for pair in words.as_chunks::<2>().0 {
             let vertex = match header.logical {
                 (2, 0) => [
                     previous[0].wrapping_add(unzigzag(pair[0])),

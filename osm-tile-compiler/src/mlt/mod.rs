@@ -489,7 +489,9 @@ fn encode_property(
     data: &mut Vec<u8>,
 ) {
     let kind = column_kind(values);
-    let nullable = values.iter().any(Option::is_none);
+    // String columns are always nullable: the C++ decoder in MapLibre Native
+    // 6.4 rejects a string column without a present stream.
+    let nullable = kind == Kind::String || values.iter().any(Option::is_none);
     let code = match kind {
         Kind::Bool => column::BOOL,
         Kind::Int32 => column::INT32,
@@ -828,7 +830,7 @@ impl<'a> IntCandidates<'a> {
     /// The plain and run-length encodings of the words.
     fn best_plain(&self) -> impl Iterator<Item = Candidate> {
         let plain = Candidate::plain(encoding::VARINT, self.words);
-        let rle = has_runs(self.words).then(|| Candidate::rle(encoding::RLE_VARINT, self.words));
+        let rle = rle_pays(self.words).then(|| Candidate::rle(encoding::RLE_VARINT, self.words));
         std::iter::once(plain).chain(rle)
     }
 
@@ -836,16 +838,20 @@ impl<'a> IntCandidates<'a> {
     fn best_delta(&self) -> Option<Candidate> {
         let deltas = self.deltas.as_ref()?;
         let plain = Candidate::plain(encoding::DELTA_VARINT, deltas);
-        let rle = has_runs(deltas).then(|| Candidate::rle(encoding::DELTA_RLE_VARINT, deltas));
+        let rle = rle_pays(deltas).then(|| Candidate::rle(encoding::DELTA_RLE_VARINT, deltas));
         std::iter::once(plain)
             .chain(rle)
             .min_by_key(Candidate::size)
     }
 }
 
-/// Whether some word repeats the one before it, so that runs may pay.
-fn has_runs(words: &[u64]) -> bool {
-    words.windows(2).any(|pair| pair[0] == pair[1])
+/// Whether the words make fewer runs than half their count, so that
+/// run-length encoding has at most as many words as values. MapLibre Native
+/// 6.4's C++ decoder rejects a nullable column whose run-length stream is
+/// longer than the values it holds.
+fn rle_pays(words: &[u64]) -> bool {
+    let runs = 1 + words.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    words.len() >= 2 && runs * 2 <= words.len()
 }
 
 fn zigzag32(value: i32) -> u32 {

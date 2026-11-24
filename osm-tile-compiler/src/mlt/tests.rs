@@ -187,7 +187,8 @@ fn every_geometry_type_mixes_in_one_layer() {
         coords(&[(x, y), (x + size, y), (x + size, y + size), (x, y + size)])
     };
     let mut builder = layer("mixed", 4096);
-    let kinds: Vec<(MvtGeomType, Box<dyn Fn(&mut fast_mvt::MvtFeatureBuilder)>)> = vec![
+    type Add = Box<dyn Fn(&mut fast_mvt::MvtFeatureBuilder)>;
+    let kinds: Vec<(MvtGeomType, Add)> = vec![
         (
             MvtGeomType::Point,
             Box::new(|f| {
@@ -269,7 +270,8 @@ fn every_geometry_type_mixes_in_one_layer() {
 #[test]
 fn ids_and_attributes_keep_their_values_and_nulls() {
     use fast_mvt::MvtValueRef as V;
-    let rows: Vec<(Option<u64>, Vec<(&str, V)>)> = vec![
+    type Row<'a> = (Option<u64>, Vec<(&'a str, V<'a>)>);
+    let rows: Vec<Row> = vec![
         (
             Some(7),
             vec![
@@ -468,6 +470,30 @@ fn integer_streams_take_the_smallest_encoding() {
     assert_eq!(data[1], encoding::DELTA_RLE_VARINT);
     let mut data = Vec::new();
     int_stream(&mut data, stream::DATA, &[3, 1, 4, 1, 5], 32, true);
+    assert_eq!(data[1], encoding::VARINT);
+}
+
+/// MapLibre Native 6.4's C++ decoder needs a present stream on every string
+/// column, and no run-length stream longer than the values it holds.
+#[test]
+fn streams_suit_the_maplibre_native_decoder() {
+    use fast_mvt::MvtValueRef as V;
+    let (mut meta, mut data) = (Vec::new(), Vec::new());
+    let values = [Some(V::String("a")), Some(V::String("b"))];
+    encode_property("name", &values, &mut meta, &mut data);
+    assert_eq!(meta[0], column::STRING + 1);
+    // Three streams, the first the present one.
+    assert_eq!(&data[..2], &[3, stream::PRESENT]);
+
+    // Deltas 1000, 1, 1 make two runs: four words for three values.
+    let mut data = Vec::new();
+    int_stream(&mut data, stream::DATA, &[1000, 1001, 1002], 32, true);
+    assert_eq!(data[1], encoding::DELTA_VARINT);
+    let mut data = Vec::new();
+    int_stream(&mut data, stream::DATA, &[9, 9, 9, 9, 9, 9, 7], 32, false);
+    assert_eq!(data[1], encoding::RLE_VARINT);
+    let mut data = Vec::new();
+    int_stream(&mut data, stream::DATA, &[9, 9, 7], 32, false);
     assert_eq!(data[1], encoding::VARINT);
 }
 

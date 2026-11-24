@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- Experimental MapLibre Tile (MLT) output: `compile --tile-format mlt`
+  (`ArchiveOptions::tile_format`, `TileFormat::Mlt`, `tileFormat: "mlt"` in
+  the worker request) writes every tile as MLT instead of MVT, in PMTiles
+  (tile type 6) or MBTiles (metadata `format` `mlt`). The default stays MVT,
+  so parity and the Monaco fingerprint don't change. Our own encoder
+  transcodes each finished MVT layer, so an MLT tile holds exactly the MVT
+  tile's features; the MLT crates are still changing too fast to depend on.
+  Berlin's archive is about 20% smaller (33.3 MB against 41.9 MB, both
+  gzipped), and MapLibre GL JS 5.24 and MapLibre Native 6.4 render it the
+  same as the MVT one. `style --tile-format mlt` (and
+  `StylePackRequest::tile_format`, `with_tile_format`) sets the source's
+  `encoding` to `mlt`, which MapLibre needs to read the tiles. `verify` and
+  `inspect` decode MLT tiles. Building levels and the C ABI request don't
+  take MLT yet, and a merge cache from an archive of the other tile format is
+  not reused.
+
 ## 0.3.0 (2026-11-23)
 
 ### Breaking

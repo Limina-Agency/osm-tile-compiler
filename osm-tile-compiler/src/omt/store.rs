@@ -1814,6 +1814,7 @@ fn finish_tile(
 /// Encodes a tile job. With `hashing`, also returns the tile's cache entry;
 /// with `reuse` (the old archive and this worker's handle on it), layers
 /// whose records match the old tile's are taken from it.
+#[allow(clippy::too_many_arguments)]
 fn encode_job(
     job: TileJob,
     hashing: bool,

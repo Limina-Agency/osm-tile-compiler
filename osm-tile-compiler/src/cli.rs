@@ -82,8 +82,8 @@ Commands:
                    write it to a directory with its fonts and icons instead
   inspect          Describe a PMTiles archive: header, metadata, tile sizes per
                    zoom and the largest tiles, and any problems 'verify' finds
-  verify           Check a PMTiles archive's layout and every tile's MVT
-                   encoding; exits with 1 if anything is wrong
+  verify           Check a PMTiles archive's layout and every tile's MVT or
+                   MLT encoding; exits with 1 if anything is wrong
   extract          Cut an area out of a PMTiles archive into a new one: the
                    tiles within a box, a polygon and zooms, copied byte for
                    byte
