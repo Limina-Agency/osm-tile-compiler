@@ -255,7 +255,7 @@ Update options (experimental):
                         line, as osm2pgsql's expire lists are: every tile a
                         changed object, a way whose node moved or a
                         multipolygon whose member changed reaches, before or
-                        after, with a tile's width around it for labels; must
+                        after, with a quarter tile around it for labels; must
                         not exist yet
   --min-zoom <N>, --max-zoom <N>
                         Zooms --changed-tiles lists [default: 0 and 14]

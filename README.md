@@ -385,19 +385,21 @@ one `z/x/y` per line at zooms 0 to 14 (`--min-zoom`, `--max-zoom`), the list
 osm2pgsql's expiry writes and Tilekiln and other renderers regenerate from. It
 covers the boxes of every changed object before and after, of every way whose
 node moved, and of every multipolygon or boundary whose member changed,
-widened by one tile for labels placed across a tile's edge. `diff
+widened by a quarter of a tile (64 pixels) for features and labels drawn
+across a tile's edge. `diff
 --changed-tiles` writes the tiles that actually differ between two archives in
 the same format. For the 13 hours of planet diffs on Małopolskie above, the
-list held 7,936 tiles and covered all 278 tiles that recompiling changed; it
+list held 5,112 tiles and covered all 278 tiles that recompiling changed; it
 took 1.2 s on top of the update. The list is wide on purpose: most edits (new
 address points, untagged nodes) change no tile, and two effects reach far from
-an edit. Labels are drawn up to a tile's width from their feature, and the
+an edit. Labels are drawn beyond their feature's tile, and the
 profile orders a way's routes (`route_1`, `route_2`, ...) as Planetiler
 does, by an index over every route, boundary, river and building relation in
 the extract, so a change to any such relation can reorder the routes of ways
 anywhere. The list therefore also holds every way in two or more routes
-whenever such a relation changes. Without that rule and the label width, the
-list held 1,571 tiles but missed 93 of the 278.
+whenever such a relation changes. Without that rule and the margin, the list
+held 1,571 tiles but missed 93 of the 278; with a whole tile's margin it held
+7,936.
 
 A recompile after an update can also skip the tiles the update left alone:
 

@@ -12,9 +12,12 @@ use std::path::Path;
 pub type TileAddress = (u8, u32, u32);
 
 /// How far around a changed object `update` reaches, in pixels of a 256-pixel
-/// tile: the widest buffer any layer renders with, so a label placed next to
-/// a tile's edge is still found in the tile beside it.
-pub const CHANGED_TILE_BUFFER_PIXELS: f64 = 256.0;
+/// tile, so a feature or label drawn across a tile's edge is also found in
+/// the tile beside it. Some labels reach further (up to a whole tile), but on
+/// Małopolskie with 13 hours of planet diffs this margin still listed every
+/// tile a recompile changed, and a whole tile's margin listed half as many
+/// tiles again.
+pub const CHANGED_TILE_BUFFER_PIXELS: f64 = 64.0;
 
 /// A box in degrees, for the tile math.
 #[derive(Debug, Clone, Copy, PartialEq)]

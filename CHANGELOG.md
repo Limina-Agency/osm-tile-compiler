@@ -38,8 +38,10 @@
   one `z/x/y` per line as osm2pgsql's expire lists are, at zooms 0 to 14 or
   `--min-zoom`/`--max-zoom`: the boxes of every changed object before and
   after, of ways whose node moved and of multipolygons and boundaries whose
-  member changed, widened by a tile (`CHANGED_TILE_BUFFER_PIXELS`) for
-  labels and cut to the extract's box. The boxes come from osm-pbf-ingest's
+  member changed, widened by 64 pixels (`CHANGED_TILE_BUFFER_PIXELS`) for
+  labels and cut to the extract's box. On Małopolskie with 13 hours of
+  planet diffs it listed 5,112 tiles, every one of the 278 a recompile
+  changed among them. The boxes come from osm-pbf-ingest's
   new `changes::changed_area`. `UpdateRequest::changed_tiles`
   (`ChangedTilesRequest`) does the same from Rust, and the report's
   `changed_tiles` says how many tiles at each zoom.
