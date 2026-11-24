@@ -1,4 +1,5 @@
 import Foundation
+import OsmTileCompilerFFI
 
 struct RunOptions {
     var threads: Int

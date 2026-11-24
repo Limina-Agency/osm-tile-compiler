@@ -19,10 +19,15 @@ if [[ -z "$device" ]]; then
   device=$(python3 -c '
 import json, sys
 devices = json.load(open(sys.argv[1]))["result"]["devices"]
-for d in devices:
-    if d.get("hardwareProperties", {}).get("platform") == "iOS" and \
-       d.get("connectionProperties", {}).get("tunnelState") != "unavailable":
-        print(d["identifier"]); break
+# Simulators are listed too, as "disconnected"; a paired iPhone may also be
+# "disconnected" until devicectl opens a tunnel, so prefer a connected one.
+phones = [d for d in devices
+          if d.get("hardwareProperties", {}).get("platform") == "iOS"
+          and d.get("hardwareProperties", {}).get("reality") == "physical"
+          and d.get("connectionProperties", {}).get("tunnelState") != "unavailable"]
+phones.sort(key=lambda d: d["connectionProperties"].get("tunnelState") != "connected")
+if phones:
+    print(phones[0]["identifier"])
 ' "$json")
   rm -f "$json"
 fi

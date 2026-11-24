@@ -39,6 +39,9 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         OTHER_LDFLAGS: ["-lc++"]
         ENABLE_BITCODE: NO
+        # The XCFramework's simulator slice is arm64 only (INTEL_SIMULATOR=1
+        # in build-xcframework.sh adds x86_64).
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
         CODE_SIGN_ENTITLEMENTS: ${ENTITLEMENTS}
     info:
       path: Generated/Info.plist
