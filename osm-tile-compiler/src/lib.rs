@@ -92,6 +92,7 @@ mod extracts;
 #[doc(hidden)]
 pub mod fuzzing;
 mod generalization;
+pub mod martin;
 mod memory;
 mod mlt;
 mod omt;
@@ -132,7 +133,7 @@ pub use omt::{
     SAR_LAYER, SAR_SCHEMA_VERSION, merge_cache_path,
     schema::{ExampleResult, Schema, TileSchema, shortbread},
 };
-pub use output::{OutputFormat, TileFormat};
+pub use output::{OutputFormat, TileCompression, TileFormat};
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
 pub use search::{
     SEARCH_INDEX_FORMAT, SEARCH_INDEX_VERSION, SearchHit, SearchIndex, SearchIndexReport,

@@ -72,6 +72,8 @@ def compile(
     exclude_layers: Sequence[str] | None = None,
     languages: Sequence[str] | None = None,
     building_levels: bool = False,
+    search_index: bool = False,
+    tile_format: Literal["mvt", "mlt"] = "mvt",
     sar: bool = False,
     sort_memory: int | None = None,
     schema: str | None = None,

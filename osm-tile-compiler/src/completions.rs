@@ -30,6 +30,7 @@ pub(crate) struct Command {
 
 const FORMATS: &[&str] = &["pmtiles", "mbtiles"];
 const TILE_FORMATS: &[&str] = &["mvt", "mlt"];
+const TILE_COMPRESSIONS: &[&str] = &["gzip", "none"];
 const DATASETS: &[&str] = &["water_polygons", "natural_earth", "lake_centerlines", "all"];
 const REPLICATION: &[&str] = &["header", "minute", "hour", "day"];
 pub(crate) const SHELLS: &[&str] = &["bash", "zsh", "fish"];
@@ -51,6 +52,7 @@ pub(crate) const COMMANDS: &[Command] = &[
             ("--output", File),
             ("--format", Words(FORMATS)),
             ("--tile-format", Words(TILE_FORMATS)),
+            ("--tile-compression", Words(TILE_COMPRESSIONS)),
             ("--sources", Dir),
             ("--bounds", Text),
             ("--polygon", File),
@@ -182,6 +184,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         arguments: File,
         options: &[
             ("--output", File),
+            ("--in-place", Flag),
             ("--trusted-key", File),
             ("--json", Flag),
         ],
@@ -209,6 +212,17 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "Serve archives, TileJSON and styles over HTTP",
         arguments: File,
         options: &[("--style-pack", Dir), ("--host", Text), ("--port", Text)],
+    },
+    Command {
+        name: "martin-config",
+        about: "Write a Martin tile server config for archives",
+        arguments: File,
+        options: &[
+            ("--output", Dir),
+            ("--fonts", Dir),
+            ("--sprites", Dir),
+            ("--json", Flag),
+        ],
     },
     Command {
         name: "keygen",

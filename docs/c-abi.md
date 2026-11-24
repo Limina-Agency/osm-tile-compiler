@@ -118,6 +118,7 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
   "extraInputs": ["/…/more.osm.pbf"],
   "output": "/…/monaco.pmtiles",
   "format": "pmtiles",
+  "tileFormat": "mvt",
   "sources": "/…/omt-sources",
   "tempDir": "/…/tmp",
   "sourcesPolicy": "use_present",
@@ -142,12 +143,16 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
 
 Only the four paths are required; everything else defaults as
 `BasemapRequest::new` does (every core, zooms 0 to 14, all layers and
-languages, the datasets present in `sources`). `sourcesPolicy` is
+languages, the datasets present in `sources`). `zoom.max` may go up to 16;
+above 14 each zoom has four times the tiles. `sourcesPolicy` is
 `use_present`, `fetch_missing` or `fetch_and_verify`. `layers` is
 `{"only": [...]}` or `{"except": [...]}`. `area.read` is `whole_extract` (the
 default) or `near_area`, which reads only the OSM data in and near the area.
 `format` is `pmtiles` or `mbtiles`; without it, an `output` ending in
-`.mbtiles` is MBTiles and anything else PMTiles. Building levels need
+`.mbtiles` is MBTiles and anything else PMTiles. `tileFormat` is `mvt` (the
+default) or `mlt` for MapLibre Tiles ([formats.md](formats.md)); a style for
+an MLT archive needs `"encoding": "mlt"` on its source, which
+`write_style_pack` with `tileFormat: "mlt"` writes. Building levels need
 PMTiles. `sar` also writes the search-and-rescue layer
 ([sar.md](sar.md)); `layers` may still leave it out, and `{"only": [...]}`
 naming `sar` writes it too. `resume` makes the compile resumable
@@ -169,7 +174,7 @@ The field layout follows the 0.2 request types (`ZoomRange`,
 `LayerSelection`, `Area` with its `ReadScope`), and the library maps it onto
 `BasemapRequest` field by field. `otc_job_start` then runs
 `BasemapRequest::validate()`, so whatever needs no reading or network fails
-synchronously: unknown layers or languages, zooms outside 0 to 14,
+synchronously: unknown layers or languages, zooms outside 0 to 16,
 `threads` of 0, a gzip level above 9, bad bounds or center, building levels
 with MBTiles, `near_area`
 without bounds or a polygon, an output that already exists. What needs
@@ -187,7 +192,8 @@ serde support with these names (roadmap item A9), the mapping goes away.
   "languages": ["uk"],
   "glyphs": "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
   "sprite": "https://openmaptiles.github.io/osm-bright-gl-style/sprite",
-  "baseUrl": "file:///…/maps/berlin-style"
+  "baseUrl": "file:///…/maps/berlin-style",
+  "tileFormat": "mvt"
 }
 ```
 
@@ -199,7 +205,8 @@ the glyph ranges beyond Latin; `languages` adds their scripts. `glyphs` and
 `sprite` say where to fetch from (URLs, `file://` URLs or local paths) and
 default to the servers above; `baseUrl` goes before the style's glyph and
 sprite paths, which MapLibre Native needs; `sar: true` also draws the
-opt-in `sar` layer, for an archive compiled with it. Progress reports `Fetched N of M
+opt-in `sar` layer, for an archive compiled with it; `tileFormat: "mlt"`
+marks the source `"encoding": "mlt"`, for an archive compiled with MLT tiles. Progress reports `Fetched N of M
 files` with a fraction and no stage. The result is the `StylePackReport`:
 
 ```json
@@ -226,7 +233,7 @@ for a delta. Their results are the same reports the commands
 print with `--json`, so their fields are `snake_case`. Paths to write must
 not exist yet; one that does fails `otc_job_start`. Unknown fields are
 refused, and so is anything else wrong that needs no reading: zooms outside
-0 to 14 or the wrong way round, a bad box, an unknown replication source.
+0 to 16 or the wrong way round, a bad box, an unknown replication source.
 
 | Kind | Request | Result |
 |---|---|---|
@@ -253,7 +260,7 @@ refused, and so is anything else wrong that needs no reading: zooms outside
 Cuts the tiles that meet the box, the polygon (a GeoJSON or Osmosis
 `.poly` file) and the zooms out of a PMTiles archive, byte for byte. With
 none of the three it copies every tile; `zoom.min` defaults to 0 and
-`zoom.max` to 14. A polygon that cannot be read, a source that is not
+`zoom.max` to the highest zoom the source holds. A polygon that cannot be read, a source that is not
 PMTiles v3, or an area or zooms with none of its tiles fail the job with
 `invalid_request`. Progress has the stage `extract` and no fraction; a cancel
 stops it within 4096 directory entries and leaves no output. The result has

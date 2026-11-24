@@ -4,7 +4,7 @@
 //! Country-dependent GB/IE inferred networks and junction way preprocessing
 //! require supplied context; `_junction_highway` carries the latter.
 use super::java_hashmap::{grouping_by_long_order, hash_set_long_order};
-use super::types::{Feature, Source, SourceKind, add_names, parse_number, parse_profile_long};
+use super::types::{Feature, Source, SourceKind, TOP, add_names, parse_number, parse_profile_long};
 use geo_types::{Coord, Geometry};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -344,7 +344,7 @@ pub fn evaluate(source: &Source, out: &mut Vec<Feature>, contribution: &mut Cont
             "aeroway",
             source.geometry.clone(),
             if source.is_point() { 14 } else { 10 },
-            14,
+            TOP,
         );
         set(
             &mut f,
@@ -368,7 +368,7 @@ pub fn evaluate(source: &Source, out: &mut Vec<Feature>, contribution: &mut Cont
                 "transportation_name",
                 source.geometry.clone(),
                 10,
-                14,
+                TOP,
             );
             f.buffer_pixels = 8.0;
             add_names(source, &mut f);
@@ -409,7 +409,7 @@ pub fn evaluate(source: &Source, out: &mut Vec<Feature>, contribution: &mut Cont
                 "transportation",
                 source.geometry.clone(),
                 13,
-                14,
+                TOP,
             );
             f.buffer_pixels = 4.0;
             set(&mut f, "class", &c);
@@ -464,7 +464,7 @@ pub fn evaluate(source: &Source, out: &mut Vec<Feature>, contribution: &mut Cont
             "transportation",
             source.geometry.clone(),
             min,
-            14,
+            TOP,
         );
         f.buffer_pixels = 4.0;
         f.min_size = 0.0;
@@ -590,7 +590,7 @@ pub fn evaluate(source: &Source, out: &mut Vec<Feature>, contribution: &mut Cont
             "transportation",
             source.geometry.clone(),
             min,
-            14,
+            TOP,
         );
         f.buffer_pixels = 4.0;
         f.min_size = 0.0;
@@ -624,7 +624,7 @@ pub fn evaluate(source: &Source, out: &mut Vec<Feature>, contribution: &mut Cont
             "transportation",
             source.geometry.clone(),
             if ferry { 4 } else { 12 },
-            14,
+            TOP,
         );
         f.buffer_pixels = 4.0;
         f.min_size = 0.0;
@@ -658,7 +658,7 @@ pub fn evaluate(source: &Source, out: &mut Vec<Feature>, contribution: &mut Cont
                 "transportation_name",
                 source.geometry.clone(),
                 12,
-                14,
+                TOP,
             );
             f.buffer_pixels = 8.0;
             f.min_size = 0.0;
@@ -706,7 +706,7 @@ fn road_name(
         "transportation_name",
         source.geometry.clone(),
         min.max(road_min),
-        14,
+        TOP,
     );
     f.buffer_pixels = 8.0;
     f.min_size = 0.0;
@@ -850,12 +850,16 @@ fn boundary(source: &Source, out: &mut Vec<Feature>, contribution: &mut Contribu
         && source.tag("type") == "boundary"
     {
         let mut f =
-            Feature::new_original_geometry(source, "boundary", source.geometry.clone(), 4, 14);
+            Feature::new_original_geometry(source, "boundary", source.geometry.clone(), 4, TOP);
         f.buffer_pixels = 4.0;
-        f.min_size = 4.0;
         set(&mut f, "class", "aboriginal_lands");
         add_names(source, &mut f);
-        out.push(f);
+        // setMinPixelSizeBelowZoom(13, 4): from z14 the default size.
+        let mut low = f.clone();
+        low.max_zoom = 13;
+        low.min_size = 4.0;
+        f.min_zoom = 14;
+        out.extend([low, f]);
     }
     if !source.is_line() {
         return;
@@ -919,7 +923,7 @@ fn boundary(source: &Source, out: &mut Vec<Feature>, contribution: &mut Contribu
         12
     };
     let mut f =
-        Feature::new_original_geometry(source, "boundary", source.geometry.clone(), min, 14);
+        Feature::new_original_geometry(source, "boundary", source.geometry.clone(), min, TOP);
     if deferred_country_border {
         f.id = (source.id / 10) * 10;
     }

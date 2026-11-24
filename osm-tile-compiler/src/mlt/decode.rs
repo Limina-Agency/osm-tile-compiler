@@ -770,3 +770,98 @@ pub(crate) fn same_as_mvt(mlt: &[u8], mvt: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Tiles as the specification's synthetic fixtures write them, which every
+/// reference decoder (Rust, TypeScript, C++) can print: the tests compare
+/// with the fixtures, and the conformance check with those decoders.
+#[cfg(test)]
+pub(crate) mod json {
+    use super::{Geometry as G, Layer, Value};
+    use serde_json::Value as Json;
+
+    /// The fixtures' features as `decode` reads them, written as the fixtures'
+    /// JSON: GeoJSON with each feature's `_layer` and `_extent` among its
+    /// properties and polygon rings closed.
+    pub(crate) fn geojson(layers: &[Layer]) -> Vec<Json> {
+        let point = |v: &[i32; 2]| serde_json::json!([v[0], v[1]]);
+        let path = |p: &Vec<[i32; 2]>| Json::Array(p.iter().map(point).collect());
+        let ring = |r: &Vec<[i32; 2]>| {
+            let mut ring = r.iter().map(point).collect::<Vec<_>>();
+            if let Some(first) = r.first() {
+                ring.push(point(first));
+            }
+            Json::Array(ring)
+        };
+        let polygon = |p: &Vec<Vec<[i32; 2]>>| Json::Array(p.iter().map(ring).collect());
+        let mut out = Vec::new();
+        for layer in layers {
+            for feature in &layer.features {
+                let (kind, coordinates) = match &feature.geometry {
+                    G::Point(p) => ("Point", point(p)),
+                    G::MultiPoint(m) => ("MultiPoint", Json::Array(m.iter().map(point).collect())),
+                    G::LineString(l) => ("LineString", path(l)),
+                    G::MultiLineString(m) => {
+                        ("MultiLineString", Json::Array(m.iter().map(path).collect()))
+                    }
+                    G::Polygon(p) => ("Polygon", polygon(p)),
+                    G::MultiPolygon(m) => {
+                        ("MultiPolygon", Json::Array(m.iter().map(polygon).collect()))
+                    }
+                };
+                let mut properties = serde_json::Map::new();
+                properties.insert("_extent".into(), layer.extent.into());
+                properties.insert("_layer".into(), layer.name.clone().into());
+                for (key, value) in &feature.properties {
+                    let value = match value {
+                        Value::Bool(v) => Json::from(*v),
+                        Value::Int(v) => Json::from(*v),
+                        Value::UInt(v) => Json::from(*v),
+                        Value::String(v) => Json::from(v.clone()),
+                        Value::Float(v) => special(v.is_nan(), v.is_infinite(), *v < 0.0, "f32")
+                            .unwrap_or_else(|| Json::from(f64::from(*v))),
+                        Value::Double(v) => special(v.is_nan(), v.is_infinite(), *v < 0.0, "f64")
+                            .unwrap_or_else(|| Json::from(*v)),
+                    };
+                    properties.insert(key.clone(), value);
+                }
+                let mut json = serde_json::json!({
+                    "type": "Feature",
+                    "properties": properties,
+                    "geometry": {"type": kind, "coordinates": coordinates},
+                });
+                if let Some(id) = feature.id {
+                    json["id"] = id.into();
+                }
+                out.push(json);
+            }
+        }
+        out
+    }
+
+    fn special(nan: bool, infinite: bool, negative: bool, kind: &str) -> Option<Json> {
+        match (nan, infinite, negative) {
+            (true, _, _) => Some(format!("{kind}::NAN").into()),
+            (_, true, false) => Some(format!("{kind}::INFINITY").into()),
+            (_, true, true) => Some(format!("{kind}::NEG_INFINITY").into()),
+            _ => None,
+        }
+    }
+
+    /// Whether two fixture values are the same, floats compared at the
+    /// precision `ours` has.
+    pub(crate) fn same(ours: &Json, theirs: &Json) -> bool {
+        match (ours, theirs) {
+            (Json::Number(a), Json::Number(b)) if a.is_f64() || b.is_f64() => {
+                let (a, b) = (a.as_f64().unwrap(), b.as_f64().unwrap());
+                a.to_bits() == b.to_bits() || (a as f32).to_bits() == (b as f32).to_bits()
+            }
+            (Json::Array(a), Json::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b))
+            }
+            (Json::Object(a), Json::Object(b)) => {
+                a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| same(v, w)))
+            }
+            _ => ours == theirs,
+        }
+    }
+}

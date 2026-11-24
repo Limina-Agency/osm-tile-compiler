@@ -722,6 +722,10 @@ struct PendingFile {
     temporary: PathBuf,
     destination: PathBuf,
     kept: bool,
+    /// Whether the file may replace one already at `destination`: the
+    /// rename then swaps it in at once, so a server reading the old file
+    /// sees either it or the new one, never a mix.
+    replace: bool,
 }
 
 /// Where [`diff`] and [`apply`] write `output` until it is complete:
@@ -734,7 +738,11 @@ pub fn partial_path(output: &Path) -> PathBuf {
 
 impl PendingFile {
     fn create(destination: &Path) -> Result<(Self, File), String> {
-        if destination.exists() {
+        Self::create_with(destination, false)
+    }
+
+    fn create_with(destination: &Path, replace: bool) -> Result<(Self, File), String> {
+        if !replace && destination.exists() {
             return Err(format!("{} already exists", destination.display()));
         }
         if destination.file_name().is_none() {
@@ -751,6 +759,7 @@ impl PendingFile {
                 temporary,
                 destination: destination.to_owned(),
                 kept: false,
+                replace,
             },
             file,
         ))
@@ -760,7 +769,7 @@ impl PendingFile {
         file.sync_all()
             .map_err(|e| format!("Failed to write {}: {e}", self.temporary.display()))?;
         drop(file);
-        if self.destination.exists() {
+        if !self.replace && self.destination.exists() {
             return Err(format!("{} already exists", self.destination.display()));
         }
         std::fs::rename(&self.temporary, &self.destination)
@@ -1536,6 +1545,7 @@ pub(super) fn apply(
     delta: &Path,
     output: &Path,
     trusted: &[PublicKey],
+    replace: bool,
 ) -> Result<ApplyReport, String> {
     let opened = open_delta(delta)?;
     let (checked, signed) = check_signatures(delta, &opened, trusted)?;
@@ -1568,7 +1578,7 @@ pub(super) fn apply(
             found.sha256
         ));
     }
-    let (pending, file) = PendingFile::create(output)?;
+    let (pending, file) = PendingFile::create_with(output, replace)?;
     let mut out = HashingWriter::new(BufWriter::with_capacity(BUFFER_BYTES, file));
     let mut operations = (&mut input).take(opened.signed_end - opened.header_bytes);
     run(base, &manifest, &mut operations, &mut out)?;
@@ -1634,7 +1644,7 @@ mod tests {
         let report = diff(&base, &target, &delta, &DiffOptions::default()).unwrap();
         assert_eq!(read_manifest(&delta).unwrap(), report.manifest);
         let rebuilt = dir.path().join("rebuilt.pmtiles");
-        apply(&base, &delta, &rebuilt, &[]).unwrap();
+        apply(&base, &delta, &rebuilt, &[], false).unwrap();
         assert_eq!(
             std::fs::read(&rebuilt).unwrap(),
             std::fs::read(&target).unwrap()
@@ -1717,7 +1727,7 @@ mod tests {
         let delta = dir.path().join("a-b.delta");
         diff(&a, &b, &delta, &DiffOptions::default()).unwrap();
         let out = dir.path().join("out.pmtiles");
-        let error = apply(&c, &delta, &out, &[]).unwrap_err();
+        let error = apply(&c, &delta, &out, &[], false).unwrap_err();
         assert!(
             error.contains("is not the archive this delta applies to"),
             "{error}"
@@ -1739,11 +1749,11 @@ mod tests {
         bytes[last] ^= 0xff;
         std::fs::write(&delta, &bytes).unwrap();
         let out = dir.path().join("out.pmtiles");
-        assert!(apply(&a, &delta, &out, &[]).is_err());
+        assert!(apply(&a, &delta, &out, &[], false).is_err());
         assert!(!out.exists());
         bytes.truncate(bytes.len() - 5);
         std::fs::write(&delta, &bytes).unwrap();
-        assert!(apply(&a, &delta, &out, &[]).is_err());
+        assert!(apply(&a, &delta, &out, &[], false).is_err());
         assert!(!out.exists());
     }
 
@@ -1813,7 +1823,7 @@ mod tests {
         let report = read_manifest(&dir.path().join("4.delta")).unwrap();
         assert!(report.patched_tiles > 200, "{report:?}");
         let rebuilt = dir.path().join("rebuilt.pmtiles");
-        apply(&a, &dir.path().join("4.delta"), &rebuilt, &[]).unwrap();
+        apply(&a, &dir.path().join("4.delta"), &rebuilt, &[], false).unwrap();
         assert_eq!(std::fs::read(&rebuilt).unwrap(), std::fs::read(&b).unwrap());
     }
 
@@ -1825,6 +1835,46 @@ mod tests {
         let delta = dir.join("a-b.delta");
         diff(&a, &b, &delta, &DiffOptions::default()).unwrap();
         (a, b, delta)
+    }
+
+    #[test]
+    fn applies_in_place_by_swapping_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, delta) = unsigned_delta(dir.path());
+        let key = SecretKey::from_seed(&[7; 32]);
+        sign(&delta, &key).unwrap();
+        // Held open, as a tile server holds the archive it serves.
+        let mut held = File::open(&a).unwrap();
+        let old = std::fs::read(&a).unwrap();
+        let report = apply(&a, &delta, &a, &[key.public_key()], true).unwrap();
+        assert!(report.trusted);
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        assert!(!partial_path(&a).exists());
+        // The open handle still reads the old archive whole (Unix rename).
+        #[cfg(unix)]
+        {
+            let mut read = Vec::new();
+            held.read_to_end(&mut read).unwrap();
+            assert_eq!(read, old);
+        }
+        #[cfg(not(unix))]
+        let _ = (&mut held, old);
+        // Applied again, the base no longer matches: refused, archive kept.
+        let error = apply(&a, &delta, &a, &[], true).unwrap_err();
+        assert!(error.contains("is not the archive"), "{error}");
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    #[test]
+    fn an_untrusted_in_place_apply_leaves_the_archive_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _, delta) = unsigned_delta(dir.path());
+        let before = std::fs::read(&a).unwrap();
+        let key = SecretKey::from_seed(&[8; 32]);
+        let error = apply(&a, &delta, &a, &[key.public_key()], true).unwrap_err();
+        assert!(error.contains("not signed"), "{error}");
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        assert!(!partial_path(&a).exists());
     }
 
     #[test]
@@ -1850,15 +1900,15 @@ mod tests {
         let refused = verify(&delta, &[other.public_key()]).unwrap_err();
         assert!(refused.contains("not trusted"), "{refused}");
         let out = dir.path().join("out.pmtiles");
-        let error = apply(&a, &delta, &out, &[other.public_key()]).unwrap_err();
+        let error = apply(&a, &delta, &out, &[other.public_key()], false).unwrap_err();
         assert!(error.contains("not trusted"), "{error}");
         assert!(!out.exists() && !partial_path(&out).exists());
-        let applied = apply(&a, &delta, &out, &[key.public_key()]).unwrap();
+        let applied = apply(&a, &delta, &out, &[key.public_key()], false).unwrap();
         assert!(applied.trusted);
         assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&b).unwrap());
         // Without trusted keys a signed delta applies as any other.
         let plain = dir.path().join("plain.pmtiles");
-        assert!(!apply(&a, &delta, &plain, &[]).unwrap().trusted);
+        assert!(!apply(&a, &delta, &plain, &[], false).unwrap().trusted);
     }
 
     #[test]
@@ -1875,7 +1925,7 @@ mod tests {
             bytes[at] ^= 0x01;
             std::fs::write(&delta, &bytes).unwrap();
             let out = dir.path().join("out.pmtiles");
-            let error = apply(&a, &delta, &out, &[]).unwrap_err();
+            let error = apply(&a, &delta, &out, &[], false).unwrap_err();
             assert!(
                 error.contains("does not match") || error.contains("manifest"),
                 "{error}"
@@ -1913,7 +1963,7 @@ mod tests {
         assert_eq!(signed[..span], unsigned[..span]);
         assert_eq!(signed.len(), unsigned.len() + 2 * RECORD_BYTES as usize);
         let out = dir.path().join("out.pmtiles");
-        let applied = apply(&a, &delta, &out, &[two.public_key()]).unwrap();
+        let applied = apply(&a, &delta, &out, &[two.public_key()], false).unwrap();
         assert_eq!(applied.signed_by.len(), 2);
         assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&b).unwrap());
     }
@@ -1931,7 +1981,12 @@ mod tests {
         std::fs::write(&delta, &bytes).unwrap();
         assert_eq!(read_manifest(&delta).unwrap().version, 1);
         let out = dir.path().join("out.pmtiles");
-        assert!(apply(&a, &delta, &out, &[]).unwrap().signed_by.is_empty());
+        assert!(
+            apply(&a, &delta, &out, &[], false)
+                .unwrap()
+                .signed_by
+                .is_empty()
+        );
         assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&b).unwrap());
         let key = SecretKey::from_seed(&[1; 32]);
         assert!(sign(&delta, &key).unwrap_err().contains("version 1"));
@@ -1940,6 +1995,7 @@ mod tests {
             &delta,
             &dir.path().join("x.pmtiles"),
             &[key.public_key()],
+            false,
         );
         assert!(required.unwrap_err().contains("not signed"));
     }
@@ -1952,7 +2008,7 @@ mod tests {
         let at = bytes.len() - FOOTER_TAIL_BYTES as usize;
         bytes.splice(at..at, [0u8; 3]);
         std::fs::write(&delta, &bytes).unwrap();
-        let error = apply(&a, &delta, &dir.path().join("out.pmtiles"), &[]).unwrap_err();
+        let error = apply(&a, &delta, &dir.path().join("out.pmtiles"), &[], false).unwrap_err();
         assert!(error.contains("after its end operation"), "{error}");
     }
 

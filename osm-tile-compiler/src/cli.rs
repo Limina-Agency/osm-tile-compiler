@@ -1,10 +1,11 @@
 //! The human command line: `compile`, `building-levels`, `search-index`,
 //! `search`, `fetch-sources`, `style`, `inspect`, `verify`, `extract`, `diff`,
-//! `apply`, `update`, `serve`, `keygen`, `sign`, `verify-signature`,
+//! `apply`, `update`, `serve`, `martin-config`, `keygen`, `sign`, `verify-signature`,
 //! `completions`, `help`, `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
 //! the version, `--json`). Usage errors exit with 2, failures with 1, and
 //! a command stopped by Ctrl-C with 130 (see `interrupt`).
+mod martin;
 mod serve;
 
 use crate::interrupt;
@@ -53,9 +54,10 @@ Usage:
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--sign <KEY>] [--changed-tiles <FILE>] [--json]
-  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--trusted-key <KEY>]... [--json]
+  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> (--output <NEW.pmtiles> | --in-place) [--trusted-key <KEY>]... [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
   osm-tile-compiler serve <ARCHIVE>... [--style-pack <DIR>] [--host <ADDR>] [--port <N>]
+  osm-tile-compiler martin-config <ARCHIVE|DIR>... --output <DIR> [--fonts <DIR>] [--sprites <DIR>] [--json]
   osm-tile-compiler keygen <FILE.key>
   osm-tile-compiler sign <FILE> --key <FILE.key> [--json]
   osm-tile-compiler verify-signature <FILE> [--trusted-key <KEY>]... [--signature <FILE.sig>] [--json]
@@ -82,9 +84,10 @@ Usage:
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--sign <KEY>] [--changed-tiles <FILE>] [--json]
-  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--trusted-key <KEY>]... [--json]
+  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> (--output <NEW.pmtiles> | --in-place) [--trusted-key <KEY>]... [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
   osm-tile-compiler serve <ARCHIVE>... [--style-pack <DIR>] [--host <ADDR>] [--port <N>]
+  osm-tile-compiler martin-config <ARCHIVE|DIR>... --output <DIR> [--fonts <DIR>] [--sprites <DIR>] [--json]
   osm-tile-compiler keygen <FILE.key>
   osm-tile-compiler sign <FILE> --key <FILE.key> [--json]
   osm-tile-compiler verify-signature <FILE> [--trusted-key <KEY>]... [--signature <FILE.sig>] [--json]
@@ -134,6 +137,9 @@ Commands:
   serve            Serve archives (PMTiles or MBTiles) over HTTP for a
                    preview: tiles, TileJSON, a MapLibre style for each, and
                    the glyphs and sprite of an offline style pack
+  martin-config    Experimental: write a Martin tile server config that
+                   serves the archives (and any later added to a directory
+                   given), with an OSM Bright style for each
   keygen           Write a new ed25519 signing key to FILE.key and its public
                    key to FILE.key.pub, for sign, diff --sign and
                    --trusted-key
@@ -178,8 +184,10 @@ Compile options:
                         zooms show only the area's surroundings
   --center <LON LAT Z>  Where viewers start [default: the middle of the area,
                         at the highest zoom that shows all of it]
-  --min-zoom <N>        Lowest zoom, 0-14 [default: 0]
-  --max-zoom <N>        Highest zoom, 0-14 [default: 14]
+  --min-zoom <N>        Lowest zoom, 0-16 [default: 0]
+  --max-zoom <N>        Highest zoom, 0-16 [default: 14]. Its tiles keep
+                        every detail; viewers overzoom them. Each zoom above
+                        14 takes about four times the tiles and time
   --threads <N>         Worker threads [default: available cores]
   --sort-memory <MIB>   Memory the tile sort may hold before it writes runs
                         to scratch, at least 8 MiB per thread [default: half
@@ -214,9 +222,14 @@ Compile options:
   --attribution <HTML>  Attribution viewers show; must keep crediting
                         OpenMapTiles and OpenStreetMap [default: both]
   --gzip-level <N>      Tile compression, 0 (none) to 9 (smallest) [default: 6]
-  --tile-format <F>     mvt, or mlt for MapLibre Tiles (experimental: MapLibre
-                        GL JS 5.12+, Android 12.1+, iOS 6.2+ read them, given
+  --tile-format <F>     mvt, or mlt for MapLibre Tiles, about 20% smaller
+                        (MapLibre GL JS 5.12+, Android 13.4+, iOS 6.28+, given
                         encoding mlt on the source) [default: mvt]
+  --tile-compression <C>
+                        gzip, or none to store each tile as encoded, for
+                        servers that refuse compressed MLT, such as Martin
+                        2.0 (PMTiles only; not with --merge-cache or
+                        --reuse-from) [default: gzip]
   --schema <S>          The tile schema: openmaptiles, shortbread, or a YAML
                         file in Planetiler's custom map format
                         (docs/schemas.md) [default: openmaptiles]. With
@@ -283,6 +296,11 @@ Diff and apply options:
                         several. The signature is checked before anything is
                         written. Without it, an unsigned delta applies, but
                         one whose signature does not match never does
+  --in-place            apply: replace OLD.pmtiles with the result instead of
+                        writing --output. It is written beside it and renamed
+                        over it once checked, so a server reading it, such as
+                        Martin, sees the old archive or the new one, never a
+                        mix; on failure OLD.pmtiles is left as it was
   --json                Print the delta's manifest and size as JSON on stdout
   The delta format is experimental and may change between releases; a delta
   applies only with a build that reads its version.
@@ -319,7 +337,7 @@ Update options (experimental):
                         after, with a quarter tile around it for labels; must
                         not exist yet
   --min-zoom <N>, --max-zoom <N>
-                        Zooms --changed-tiles lists [default: 0 and 14]
+                        Zooms --changed-tiles lists, 0-16 [default: 0 and 14]
   --json                Print the update report as JSON on stdout
   Changes to objects the input holds are always kept; new objects are kept
   when they are inside the box or reach into the extract. Rewritten blocks
@@ -338,6 +356,22 @@ Serve options:
   /tiles/<NAME>/<Z>/<X>/<Y>.mvt (.mlt for MapLibre Tiles) and /maps/<NAME>,
   a page that shows the map (it loads MapLibre GL JS from unpkg.com). Runs
   until Ctrl-C.
+
+Martin config options (experimental):
+  ARCHIVE|DIR...        PMTiles or MBTiles archives, or directories of them.
+                        Martin watches a directory: archives added, replaced
+                        (apply --in-place) or removed there are served at once
+  --output <DIR>        Directory to write martin.yaml and styles/<NAME>.json
+                        to; must not exist yet
+  --fonts <DIR>         TrueType or OpenType fonts (Noto Sans Regular, Bold and
+                        Italic) for Martin to serve the glyphs from [default:
+                        glyphs from the network]
+  --sprites <DIR>       SVG icons for Martin to build the sprite from [default:
+                        OSM Bright's sprite from the network]
+  --json                Print what was written as JSON on stdout
+  Give DIR/martin.yaml to martin as its config file. Each archive's style is
+  /style/<NAME>; its tiles are /<NAME>/<Z>/<X>/<Y>. The styles name Martin by
+  relative URLs, which Martin makes absolute for each client.
 
 Building levels options:
   --threads <N>         Worker threads [default: available cores]; the archive
@@ -562,6 +596,7 @@ enum Command {
     Apply(DeltaArgs),
     Update(Box<UpdateArgs>),
     Serve(serve::ServeArgs),
+    MartinConfig(martin::MartinArgs),
     Completions(String),
     Keygen(PathBuf),
     Sign {
@@ -610,6 +645,8 @@ struct DeltaArgs {
     changed_tiles: Option<PathBuf>,
     /// `apply --trusted-key`.
     trusted: Vec<PublicKey>,
+    /// `apply --in-place`: `output` is `base`, replaced atomically.
+    in_place: bool,
 }
 
 /// Runs the command line on `args` (without the program name) and returns the
@@ -657,6 +694,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::Apply(args) => apply(args),
         Command::Update(args) => update(*args),
         Command::Serve(args) => serve::run(args),
+        Command::MartinConfig(args) => martin::run(args),
         Command::Keygen(path) => keygen(&path),
         Command::Sign { file, key, json } => sign(&file, &key, json),
         Command::VerifySignature {
@@ -711,6 +749,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some(name @ ("diff" | "apply")) => parse_delta_command(name, rest),
         Some("update") => parse_update(rest),
         Some("serve") => serve::parse(rest),
+        Some("martin-config") => martin::parse(rest),
         Some("keygen") => parse_keygen(rest),
         Some(name @ ("sign" | "verify-signature")) => parse_signature_command(name, rest),
         Some("completions") => parse_completions(rest),
@@ -852,7 +891,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut center = None;
     let mut archive = ArchiveOptions::default();
     let mut min_zoom = 0;
-    let mut max_zoom = 14;
+    let mut max_zoom = ZoomRange::DEFAULT_MAX_ZOOM;
     let mut threads = None;
     let mut sort_memory = None;
     let mut temp_dir = None;
@@ -922,6 +961,13 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 archive.tile_format = osm_tile_compiler::TileFormat::from_id(&id)
                     .ok_or_else(|| format!("--tile-format must be mvt or mlt, got '{id}'"))?;
             }
+            "--tile-compression" => {
+                let id = value(&mut args, &flag)?.to_string_lossy().into_owned();
+                archive.tile_compression = osm_tile_compiler::TileCompression::from_id(&id)
+                    .ok_or_else(|| {
+                        format!("--tile-compression must be gzip or none, got '{id}'")
+                    })?;
+            }
             "--center" => {
                 let mut values = [0.0_f64; 3];
                 for slot in &mut values {
@@ -931,9 +977,10 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                     *slot = number(arg, &flag)?;
                 }
                 let [longitude, latitude, zoom] = values;
-                if zoom.fract() != 0.0 || !(0.0..=14.0).contains(&zoom) {
+                if zoom.fract() != 0.0 || !(0.0..=f64::from(ZoomRange::LIMIT)).contains(&zoom) {
                     return Err(format!(
-                        "--center zoom must be a whole number 0-14, got {zoom}"
+                        "--center zoom must be a whole number 0-{}, got {zoom}",
+                        ZoomRange::LIMIT
                     ));
                 }
                 center = Some(ArchiveCenter::new(longitude, latitude, zoom as u8));
@@ -1006,7 +1053,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let zoom = ZoomRange::new(min_zoom, max_zoom).map_err(|_| {
         format!(
             "zooms must satisfy 0 <= --min-zoom <= --max-zoom <= {}, got {min_zoom} and {max_zoom}",
-            ZoomRange::MAX_ZOOM
+            ZoomRange::LIMIT
         )
     })?;
     let (layers, flag) = match (only_layers, excluded_layers) {
@@ -1265,7 +1312,7 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
             output: path,
             zooms: ZoomRange::new(
                 min_zoom.unwrap_or(0),
-                max_zoom.unwrap_or(ZoomRange::MAX_ZOOM),
+                max_zoom.unwrap_or(ZoomRange::DEFAULT_MAX_ZOOM),
             )
             .map_err(String::from)?,
         }),
@@ -1441,6 +1488,7 @@ fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String>
     let mut output = None;
     let mut json = false;
     let (mut sign, mut changed_tiles, mut trusted) = (None, None, Vec::new());
+    let mut in_place = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match option(arg).as_deref() {
@@ -1456,6 +1504,7 @@ fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String>
             Some(flag @ "--trusted-key") if name == "apply" => {
                 trusted.push(trusted_key(value(&mut args, flag)?)?);
             }
+            Some("--in-place") if name == "apply" => in_place = true,
             Some(flag) => return Err(format!("unknown {name} option '{flag}'")),
             None => paths.push(PathBuf::from(arg)),
         }
@@ -1468,7 +1517,17 @@ fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String>
     let [base, other]: [PathBuf; 2] = paths
         .try_into()
         .map_err(|_| format!("{name} takes two files: OLD.pmtiles and {second}"))?;
-    let output = output.ok_or_else(|| format!("{name} needs --output"))?;
+    let output = match (output, in_place) {
+        (Some(_), true) => return Err("apply takes --output or --in-place, not both".into()),
+        (None, true) => base.clone(),
+        (output, false) => output.ok_or_else(|| {
+            if name == "apply" {
+                "apply needs --output or --in-place".to_string()
+            } else {
+                format!("{name} needs --output")
+            }
+        })?,
+    };
     let args = DeltaArgs {
         base,
         other,
@@ -1477,6 +1536,7 @@ fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String>
         sign,
         changed_tiles,
         trusted,
+        in_place,
     };
     Ok(if name == "diff" {
         Command::Diff(args)
@@ -2552,12 +2612,13 @@ fn extract(args: ExtractArgs) -> Result<(), String> {
         request.polygon = Some(osm_tile_compiler::CompileArea::read(polygon)?);
     }
     if args.min_zoom.is_some() || args.max_zoom.is_some() {
-        let max = args.max_zoom.unwrap_or(ZoomRange::MAX_ZOOM);
+        // Without --max-zoom, up to whatever the source holds.
+        let max = args.max_zoom.unwrap_or(ZoomRange::LIMIT);
         let min = args.min_zoom.unwrap_or(0).min(max);
         request.zoom = Some(ZoomRange::new(min, max).map_err(|_| {
             format!(
                 "zooms must satisfy 0 <= --min-zoom <= --max-zoom <= {}, got {min} and {max}",
-                ZoomRange::MAX_ZOOM
+                ZoomRange::LIMIT
             )
         })?);
     }
@@ -2655,7 +2716,11 @@ fn signed_summary(signed_by: &[String]) -> String {
 
 fn apply(args: DeltaArgs) -> Result<(), String> {
     let _partial = interrupt::remove_on_exit(archive::partial_path(&args.output));
-    let report = archive::apply_trusted(&args.base, &args.other, &args.output, &args.trusted)?;
+    let report = if args.in_place {
+        archive::apply_in_place(&args.base, &args.other, &args.trusted)?
+    } else {
+        archive::apply_trusted(&args.base, &args.other, &args.output, &args.trusted)?
+    };
     if args.json {
         println!(
             "{}",

@@ -1134,6 +1134,10 @@ impl Store {
     ) -> Result<TileStats, String> {
         let (bounds, center, options) = (&header.bounds, header.center, header.options);
         let (minzoom, maxzoom) = (header.min_zoom, header.max_zoom);
+        // The zoom the post-processing treats as the top, where Planetiler's
+        // `config.tolerance` and `minFeatureSize` switch to their max zoom
+        // values: the archive's highest zoom, and never below 14.
+        let top = maxzoom.max(14);
         if threads == 0 {
             return Err("OMT encoder threads must be positive".into());
         }
@@ -1211,6 +1215,7 @@ impl Store {
             min_zoom: minzoom,
             max_zoom: maxzoom,
             tile_format: options.tile_format,
+            tile_compression: options.tile_compression,
         })?;
         let mut writing = crate::profiling::Accumulator::new("omt_archive_write");
         let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
@@ -1248,9 +1253,14 @@ impl Store {
                             reuse,
                             counters,
                             timings,
-                            options.gzip_level,
+                            // Unzipped again as written: store, don't compress.
+                            match options.tile_compression {
+                                crate::TileCompression::None => 0,
+                                _ => options.gzip_level,
+                            },
                             options.tile_format,
                             omt_rules,
+                            top,
                             control,
                         )
                     })
@@ -2031,6 +2041,7 @@ fn encode_layer_records(
     timings: &mut EncodeTimings,
     tile_format: TileFormat,
     omt_rules: bool,
+    top: u8,
     control: &Control,
 ) -> Result<Option<Vec<u8>>, String> {
     control.check()?;
@@ -2041,7 +2052,7 @@ fn encode_layer_records(
         records = timings.density.measure(|| point_density(records));
         records = timings
             .geometry
-            .measure(|| merge_geometries_controlled(records, control))?;
+            .measure(|| merge_geometries_controlled(records, top, control))?;
     }
     let layer = timings
         .dictionaries
@@ -2098,6 +2109,7 @@ fn encode_job(
     gzip_level: u32,
     tile_format: TileFormat,
     omt_rules: bool,
+    top: u8,
     control: &Control,
 ) -> Result<(Option<EncodedTile>, Option<TileEntry>), String> {
     let id = job.id;
@@ -2121,7 +2133,7 @@ fn encode_job(
         timings.hash.measure(|| {
             groups
                 .iter()
-                .map(|(layer, records)| merge_cache::layer_key(id, layer.name(), records))
+                .map(|(layer, records)| merge_cache::layer_key(id, top, layer.name(), records))
                 .collect::<Vec<_>>()
         })
     } else {
@@ -2211,7 +2223,15 @@ fn encode_job(
                         .map(EncodedRecord::decode)
                         .collect::<Result<Vec<_>, _>>()
                 })?;
-                encode_layer_records(name, records, timings, tile_format, omt_rules, control)?
+                encode_layer_records(
+                    name,
+                    records,
+                    timings,
+                    tile_format,
+                    omt_rules,
+                    top,
+                    control,
+                )?
             }
         };
         let size = bytes.as_ref().map_or(0, Vec::len);
@@ -2306,6 +2326,12 @@ fn point_density(records: Vec<Record>) -> Vec<Record> {
     }
     let mut output = vec![];
     for mut record in ordinary {
+        // Park.postProcess counts and ranks only the points in a label grid
+        // group, which ends at z14; above it a park point has no rank.
+        if record.layer == "park" && record.grid_cell.is_none() {
+            output.push(record);
+            continue;
+        }
         if let TileGeometry::Point(points) = &record.geometry
             && let Some(point) = points.first()
         {
@@ -2346,13 +2372,15 @@ fn point_density(records: Vec<Record>) -> Vec<Record> {
 
 #[cfg(test)]
 fn merge_geometries(records: Vec<Record>) -> Result<Vec<Record>, String> {
-    merge_geometries_controlled(records, &Control::detached())
+    merge_geometries_controlled(records, 14, &Control::detached())
 }
 
 /// Merges a layer's features as the profile's post-processing does,
-/// stopping on a cancel between merge groups.
+/// stopping on a cancel between merge groups. `top` is the zoom whose
+/// tolerance and minimum size are Planetiler's max zoom values.
 fn merge_geometries_controlled(
     records: Vec<Record>,
+    top: u8,
     control: &Control,
 ) -> Result<Vec<Record>, String> {
     // Water.postProcess returns a one-feature layer unchanged. Running the
@@ -2437,7 +2465,7 @@ fn merge_geometries_controlled(
         }
         match &mut first.geometry {
             TileGeometry::Polygon(groups) => {
-                let policy = polygon_merge_policy(&first.layer, first.zoom);
+                let policy = polygon_merge_policy(&first.layer, first.zoom, top);
                 // Combine retains the original integer rings; floating-point
                 // polygon conversion would be allocated and then discarded.
                 let dissolve = matches!(policy, PolygonMerge::Dissolve { .. });
@@ -2551,7 +2579,7 @@ fn merge_geometries_controlled(
                 }
                 snap_line_paths(paths, *scale_exp);
                 *scale_exp = 0;
-                let tolerance = if first.zoom >= 14 { 1. } else { 1.6 };
+                let tolerance = if first.zoom >= top { 1. } else { 1.6 };
                 if let Some((minimum, buffer)) =
                     line_merge_policy(&first.layer, first.zoom, &first.attrs)
                 {
@@ -2644,7 +2672,7 @@ enum PolygonMerge {
         distance: f64,
     },
 }
-fn polygon_merge_policy(layer: &str, zoom: u8) -> PolygonMerge {
+fn polygon_merge_policy(layer: &str, zoom: u8, top: u8) -> PolygonMerge {
     match layer {
         "building" if zoom == 13 => PolygonMerge::Dissolve {
             min_area: 4.,
@@ -2675,7 +2703,7 @@ fn polygon_merge_policy(layer: &str, zoom: u8) -> PolygonMerge {
             distance: 0.,
         },
         _ => PolygonMerge::Dissolve {
-            min_area: if zoom == 14 { 0.0625 } else { 1. },
+            min_area: if zoom >= top { 0.0625 } else { 1. },
             min_hole_area: 0.,
             distance: 0.,
         },
