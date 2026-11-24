@@ -284,8 +284,9 @@ regardless of the name. The tiles are the same bytes as in the PMTiles
 archive (gzip-compressed MVT, `format` `pbf`), and the metadata the same
 fields, with `vector_layers` in the `json` row. As in Planetiler's compact
 MBTiles, `tiles` is a view over `map` and `images`, so that identical small
-tiles (open sea, solid land) are stored once. Building levels, `--delta-from`,
-`inspect`, `verify`, `extract`, `diff` and `apply` work on PMTiles only.
+tiles (open sea, solid land) are stored once. Building levels, the search
+index, `--delta-from`, `inspect`, `verify`, `extract`, `diff` and `apply`
+work on PMTiles only.
 
 ## Building levels
 
@@ -310,6 +311,23 @@ lines, cliffs, caves, mine shafts) and trails graded by `sac_scale`, at zooms
 10 to 14 with no label grid dropping any. The OpenMapTiles layers are the
 same with or without it, and the metadata says `"sar_schema": 1`. `style
 --sar` draws it above the basemap. Its schema is in [docs/sar.md](docs/sar.md).
+
+## Offline search
+
+`compile --search-index` also writes `<NAME>-search.idx`, a small index of
+the archive's names (3 to 4% of a region's archive) that finds towns, POIs,
+streets, peaks, waters and `sar` features with no network. Matching ignores
+case and diacritics (`lodz` finds Łódź), the last word is a prefix, and a
+word can name the nearest town (`florianska krakow`). `search-index` writes
+it for an existing archive, for example one cut with `extract` on a phone:
+
+```sh
+osm-tile-compiler search-index tatras.pmtiles
+osm-tile-compiler search tatras.pmtiles murowaniec --near 20.00 49.24
+```
+
+From Rust, `SearchIndex::open` and `SearchIndex::search`. How it matches
+and its file format are in [docs/search.md](docs/search.md).
 
 ## Checking archives
 

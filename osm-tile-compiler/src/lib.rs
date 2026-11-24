@@ -62,7 +62,8 @@
 //!
 //! Besides compiling, the crate fetches the inputs ([`fetch_sources`],
 //! [`fetch_extract`]), writes building levels for an archive
-//! ([`write_building_levels`]), inspects, cuts, diffs and patches archives
+//! ([`write_building_levels`]) and a search index of its names
+//! ([`write_search_index`], queried with [`SearchIndex`]), inspects, cuts, diffs and patches archives
 //! ([`archive`]), and writes the MapLibre style for an archive
 //! ([`maplibre_style`]) or an offline pack of it with its fonts and icons
 //! ([`write_style_pack`]).
@@ -95,6 +96,7 @@ mod omt;
 mod output;
 mod profiling;
 mod request;
+mod search;
 mod sources;
 pub mod stage_profile;
 mod style_pack;
@@ -126,6 +128,11 @@ pub use omt::{
 };
 pub use output::OutputFormat;
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
+pub use search::{
+    SEARCH_INDEX_FORMAT, SEARCH_INDEX_VERSION, SearchHit, SearchIndex, SearchIndexReport,
+    SearchQuery, fold_search_text, search_index_path, write_search_index,
+    write_search_index_beside, write_search_index_cancellable,
+};
 pub use sources::{CachedInput, FetchEvent, FetchMode, SupplementalDataset, fetch_sources};
 pub use style_pack::{
     DEFAULT_GLYPHS_URL, DEFAULT_SPRITE_URL, STYLE_FONTSTACKS, StylePackEvent, StylePackReport,

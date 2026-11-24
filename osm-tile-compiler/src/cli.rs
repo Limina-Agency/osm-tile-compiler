@@ -1,6 +1,6 @@
-//! The human command line: `compile`, `building-levels`, `fetch-sources`,
-//! `style`, `inspect`, `verify`, `extract`, `diff`, `apply`, `update`, `help`,
-//! `--version`.
+//! The human command line: `compile`, `building-levels`, `search-index`,
+//! `search`, `fetch-sources`, `style`, `inspect`, `verify`, `extract`, `diff`,
+//! `apply`, `update`, `help`, `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
 //! the version, `--json`). Usage errors exit with 2, failures with 1, and
 //! a command stopped by Ctrl-C with 130 (see `interrupt`).
@@ -22,6 +22,8 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod search;
+
 const NAME: &str = "osm-tile-compiler";
 /// Marks a default scratch directory (`<output>.tmp`) as this tool's.
 const SCRATCH_MARKER: &str = ".osm-tile-compiler-scratch";
@@ -37,6 +39,8 @@ Usage:
   osm-tile-compiler compile <INPUT.pbf>... --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
+  osm-tile-compiler search-index <INPUT.pmtiles> [--output <FILE.idx>] [--threads <N>] [--json]
+  osm-tile-compiler search <FILE.idx|FILE.pmtiles> <QUERY>... [--near <LON LAT>] [OPTIONS]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
@@ -56,6 +60,8 @@ Usage:
   osm-tile-compiler compile <INPUT.pbf>... --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
+  osm-tile-compiler search-index <INPUT.pmtiles> [--output <FILE.idx>] [--threads <N>] [--json]
+  osm-tile-compiler search <FILE.idx|FILE.pmtiles> <QUERY>... [--near <LON LAT>] [OPTIONS]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
@@ -73,6 +79,12 @@ Commands:
                    into a new PMTiles archive
   building-levels  Write the building levels of a compiled archive to a new
                    PMTiles archive: its buildings as boxes for far views
+  search-index     Write the search index of a compiled archive beside it, as
+                   <NAME>-search.idx: its places, POIs, streets, peaks, waters
+                   and sar features by name, for search with no network
+  search           Find names in a search index (or the one beside an
+                   archive), ignoring case and diacritics; the last word
+                   matches as a prefix
   fetch-sources    Download, or verify, the supplemental datasets into DIR:
                    lake_centerline.shp.zip, natural_earth_vector.sqlite.zip and
                    water-polygons-split-3857.zip
@@ -132,6 +144,8 @@ Compile options:
   --fetch               Download any supplemental dataset missing from --sources
   --building-levels     Also write the building levels beside the archive, as
                         <NAME>-buildings.pmtiles
+  --search-index        Also write the search index beside the archive, as
+                        <NAME>-search.idx (see search-index)
   --sar                 Also write the search-and-rescue layer 'sar' into the
                         archive: shelters, water, emergency points, landing
                         sites, hazards and graded trails (docs/sar.md). The
@@ -226,6 +240,23 @@ Building levels options:
                         is the same for any number
   --profile <FILE>      Measure each stage, as for compile
 
+Search index options:
+  --output <FILE>       Index to write; must not exist yet [default:
+                        <NAME>-search.idx beside the archive]
+  --threads <N>         Worker threads [default: available cores]; the index
+                        is the same for any number
+  --json                Print what the index holds as JSON on stdout
+
+Search options:
+  --near <LON LAT>      Rank nearer hits first among equally good ones, and
+                        print their distance
+  --within <W S E N>    Only hits inside this box
+  --layers <A,B,...>    Only hits from these layers: place, poi, sar,
+                        mountain_peak, transportation_name, waterway,
+                        water_name, park, aerodrome_label
+  --limit <N>           Most hits to print [default: 10]
+  --json                Print the hits as JSON on stdout
+
 Style options:
   --glyphs <URL>        Font glyphs, with {fontstack} and {range}
                         [default: https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf]
@@ -281,6 +312,7 @@ struct CompileArgs {
     temp_dir: Option<PathBuf>,
     fetch: bool,
     building_levels: bool,
+    search_index: bool,
     sar: bool,
     json: bool,
     profile: Option<PathBuf>,
@@ -395,6 +427,8 @@ enum Command {
     Version,
     Compile(Box<CompileArgs>),
     BuildingLevels(BuildingLevelsArgs),
+    SearchIndex(search::SearchIndexArgs),
+    Search(search::SearchArgs),
     FetchSources(PathBuf),
     Style(StyleArgs),
     Inspect { archive: PathBuf, json: bool },
@@ -451,6 +485,8 @@ pub fn main(args: Vec<OsString>) -> i32 {
         }
         Command::Compile(args) => compile(*args),
         Command::BuildingLevels(args) => building_levels(args),
+        Command::SearchIndex(args) => search::search_index(args),
+        Command::Search(args) => search::search(args),
         Command::FetchSources(directory) => fetch_sources(&directory),
         Command::Style(args) => style(args),
         Command::Inspect { archive, json } => inspect(&archive, json),
@@ -483,6 +519,8 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("--version" | "-V") => Ok(Command::Version),
         Some("compile") => parse_compile(rest),
         Some("building-levels") => parse_building_levels(rest),
+        Some("search-index") => search::parse_search_index(rest),
+        Some("search") => search::parse_search(rest),
         Some("fetch-sources") => parse_fetch_sources(rest),
         Some("style") => parse_style(rest),
         Some(name @ ("inspect" | "verify")) => parse_archive_command(name, rest),
@@ -593,6 +631,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut temp_dir = None;
     let mut fetch = false;
     let mut building_levels = false;
+    let mut search_index = false;
     let mut sar = false;
     let mut omit_sources = Vec::new();
     let mut json = false;
@@ -682,6 +721,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
             }
             "--fetch" => fetch = true,
             "--building-levels" => building_levels = true,
+            "--search-index" => search_index = true,
             "--sar" => sar = true,
             "--omit-sources" => {
                 omit_sources.clear();
@@ -767,6 +807,12 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 format.name()
             ));
         }
+        if search_index {
+            return Err(format!(
+                "--search-index needs a PMTiles archive, not {}",
+                format.name()
+            ));
+        }
         if delta_from.is_some() {
             return Err(format!(
                 "--delta-from needs a PMTiles archive, not {}",
@@ -818,6 +864,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         temp_dir,
         fetch,
         building_levels,
+        search_index,
         sar,
         json,
         profile,
@@ -1533,7 +1580,12 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     // Downloads and the compile stop when asked, removing what they wrote.
     let _cooperating = interrupt::cooperate();
     let levels = building_levels_path(&args.output);
-    for archive in [&args.output, &levels] {
+    let search_index = osm_tile_compiler::search_index_path(&args.output);
+    let search_index = args.search_index.then_some(&search_index);
+    for archive in [Some(&args.output), Some(&levels), search_index]
+        .into_iter()
+        .flatten()
+    {
         if archive.exists() {
             return Err(format!(
                 "refusing to replace existing archive {}",
@@ -1694,6 +1746,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     request.layers = args.layers;
     request.languages = args.languages;
     request.building_levels = args.building_levels;
+    request.search_index = args.search_index;
     request.sar = args.sar;
     request.sort_memory = args.sort_memory;
     request.merge_cache = args.merge_cache;
@@ -1767,6 +1820,9 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     }
     if let Some((path, report)) = &output.building_levels {
         report_levels(&mut status, path, report);
+    }
+    if let Some((path, report)) = &output.search_index {
+        search::report_index(&mut status, path, report);
     }
     write_profile(&mut status, args.profile.as_deref(), profile)?;
     if let Some((old, delta_path)) = &delta {

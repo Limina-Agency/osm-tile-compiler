@@ -46,8 +46,9 @@ pub struct BasemapRequest {
     /// [`Area::bounds`], the area is the box around every extract's header
     /// box; the archive's OSM data timestamp is the oldest extract's.
     pub extra_inputs: Vec<PathBuf>,
-    /// The archive to write; it must not exist yet. Building levels, when
-    /// asked for, go beside it ([`building_levels_path`]).
+    /// The archive to write; it must not exist yet. Building levels and the
+    /// search index, when asked for, go beside it ([`building_levels_path`],
+    /// [`crate::search_index_path`]).
     pub output: PathBuf,
     /// The archive format [default: the one `output`'s extension names, see
     /// [`OutputFormat::from_path`]].
@@ -98,6 +99,13 @@ pub struct BasemapRequest {
     ///
     /// [`write_building_levels`]: crate::write_building_levels
     pub building_levels: bool,
+    /// Whether to write a search index of the archive's names beside it, at
+    /// [`search_index_path`] [default: no]. It finds places, POIs, streets,
+    /// peaks, waters and `sar` features by name offline; see
+    /// [`SearchIndex`](crate::SearchIndex).
+    ///
+    /// [`search_index_path`]: crate::search_index_path
+    pub search_index: bool,
     /// The memory, in bytes, the tile sort may hold in its buffers before it
     /// writes them to scratch runs [default: half of what the machine has
     /// available when rendering starts]. The buffers start at 8 MiB per
@@ -149,6 +157,7 @@ impl BasemapRequest {
             sar: false,
             languages: None,
             building_levels: false,
+            search_index: false,
             sort_memory: None,
             merge_cache: crate::MergeCacheOptions::default(),
         }
@@ -208,6 +217,12 @@ impl BasemapRequest {
                 self.output_format().name()
             )));
         }
+        if self.search_index && self.output_format() != OutputFormat::PmTiles {
+            return Err(invalid(format!(
+                "the search index is written beside PMTiles archives only, not {}",
+                self.output_format().name()
+            )));
+        }
         let caching = self.merge_cache.write || self.merge_cache.reuse_from.is_some();
         if caching && self.output_format() != OutputFormat::PmTiles {
             return Err(invalid(format!(
@@ -221,7 +236,12 @@ impl BasemapRequest {
             ));
         }
         let levels = building_levels_path(&self.output);
-        let archives = [Some(&self.output), self.building_levels.then_some(&levels)];
+        let search = crate::search_index_path(&self.output);
+        let archives = [
+            Some(&self.output),
+            self.building_levels.then_some(&levels),
+            self.search_index.then_some(&search),
+        ];
         for archive in archives.into_iter().flatten() {
             if archive.exists() {
                 return Err(invalid(format!(
@@ -256,6 +276,8 @@ pub struct BasemapOutput {
     pub format: OutputFormat,
     /// The building levels and what they hold, if written.
     pub building_levels: Option<(PathBuf, BuildingLevelsReport)>,
+    /// The search index and what it holds, if written.
+    pub search_index: Option<(PathBuf, crate::SearchIndexReport)>,
     /// The area compiled.
     pub bounds: CompileBounds,
     /// Where each supplemental dataset read came from, when the request
@@ -310,7 +332,7 @@ fn read_pbf_bounds(input: &Path) -> Result<CompileBounds, String> {
 
 /// Compiles `request.input_pbf` into a basemap: fetches the supplemental
 /// datasets as the request says, compiles, and writes the building levels
-/// beside the archive if the request asks for them.
+/// and the search index beside the archive if the request asks for them.
 ///
 /// `progress` and `should_cancel` are called on the calling thread, which
 /// waits for the compile while the work runs on a rayon pool of
@@ -428,10 +450,22 @@ fn compile(
         levels_guard = Some(RemoveOnDrop::file(path.clone()));
         building_levels = Some((path, report));
     }
+    let mut search_index = None;
+    let mut search_guard = None;
+    if request.search_index {
+        control.stage(CompileStage::SearchIndex, "Writing the search index")?;
+        let path = crate::search_index_path(&request.output);
+        let report = crate::search::write_index(&request.output, &path, request.threads, control)?;
+        search_guard = Some(RemoveOnDrop::file(path.clone()));
+        search_index = Some((path, report));
+    }
     control.check()?;
     drop(scratch);
     archive_guard.keep();
     if let Some(guard) = levels_guard {
+        guard.keep();
+    }
+    if let Some(guard) = search_guard {
         guard.keep();
     }
     Ok(BasemapOutput {
@@ -439,6 +473,7 @@ fn compile(
         archive: request.output.clone(),
         format: request.output_format(),
         building_levels,
+        search_index,
         bounds,
         supplemental_inputs,
         omitted_sources: SupplementalDataset::ALL

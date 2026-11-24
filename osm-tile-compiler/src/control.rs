@@ -161,11 +161,15 @@ pub enum CompileStage {
     /// Writing the building levels beside the archive. Its fraction counts
     /// the groups of tiles done.
     BuildingLevels,
+    /// Writing the search index beside the archive. Its fraction counts the
+    /// tiles read; like `FetchSources`, it is not part of `overall`, as it
+    /// takes about a hundredth of a compile.
+    SearchIndex,
 }
 
 impl CompileStage {
     /// Every stage, in order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::FetchSources,
         Self::MergeExtracts,
         Self::ReadSources,
@@ -173,11 +177,12 @@ impl CompileStage {
         Self::ReadOsm,
         Self::WriteTiles,
         Self::BuildingLevels,
+        Self::SearchIndex,
     ];
 
     /// A stable identifier: `fetch_sources`, `merge_extracts`,
-    /// `read_sources`, `index_osm`, `read_osm`, `write_tiles` or
-    /// `building_levels`.
+    /// `read_sources`, `index_osm`, `read_osm`, `write_tiles`,
+    /// `building_levels` or `search_index`.
     pub fn id(self) -> &'static str {
         match self {
             Self::FetchSources => "fetch_sources",
@@ -187,6 +192,7 @@ impl CompileStage {
             Self::ReadOsm => "read_osm",
             Self::WriteTiles => "write_tiles",
             Self::BuildingLevels => "building_levels",
+            Self::SearchIndex => "search_index",
         }
     }
 
@@ -196,7 +202,7 @@ impl CompileStage {
     /// PBF) on 4 threads.
     pub fn weight(self) -> f64 {
         match self {
-            Self::FetchSources | Self::MergeExtracts => 0.0,
+            Self::FetchSources | Self::MergeExtracts | Self::SearchIndex => 0.0,
             Self::ReadSources => 0.05,
             Self::IndexOsm => 0.05,
             Self::ReadOsm => 0.47,

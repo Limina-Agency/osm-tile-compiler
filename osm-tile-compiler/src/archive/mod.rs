@@ -20,6 +20,7 @@ pub use delta::{
     ApplyReport, ArchiveDigest, DELTA_FORMAT, DELTA_VERSION, DeltaManifest, DiffReport, TileChanges,
 };
 pub use extract::{ExtractReport, ExtractRequest, extract};
+pub(crate) use reader::decompress as decompress_tile;
 #[doc(hidden)]
 pub use reader::{ArchiveReader, Entry, Header};
 

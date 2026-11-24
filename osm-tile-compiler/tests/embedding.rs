@@ -11,6 +11,7 @@ use common::{monaco_pbf, synthetic_sources};
 use osm_tile_compiler::{
     BasemapRequest, CompileError, CompileProgress, CompileStage, SourcesPolicy,
     SupplementalDataset, archive::ArchiveReader, building_levels_path, compile_basemap,
+    search_index_path,
 };
 use std::cell::{Cell, RefCell};
 use std::io::Read;
@@ -97,6 +98,7 @@ fn compiles_monaco_reporting_every_stage() {
     request.sources_policy = SourcesPolicy::FetchMissing;
     // A second extract, the same one, so that the merge runs too.
     request.extra_inputs = vec![monaco_pbf()];
+    request.search_index = true;
     let reports = RefCell::new(Vec::<CompileProgress>::new());
     let output = compile_basemap(
         &request,
@@ -128,6 +130,9 @@ fn compiles_monaco_reporting_every_stage() {
     let (levels, report) = output.building_levels.as_ref().unwrap();
     assert_eq!(levels, &building_levels_path(&request.output));
     assert!(!report.levels.is_empty());
+    let (index, report) = output.search_index.as_ref().unwrap();
+    assert_eq!(index, &search_index_path(&request.output));
+    assert!(report.records > 0);
     assert!(metadata(&request.output).get("omitted_sources").is_none());
     // The scratch directory the compile made is gone; only the outputs and
     // the extracted datasets remain.
@@ -136,6 +141,7 @@ fn compiles_monaco_reporting_every_stage() {
         files(&temp.path().join("out")),
         [
             PathBuf::from("monaco-buildings.pmtiles"),
+            PathBuf::from("monaco-search.idx"),
             PathBuf::from("monaco.pmtiles")
         ]
     );
@@ -161,6 +167,7 @@ fn cancelling_at_each_stage_stops_at_once_and_leaves_nothing() {
         let mut request = request(&dir, &sources, 2);
         request.sources_policy = SourcesPolicy::FetchMissing;
         request.extra_inputs = vec![monaco_pbf()];
+        request.search_index = true;
         let asked = Cell::new(None::<Instant>);
         let seen = RefCell::new(Vec::new());
         let result = compile_basemap(
@@ -180,6 +187,7 @@ fn cancelling_at_each_stage_stops_at_once_and_leaves_nothing() {
         assert_eq!(seen.borrow().last(), Some(&stage), "{stage:?}");
         assert!(!request.output.exists(), "{stage:?}");
         assert!(!building_levels_path(&request.output).exists(), "{stage:?}");
+        assert!(!search_index_path(&request.output).exists(), "{stage:?}");
         assert!(!request.temp_dir.exists(), "{stage:?}");
         assert_eq!(files(&dir), Vec::<PathBuf>::new(), "{stage:?}");
         assert_eq!(files(&sources), sources_before, "{stage:?}");
