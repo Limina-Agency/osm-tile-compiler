@@ -28,6 +28,19 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --locked -p osm-tile-compiler --test area_download -- --ignored --nocapture
 
+  # The MLT decoder against the MapLibre Tile specification's main branch:
+  # every v1 synthetic fixture in an encoding it reads must decode to its
+  # JSON, and the fixtures vendored in fixtures/ must still be upstream's. A
+  # failure means the specification moved: see scripts/check-mlt-spec.sh.
+  mlt-spec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: scripts/check-mlt-spec.sh
+
   # The PR job's macOS leg waits on GitHub's few free macOS runners and is
   # often cancelled; this runs it once a day when they are idle.
   macos:

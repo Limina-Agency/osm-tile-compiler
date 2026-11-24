@@ -118,6 +118,7 @@ fault of the library. `stage` is set for `failed`. Messages are fit to show.
   "extraInputs": ["/…/more.osm.pbf"],
   "output": "/…/monaco.pmtiles",
   "format": "pmtiles",
+  "tileFormat": "mvt",
   "sources": "/…/omt-sources",
   "tempDir": "/…/tmp",
   "sourcesPolicy": "use_present",
@@ -147,7 +148,10 @@ above 14 each zoom has four times the tiles. `sourcesPolicy` is
 `{"only": [...]}` or `{"except": [...]}`. `area.read` is `whole_extract` (the
 default) or `near_area`, which reads only the OSM data in and near the area.
 `format` is `pmtiles` or `mbtiles`; without it, an `output` ending in
-`.mbtiles` is MBTiles and anything else PMTiles. Building levels need
+`.mbtiles` is MBTiles and anything else PMTiles. `tileFormat` is `mvt` (the
+default) or `mlt` for MapLibre Tiles ([formats.md](formats.md)); a style for
+an MLT archive needs `"encoding": "mlt"` on its source, which
+`write_style_pack` with `tileFormat: "mlt"` writes. Building levels need
 PMTiles. `sar` also writes the search-and-rescue layer
 ([sar.md](sar.md)); `layers` may still leave it out, and `{"only": [...]}`
 naming `sar` writes it too. `resume` makes the compile resumable
@@ -183,7 +187,8 @@ serde support with these names (roadmap item A9), the mapping goes away.
   "languages": ["uk"],
   "glyphs": "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
   "sprite": "https://openmaptiles.github.io/osm-bright-gl-style/sprite",
-  "baseUrl": "file:///…/maps/berlin-style"
+  "baseUrl": "file:///…/maps/berlin-style",
+  "tileFormat": "mvt"
 }
 ```
 
@@ -195,7 +200,8 @@ the glyph ranges beyond Latin; `languages` adds their scripts. `glyphs` and
 `sprite` say where to fetch from (URLs, `file://` URLs or local paths) and
 default to the servers above; `baseUrl` goes before the style's glyph and
 sprite paths, which MapLibre Native needs; `sar: true` also draws the
-opt-in `sar` layer, for an archive compiled with it. Progress reports `Fetched N of M
+opt-in `sar` layer, for an archive compiled with it; `tileFormat: "mlt"`
+marks the source `"encoding": "mlt"`, for an archive compiled with MLT tiles. Progress reports `Fetched N of M
 files` with a fraction and no stage. The result is the `StylePackReport`:
 
 ```json

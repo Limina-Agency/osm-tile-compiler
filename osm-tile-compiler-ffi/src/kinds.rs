@@ -221,6 +221,8 @@ struct CompileBasemapJson {
     output: PathBuf,
     /// "pmtiles" or "mbtiles" [default: by the output's extension].
     format: Option<String>,
+    /// The tiles' encoding: "mvt" or "mlt" [default: mvt].
+    tile_format: Option<String>,
     sources: PathBuf,
     temp_dir: PathBuf,
     sources_policy: Option<SourcesPolicyJson>,
@@ -247,6 +249,12 @@ struct CompileBasemapJson {
     resume: bool,
 }
 
+fn tile_format(id: &str) -> Result<osm_tile_compiler::TileFormat, JobError> {
+    osm_tile_compiler::TileFormat::from_id(id).ok_or_else(|| {
+        JobError::invalid_request(format!("Unknown tile format '{id}': it is mvt or mlt"))
+    })
+}
+
 fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
     let json: CompileBasemapJson = serde_json::from_value(request)
         .map_err(|e| JobError::invalid_request(format!("Invalid compile_basemap request: {e}")))?;
@@ -258,6 +266,9 @@ fn compile_basemap_request(request: Value) -> Result<BasemapRequest, JobError> {
                 "Unknown output format '{id}': it is pmtiles or mbtiles"
             ))
         })?);
+    }
+    if let Some(id) = json.tile_format {
+        request.archive.tile_format = tile_format(&id)?;
     }
     if let Some(policy) = json.sources_policy {
         request.sources_policy = match policy {
@@ -366,6 +377,8 @@ struct StylePackJson {
     base_url: Option<String>,
     #[serde(default)]
     sar: bool,
+    /// The archive's tiles: "mvt" or "mlt" [default: mvt].
+    tile_format: Option<String>,
 }
 
 fn style_pack_request(request: Value) -> Result<StylePackRequest, JobError> {
@@ -376,6 +389,9 @@ fn style_pack_request(request: Value) -> Result<StylePackRequest, JobError> {
     request.languages = json.languages;
     request.base_url = json.base_url;
     request.sar = json.sar;
+    if let Some(id) = json.tile_format {
+        request.tile_format = tile_format(&id)?;
+    }
     if let Some(glyphs) = json.glyphs {
         request.glyphs = glyphs;
     }
@@ -471,6 +487,7 @@ mod tests {
             "languages": ["en"],
             "buildingLevels": true,
             "sar": true,
+            "tileFormat": "mlt",
         }))
         .unwrap();
         assert_eq!(request.input_pbf, PathBuf::from("/in.osm.pbf"));
@@ -489,6 +506,10 @@ mod tests {
         assert_eq!(request.languages, Some(vec!["en".to_string()]));
         assert!(request.building_levels);
         assert!(request.sar);
+        assert_eq!(
+            request.archive.tile_format,
+            osm_tile_compiler::TileFormat::Mlt
+        );
     }
 
     #[test]
@@ -499,8 +520,10 @@ mod tests {
             "languages": ["uk"],
             "glyphs": "https://example.com/{fontstack}/{range}.pbf",
             "baseUrl": "asset://pack",
+            "tileFormat": "mlt",
         }))
         .unwrap();
+        assert_eq!(request.tile_format, osm_tile_compiler::TileFormat::Mlt);
         assert_eq!(request.directory, PathBuf::from("/nowhere/pack"));
         assert_eq!(request.languages, Some(vec!["uk".to_string()]));
         assert_eq!(request.base_url.as_deref(), Some("asset://pack"));
@@ -530,6 +553,7 @@ mod tests {
             parse_request(r#","omitSources":["x"]"#).contains("Unknown supplemental dataset 'x'")
         );
         assert!(parse_request(r#","colour":"red""#).contains("unknown field `colour`"));
+        assert!(parse_request(r#","tileFormat":"png""#).contains("Unknown tile format 'png'"));
         assert!(parse_request(r#","sourcesPolicy":"always""#).contains("unknown variant"));
         assert!(parse_request(r#","zoom":{"min":9,"max":3}"#).contains("zooms must satisfy"));
         // BasemapRequest::validate runs at start too.

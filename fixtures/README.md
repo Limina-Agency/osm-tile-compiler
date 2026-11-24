@@ -34,12 +34,14 @@ the platform's math library: with glibc's replaced by the `libm` crate's
 identical. It contains OpenStreetMap data, © OpenStreetMap contributors, under
 the Open Database License 1.0: https://www.openstreetmap.org/copyright.
 
-`mlt-synthetic/` holds the MapLibre Tile specification's synthetic v1
-fixtures (`test/synthetic/0x01/` of
-https://github.com/maplibre/maplibre-tile-spec at commit `698a3f7e`, dual
-licensed MIT or Apache-2.0): each `.mlt` tile with the `.json` its features
-must decode to, the JSON compacted. Only those whose encodings the
-compiler's test decoder reads are copied: none with FastPFOR, FSST, Morton,
-shared dictionaries or tessellation. `src/mlt/tests.rs` decodes every one
-and compares it with its JSON, so the decoder that checks the MLT encoder is
-itself checked against the specification.
+`mlt-synthetic/` and `mlt-synthetic-rust/` hold the MapLibre Tile
+specification's synthetic v1 fixtures (`test/synthetic/0x01/` and
+`test/synthetic/0x01-rust/` of https://github.com/maplibre/maplibre-tile-spec
+at the commit in `mlt-spec-commit`, dual licensed MIT or Apache-2.0): each
+`.mlt` tile with the `.json` its features must decode to, the JSON compacted.
+Only those whose encodings the compiler's decoder reads are copied: none with
+FastPFOR, FSST, shared dictionaries or tessellation. `src/mlt/tests.rs`
+decodes every one and compares it with its JSON, so the decoder that checks
+the MLT encoder is itself checked against the specification.
+`scripts/check-mlt-spec.sh` checks them against the specification's main
+branch (the nightly workflow runs it), and `--update` copies them again.

@@ -84,8 +84,10 @@ dicts, the same fields the command line prints with `--json`.
 GeoJSON or `.poly` file), `read` (`"whole_extract"`, `"near_area"`), `center`
 (`(longitude, latitude, zoom)`), `name`, `description`, `attribution`,
 `gzip_level`, `min_zoom`, `max_zoom`, `threads`, `layers` or `exclude_layers`
-(names from `LAYERS`), `languages`, `building_levels`, `sar`, `sort_memory`.
-It returns `archive`, `format`, `bounds`, `building_levels` (a path or None),
+(names from `LAYERS`), `languages`, `building_levels`, `search_index`,
+`tile_format` (`"mvt"`, the default, or `"mlt"` for MapLibre Tiles), `sar`,
+`sort_memory`. It returns `archive`, `format`, `bounds`, `building_levels`
+and `search_index` (each a path or None),
 `result` (the compile's statistics), `supplemental_inputs`,
 `omitted_sources` and `manifest` (the `basemap-manifest` document).
 
