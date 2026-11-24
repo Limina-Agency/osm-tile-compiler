@@ -214,14 +214,12 @@ pub(crate) fn write_index(
                         let stored = reader.tile(entry)?;
                         let mut tile = crate::archive::decompress_tile(&stored, compression)?;
                         if mlt {
-                            tile = crate::mlt::to_mvt(&tile)
-                                .map_err(|e| {
-                                    format!(
-                                        "tile {zoom}/{x}/{y} of {} is malformed: {e}",
-                                        input.display()
-                                    )
-                                })?
-                                .into();
+                            tile = crate::mlt::to_mvt(&tile).map_err(|e| {
+                                format!(
+                                    "tile {zoom}/{x}/{y} of {} is malformed: {e}",
+                                    input.display()
+                                )
+                            })?;
                         }
                         read_tile(&tile, zoom, *x, *y, &mut items).ok_or_else(|| {
                             format!("tile {zoom}/{x}/{y} of {} is malformed", input.display())
