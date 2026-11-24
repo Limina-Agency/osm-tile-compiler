@@ -221,7 +221,10 @@ semantic versioning, like the Rust API.
   `verify`/`inspect` and delta `apply`.
 - `otc_validate(json, &error)`: the same checks as `otc_job_start` without
   starting a job, for forms that check as the user types.
-- Packaging: an XCFramework for iOS and a JNI-ready `.so` per Android ABI
-  (with the CI thread's iOS and Android builds), then the Swift package (F4)
-  and Kotlin AAR (F5) as thin wrappers over these ten functions.
+- Packaging: `scripts/build-xcframework.sh` builds the iOS XCFramework
+  (device and Apple-silicon simulator, with a module map, so Swift can
+  `import OsmTileCompilerFFI`), and `ios/DeviceTest` is a SwiftUI app that
+  measures a compile on a phone with it. Still to come: a JNI-ready `.so`
+  per Android ABI, then the Swift package (F4) and Kotlin AAR (F5) as thin
+  wrappers over these ten functions.
 - On-device numbers (F6) and a low-memory mode for phones (P8).
