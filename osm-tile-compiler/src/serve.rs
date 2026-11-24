@@ -33,7 +33,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -203,40 +203,74 @@ impl TileServer {
     /// Serves until `should_stop` returns true, which is asked about every
     /// tenth of a second. Connections open then are finished in the
     /// background.
+    ///
+    /// Connections are accepted on a thread of their own that blocks in
+    /// `accept`, so a new connection is taken at once rather than at the next
+    /// poll; stopping wakes it with a connection to itself.
     pub fn run(self, should_stop: impl Fn() -> bool) -> Result<(), CompileError> {
-        self.listener
-            .set_nonblocking(true)
-            .map_err(|e| CompileError::other(e.to_string()))?;
-        let active = Arc::new(AtomicUsize::new(0));
-        while !should_stop() {
-            let stream = match self.listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    // Running out of file descriptors and the like: wait and
-                    // go on rather than stop serving.
-                    eprintln!("serve: could not accept a connection: {e}");
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-            };
-            if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                active.fetch_sub(1, Ordering::SeqCst);
-                let _ = refuse(stream);
-                continue;
-            }
-            let state = Arc::clone(&self.state);
-            let active = Arc::clone(&active);
-            std::thread::spawn(move || {
-                let _ = serve_connection(&state, stream);
-                active.fetch_sub(1, Ordering::SeqCst);
-            });
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener = self.listener;
+        let state = self.state;
+        let wake = wake_address(state.local);
+        let accepting = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || accept_loop(&listener, &state, &stop))
+        };
+        while !should_stop() && !accepting.is_finished() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        stop.store(true, Ordering::SeqCst);
+        // Unblock `accept`; if the connection fails the thread is stuck
+        // until the next client, so don't wait for it then.
+        if TcpStream::connect_timeout(&wake, Duration::from_secs(1)).is_ok() {
+            let _ = accepting.join();
         }
         Ok(())
+    }
+}
+
+/// Where a connection reaches a listener bound to `local`: the loopback
+/// address for an unspecified one.
+fn wake_address(local: SocketAddr) -> SocketAddr {
+    let mut wake = local;
+    if wake.ip().is_unspecified() {
+        wake.set_ip(match wake {
+            SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    wake
+}
+
+fn accept_loop(listener: &TcpListener, state: &Arc<State>, stop: &AtomicBool) {
+    let active = Arc::new(AtomicUsize::new(0));
+    loop {
+        let accepted = listener.accept();
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                // Running out of file descriptors and the like: wait and
+                // go on rather than stop serving.
+                eprintln!("serve: could not accept a connection: {e}");
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            let _ = refuse(stream);
+            continue;
+        }
+        let state = Arc::clone(state);
+        let active = Arc::clone(&active);
+        std::thread::spawn(move || {
+            let _ = serve_connection(&state, stream);
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }
 
@@ -1316,6 +1350,43 @@ mod tests {
 
     fn get(path: &str) -> String {
         format!("GET {path} HTTP/1.1\r\nHost: maps.local:9000\r\nAccept-Encoding: gzip\r\n\r\n")
+    }
+
+    #[test]
+    fn takes_each_new_connection_at_once_and_stops_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        write_archives(dir.path());
+        let server = TileServer::bind(&ServeRequest::new(
+            vec![dir.path().join("test.pmtiles")],
+            "0.0.0.0:0",
+        ))
+        .unwrap();
+        let address = wake_address(server.local_addr());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let running = std::thread::spawn(move || server.run(|| stopped.load(Ordering::Relaxed)));
+        // One request per connection, one after another, as a client that
+        // doesn't keep connections alive sends them. Polling for connections
+        // every 100 ms took at least 5 s for these 50.
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            let response = exchange(address, &[&get("/tiles/test.json")]);
+            assert!(response[0].0.starts_with("HTTP/1.1 200"));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let asked = std::time::Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        running.join().unwrap().unwrap();
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert!(TcpStream::connect(address).is_err(), "still listening");
     }
 
     #[test]
