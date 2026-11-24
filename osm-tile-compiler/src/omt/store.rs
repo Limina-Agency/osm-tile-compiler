@@ -1945,6 +1945,7 @@ fn osm_metadata(metadata: &mut serde_json::Value, osm_data: &super::OsmDataInfo)
 /// The metadata of an archive a configured schema made. Its name,
 /// description and attribution are the schema's unless the request set
 /// them; there is no OpenMapTiles version or Planetiler commit to give.
+#[allow(clippy::too_many_arguments)]
 fn schema_metadata(
     schema: &super::schema::Schema,
     layers: &[&str],
@@ -2238,15 +2239,7 @@ fn encode_job(
                         .map(EncodedRecord::decode)
                         .collect::<Result<Vec<_>, _>>()
                 })?;
-                encode_layer_records(
-                    name,
-                    records,
-                    timings,
-                    tile_format,
-                    omt_rules,
-                    top,
-                    control,
-                )?
+                encode_layer_records(name, records, timings, tile_format, omt_rules, top, control)?
             }
         };
         let size = bytes.as_ref().map_or(0, Vec::len);

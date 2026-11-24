@@ -424,7 +424,10 @@ fn check_data_layers(request: &OpenMapTilesRequest, layers: &Layers) -> Result<(
 
 /// The layers an archive declares: the profile's written, then the data
 /// layers not among them, in the request's order.
-fn declared_layers<'a>(mut layers: Vec<&'a str>, data_layers: &'a [crate::DataLayer]) -> Vec<&'a str> {
+fn declared_layers<'a>(
+    mut layers: Vec<&'a str>,
+    data_layers: &'a [crate::DataLayer],
+) -> Vec<&'a str> {
     for data in data_layers {
         if !layers.contains(&data.layer.as_str()) {
             layers.push(data.layer.as_str());
@@ -765,9 +768,7 @@ impl Layers {
     fn with_data_layers(self, data_layers: &[crate::DataLayer]) -> Self {
         let names = data_layers.iter().map(|d| d.layer.as_str());
         match self {
-            Self::OpenMapTiles(selection) => {
-                Self::OpenMapTiles(selection.with_data_layers(names))
-            }
+            Self::OpenMapTiles(selection) => Self::OpenMapTiles(selection.with_data_layers(names)),
             Self::Schema(schema, filter) => {
                 let filter = filter.with_data_layers(names);
                 Self::Schema(schema, filter)
