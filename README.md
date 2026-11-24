@@ -19,8 +19,8 @@ set the design:
 - **In-process.** The compile is a library that runs inside the app that
   shows the map, with no separate service, database or Java runtime to
   ship or start. CI builds it for iOS devices and the simulator and for Android
-  (arm64, armv7 and x86_64), and it has
-  run in an app in the simulator; it has not yet been measured on a phone. The command line is a thin layer over the same
+  (arm64, armv7 and x86_64). On an iPhone 17 it compiles Małopolskie in
+  17.0 s with a peak footprint of 171 MiB. The command line is a thin layer over the same
   call.
 - **Speed and memory first.** A region compiles in seconds to a minute, in
   a fraction of the memory a server-side tool expects, so it fits on the
@@ -46,6 +46,9 @@ set the design:
   executable reads the extract and writes a single archive.
 - **Checked output.** `verify` decodes every tile of an archive, and the
   test suite pins the Monaco build's features.
+
+[docs/comparison.md](docs/comparison.md) compares it with Planetiler,
+tilemaker, Tippecanoe, the OpenMapTiles tools and Martin.
 
 It is pre-1.0. The OpenMapTiles profile meets the parity bar against
 Planetiler on three regions (`parity_verified: true`; see
@@ -634,8 +637,9 @@ building levels on, Małopolskie took:
   0.78 GiB, writing the same bytes.
 
 The basemap is 147 MiB and its building levels 26 MiB; Monaco takes well
-under a second. A phone has not been measured yet: its CPU is slower than
-the simulator's (which is the Mac's) and its memory limit stricter.
+under a second. On an iPhone 17 (4 threads, without the supplemental
+datasets and building levels), Małopolskie took 17.0 s, with a peak
+footprint of 171 MiB, the figure iOS's memory limit counts.
 [`docs/performance.md`](docs/performance.md) has the measurements, per stage
 and thread count.
 
