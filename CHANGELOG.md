@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- Deltas are format version 2 (`DELTA_VERSION`): after the end operation
+  comes a footer of ed25519 signatures, ending in the magic `OTCSIGNS`. This
+  build still applies version 1 deltas, as unsigned deltas, but an older
+  build cannot apply a version 2 delta.
+- `archive::ApplyReport` gains `signed_by` and `trusted`, and
+  `archive::DiffReport` gains `signed_by` and `changed_tiles`.
+  `UpdateRequest` gains `changed_tiles` and `UpdateReport` gains
+  `changed_tiles`, so code that builds either with a struct literal needs the
+  new field (`UpdateRequest::new` sets it to `None`).
+
+### New
+
+- Signed deltas, so a device can tell an update came from someone it trusts
+  before applying it. `keygen FILE.key` writes an ed25519 key and
+  `FILE.key.pub`; `diff --sign FILE.key`, `compile --delta-from OLD
+  --sign-delta FILE.key` and `sign FILE.delta --key FILE.key` sign a delta
+  in its footer, beside any other signatures; `apply --trusted-key KEY`
+  (repeatable, 64 hex digits or a `.pub` file) refuses a delta without a
+  valid signature by a trusted key before it writes anything, and checks the
+  signed bytes again as it applies them. Without `--trusted-key` an unsigned
+  delta applies as before, but one whose signature doesn't match never does.
+  Each signature signs the SHA-256 of everything before the footer,
+  manifest included, so it vouches for both archives' digests and every
+  operation. From Rust: `archive::{PublicKey, SecretKey, diff_with,
+  DiffOptions, apply_trusted, verify_delta, sign_delta}`.
+- Signed archives: `sign FILE --key FILE.key` on anything other than a
+  delta writes a detached signature file, `FILE.sig` (JSON, format
+  `osm-tile-compiler-signature` version 1), and `verify-signature FILE
+  [--trusted-key KEY]...` checks a delta's signatures or a file's `.sig`
+  (`archive::{sign_file, verify_file_signature}`).
+- `update --changed-tiles FILE` also writes the tiles the changes reach,
+  one `z/x/y` per line as osm2pgsql's expire lists are, at zooms 0 to 14 or
+  `--min-zoom`/`--max-zoom`: the boxes of every changed object before and
+  after, of ways whose node moved and of multipolygons and boundaries whose
+  member changed, widened by a tile (`CHANGED_TILE_BUFFER_PIXELS`) for
+  labels and cut to the extract's box. The boxes come from osm-pbf-ingest's
+  new `changes::changed_area`. `UpdateRequest::changed_tiles`
+  (`ChangedTilesRequest`) does the same from Rust, and the report's
+  `changed_tiles` says how many tiles at each zoom.
+- `diff --changed-tiles FILE` writes the tiles that differ between the two
+  archives (changed, added or removed), in the same format.
+
 ## 0.3.0 (2026-11-23)
 
 ### Breaking

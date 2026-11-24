@@ -380,6 +380,25 @@ Recompiling and diffing against the archive from before gave an 88 kB delta
 (240 tiles changed, 38 added). From Rust, the same is
 `update_extract`, built on `osm_pbf_ingest::changes`.
 
+`update --changed-tiles reach.txt` also writes which tiles the changes reach,
+one `z/x/y` per line at zooms 0 to 14 (`--min-zoom`, `--max-zoom`), the list
+osm2pgsql's expiry writes and Tilekiln and other renderers regenerate from. It
+covers the boxes of every changed object before and after, of every way whose
+node moved, and of every multipolygon or boundary whose member changed,
+widened by one tile for labels placed across a tile's edge. `diff
+--changed-tiles` writes the tiles that actually differ between two archives in
+the same format. For the 13 hours of planet diffs on Małopolskie above, the
+list held 7,936 tiles and covered all 278 tiles that recompiling changed; it
+took 1.2 s on top of the update. The list is wide on purpose: most edits (new
+address points, untagged nodes) change no tile, and two effects reach far from
+an edit. Labels are drawn up to a tile's width from their feature, and the
+profile orders a way's routes (`route_1`, `route_2`, ...) as Planetiler
+does, by an index over every route, boundary, river and building relation in
+the extract, so a change to any such relation can reorder the routes of ways
+anywhere. The list therefore also holds every way in two or more routes
+whenever such a relation changes. Without that rule and the label width, the
+list held 1,571 tiles but missed 93 of the 278.
+
 A recompile after an update can also skip the tiles the update left alone:
 
 ```sh
@@ -429,9 +448,31 @@ of OpenStreetMap edits gave a 63 kB delta: 245 of its 11,305 tiles changed and
 27 were added. `diff` took 1.4 s and `apply` 0.7 s on a 4-core cloud VM. Recompiling with
 `--languages en` instead, which changes half the tiles, gave a 5.8 MB delta.
 
+A delta can be signed, so a device applies only updates from someone it
+trusts, whichever way they arrive (a mesh, USB, a shared drive):
+
+```sh
+osm-tile-compiler keygen release.key                     # writes release.key and release.key.pub
+osm-tile-compiler diff old.pmtiles new.pmtiles --output update.delta --sign release.key
+osm-tile-compiler apply old.pmtiles update.delta --output new.pmtiles --trusted-key release.key.pub
+```
+
+`apply --trusted-key` (64 hex digits or a `.pub` file, repeatable) refuses a
+delta without a valid signature by a trusted key before it writes anything.
+Each signature is ed25519 over the SHA-256 of the whole delta before its
+signature footer, the manifest included, so it vouches for both archives'
+digests as well as every operation. `sign FILE.delta --key KEY` adds a
+signature to an existing delta, beside any others, and `verify-signature`
+checks one. Whole archives are signed the same way with a detached
+`<archive>.sig` file: `sign new.pmtiles --key release.key`, then
+`verify-signature new.pmtiles --trusted-key release.key.pub`. Without
+`--trusted-key`, an unsigned delta applies as before, but one whose signature
+does not match never does.
+
 The delta format is experimental: a delta applies only with a build that reads
 its version (`docs/formats.md`). From Rust, the same is
-`archive::{diff, apply, read_delta_manifest}`.
+`archive::{diff_with, apply_trusted, verify_delta, sign_delta, sign_file,
+verify_file_signature, read_delta_manifest}`.
 
 ## Using it as a library
 
