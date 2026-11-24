@@ -8,6 +8,9 @@ use std::fs::File;
 /// the archive is written.
 pub struct PmtilesArchiveWriter<'a> {
     writer: PmTilesStreamWriter<&'a File>,
+    /// Whether tiles are unzipped before they are stored.
+    unzip: bool,
+    unzipped: Vec<u8>,
 }
 
 impl<'a> PmtilesArchiveWriter<'a> {
@@ -16,11 +19,17 @@ impl<'a> PmtilesArchiveWriter<'a> {
         // The bytes arriving here are already gzip-compressed by the tile
         // encoder (`omt::store`). `precompressed` stores them verbatim
         // and declares `Compression::Gzip` in the header, which is a promise about the
-        // stored bytes rather than the writer's Mvt default.
+        // stored bytes rather than the writer's Mvt default. Uncompressed
+        // tiles are unzipped here and declared `Compression::None`.
+        let unzip = spec.tile_compression == super::TileCompression::None;
         // Bounds crossing the antimeridian are declared as every longitude.
         let bounds = spec.bounds.archive_bounds();
         let writer = PmTilesWriter::new(spec.tile_format.pmtiles())
-            .precompressed(Compression::Gzip)
+            .precompressed(if unzip {
+                Compression::None
+            } else {
+                Compression::Gzip
+            })
             .min_zoom(spec.min_zoom)
             .max_zoom(spec.max_zoom)
             .bounds(bounds.west, bounds.south, bounds.east, bounds.north)
@@ -29,7 +38,11 @@ impl<'a> PmtilesArchiveWriter<'a> {
             .metadata(spec.metadata_json)
             .create(file)
             .map_err(|error| format!("Failed to initialize PMTiles writer: {}", error))?;
-        Ok(Self { writer })
+        Ok(Self {
+            writer,
+            unzip,
+            unzipped: Vec::new(),
+        })
     }
 }
 
@@ -39,6 +52,16 @@ impl TileWriter for PmtilesArchiveWriter<'_> {
             TileId::new(tile_id)
                 .map_err(|error| format!("Invalid tile id {}: {}", tile_id, error))?,
         );
+        let bytes = if self.unzip {
+            use std::io::Read;
+            self.unzipped.clear();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_end(&mut self.unzipped)
+                .map_err(|error| format!("Tile {:?} is not gzip: {}", coord, error))?;
+            &self.unzipped[..]
+        } else {
+            bytes
+        };
         self.writer
             .add_tile(coord, bytes)
             .map_err(|error| format!("Failed to append tile {:?}: {}", coord, error))
@@ -88,6 +111,7 @@ mod tests {
                 min_zoom: 0,
                 max_zoom: 0,
                 tile_format: super::super::TileFormat::Mvt,
+                tile_compression: super::super::TileCompression::Gzip,
             };
             let mut archive = Box::new(PmtilesArchiveWriter::create(&file, &spec).unwrap());
             // tile_id 0 == z0/0/0.
@@ -117,5 +141,48 @@ mod tests {
             gzipped_tile.as_slice(),
             "stored tile bytes must be byte-identical to the gzipped bytes written"
         );
+    }
+
+    #[tokio::test]
+    async fn uncompressed_tiles_are_stored_unzipped() {
+        use pmtiles::AsyncPmTilesReader;
+
+        let dir = tempdir().unwrap();
+        let archive_path = dir.path().join("none.pmtiles");
+        let bounds = CompileBounds::new(50.1, 50.0, 20.1, 20.0);
+        let raw = b"an encoded tile";
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(0));
+        gzip.write_all(raw).unwrap();
+        {
+            let file = File::create(&archive_path).unwrap();
+            let spec = ArchiveSpec {
+                bounds: &bounds,
+                center: crate::ArchiveCenter {
+                    longitude: 0.0,
+                    latitude: 0.0,
+                    zoom: 0,
+                },
+                metadata_json: "{}",
+                min_zoom: 0,
+                max_zoom: 0,
+                tile_format: super::super::TileFormat::Mlt,
+                tile_compression: super::super::TileCompression::None,
+            };
+            let mut archive = Box::new(PmtilesArchiveWriter::create(&file, &spec).unwrap());
+            archive.write_tile(0, &gzip.finish().unwrap()).unwrap();
+            assert!(archive.write_tile(1, b"not gzip").is_err());
+            archive.finalize().unwrap();
+        }
+        let reader = AsyncPmTilesReader::new_with_path(&archive_path)
+            .await
+            .unwrap();
+        assert_eq!(reader.get_header().tile_compression, Compression::None);
+        assert_eq!(reader.get_header().tile_type, pmtiles::TileType::Mlt);
+        let stored = reader
+            .get_tile(TileId::new(0).unwrap())
+            .await
+            .unwrap()
+            .expect("tile 0 should exist");
+        assert_eq!(stored.as_ref(), raw);
     }
 }

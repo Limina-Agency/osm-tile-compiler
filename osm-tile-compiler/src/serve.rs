@@ -1276,6 +1276,7 @@ mod tests {
             min_zoom: 8,
             max_zoom: 8,
             tile_format: crate::TileFormat::Mvt,
+            tile_compression: crate::TileCompression::Gzip,
         };
         let file = File::create(dir.join("test.pmtiles")).unwrap();
         let mut writers: Vec<Box<dyn TileWriter + '_>> = vec![

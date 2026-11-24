@@ -132,7 +132,7 @@ pub use omt::{
     MergeCacheStats, OMT_SCHEMA_VERSION, OsmDataInfo, PROFILE_REVISION as OMT_PROFILE_REVISION,
     SAR_LAYER, SAR_SCHEMA_VERSION, merge_cache_path,
 };
-pub use output::{OutputFormat, TileFormat};
+pub use output::{OutputFormat, TileCompression, TileFormat};
 pub use request::{Area, AreaPolygon, LayerName, LayerSelection, ReadScope, ZoomRange};
 pub use search::{
     SEARCH_INDEX_FORMAT, SEARCH_INDEX_VERSION, SearchHit, SearchIndex, SearchIndexReport,

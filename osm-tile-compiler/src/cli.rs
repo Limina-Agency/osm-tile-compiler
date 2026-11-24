@@ -216,6 +216,11 @@ Compile options:
   --tile-format <F>     mvt, or mlt for MapLibre Tiles (experimental: MapLibre
                         GL JS 5.12+, Android 12.1+, iOS 6.2+ read them, given
                         encoding mlt on the source) [default: mvt]
+  --tile-compression <C>
+                        gzip, or none to store each tile as encoded, for
+                        servers that refuse compressed MLT, such as Martin
+                        2.0 (PMTiles only; not with --merge-cache or
+                        --reuse-from) [default: gzip]
   --layers <A,B,...>    Write only these layers [default: all]; each is the
                         same as in a full build. Naming sar writes it, as
                         --sar does
@@ -923,6 +928,13 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 let id = value(&mut args, &flag)?.to_string_lossy().into_owned();
                 archive.tile_format = osm_tile_compiler::TileFormat::from_id(&id)
                     .ok_or_else(|| format!("--tile-format must be mvt or mlt, got '{id}'"))?;
+            }
+            "--tile-compression" => {
+                let id = value(&mut args, &flag)?.to_string_lossy().into_owned();
+                archive.tile_compression = osm_tile_compiler::TileCompression::from_id(&id)
+                    .ok_or_else(|| {
+                        format!("--tile-compression must be gzip or none, got '{id}'")
+                    })?;
             }
             "--center" => {
                 let mut values = [0.0_f64; 3];

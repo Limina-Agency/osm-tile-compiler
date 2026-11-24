@@ -60,6 +60,38 @@ impl OutputFormat {
     }
 }
 
+/// How each tile is compressed in a PMTiles archive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum TileCompression {
+    /// gzip, the default, which every PMTiles reader takes.
+    #[default]
+    Gzip,
+    /// Stored as encoded, with the header's tile compression `none`.
+    /// Tile servers that refuse compressed MapLibre Tiles, such as Martin
+    /// 2.0.0-beta.7, serve these; a server can still gzip them on the way.
+    None,
+}
+
+impl TileCompression {
+    pub const ALL: [Self; 2] = [Self::Gzip, Self::None];
+
+    /// The identifier the command line takes: `gzip` or `none`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::None => "none",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|compression| compression.id() == id)
+    }
+}
+
 /// The encoding of the tiles in an archive.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -132,6 +164,8 @@ pub(crate) struct ArchiveSpec<'a> {
     pub min_zoom: u8,
     pub max_zoom: u8,
     pub tile_format: TileFormat,
+    /// How the writer stores the tiles it is handed gzipped.
+    pub tile_compression: TileCompression,
 }
 
 /// Takes gzip-compressed tiles in ascending tile id order (the PMTiles
