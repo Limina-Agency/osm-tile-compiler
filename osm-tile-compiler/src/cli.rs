@@ -38,7 +38,7 @@ Usage:
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
-  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
+  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar] [--tile-format <F>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
@@ -57,7 +57,7 @@ Usage:
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
-  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
+  osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar] [--tile-format <F>]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
   osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
@@ -149,6 +149,9 @@ Compile options:
   --attribution <HTML>  Attribution viewers show; must keep crediting
                         OpenMapTiles and OpenStreetMap [default: both]
   --gzip-level <N>      Tile compression, 0 (none) to 9 (smallest) [default: 6]
+  --tile-format <F>     mvt, or mlt for MapLibre Tiles (experimental: MapLibre
+                        GL JS 5.12+, Android 12.1+, iOS 6.2+ read them, given
+                        encoding mlt on the source) [default: mvt]
   --layers <A,B,...>    Write only these layers [default: all]; each is the
                         same as in a full build. Naming sar writes it, as
                         --sar does
@@ -249,6 +252,8 @@ Style options:
                         (MapLibre Native: file://, asset:// or https://)
   --sar                 Also draw the 'sar' layer, above the basemap, for an
                         archive compiled with --sar
+  --tile-format <F>     The archive's tiles: mvt, or mlt to set encoding mlt
+                        on the source [default: mvt]
 
 Layers: {LAYERS}; and sar, only when asked for
 Languages: {LANGUAGES}
@@ -387,6 +392,7 @@ struct StyleArgs {
     languages: Option<Vec<String>>,
     base_url: Option<String>,
     sar: bool,
+    tile_format: osm_tile_compiler::TileFormat,
 }
 
 #[derive(Debug)]
@@ -647,6 +653,11 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                         archive.gzip_level
                     ));
                 }
+            }
+            "--tile-format" => {
+                let id = value(&mut args, &flag)?.to_string_lossy().into_owned();
+                archive.tile_format = osm_tile_compiler::TileFormat::from_id(&id)
+                    .ok_or_else(|| format!("--tile-format must be mvt or mlt, got '{id}'"))?;
             }
             "--center" => {
                 let mut values = [0.0_f64; 3];
@@ -1062,6 +1073,7 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
     let mut languages = None;
     let mut base_url = None;
     let mut sar = false;
+    let mut tile_format = osm_tile_compiler::TileFormat::Mvt;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -1097,6 +1109,11 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
                 base_url = Some(value(&mut args, &flag)?.to_string_lossy().into_owned());
             }
             "--sar" => sar = true,
+            "--tile-format" => {
+                let id = value(&mut args, &flag)?.to_string_lossy().into_owned();
+                tile_format = osm_tile_compiler::TileFormat::from_id(&id)
+                    .ok_or_else(|| format!("--tile-format must be mvt or mlt, got '{id}'"))?;
+            }
             _ => return Err(format!("unknown style option '{flag}'")),
         }
     }
@@ -1120,6 +1137,7 @@ fn parse_style(args: &[OsString]) -> Result<Command, String> {
         languages,
         base_url,
         sar,
+        tile_format,
     }))
 }
 
@@ -1236,10 +1254,14 @@ fn style(args: StyleArgs) -> Result<(), String> {
             args.glyphs.as_deref(),
             args.sprite.as_deref(),
         );
-        if args.sar {
-            print!("{}", with_sar_layers(&style));
+        let style = if args.sar {
+            with_sar_layers(&style)
         } else {
-            print!("{style}");
+            style
+        };
+        match args.tile_format {
+            osm_tile_compiler::TileFormat::Mvt => print!("{style}"),
+            format => print!("{}", osm_tile_compiler::with_tile_format(&style, format)),
         }
         return Ok(());
     };
@@ -1271,6 +1293,7 @@ fn style(args: StyleArgs) -> Result<(), String> {
     request.languages = args.languages;
     request.base_url = args.base_url;
     request.sar = args.sar;
+    request.tile_format = args.tile_format;
     if let Some(glyphs) = args.glyphs {
         request.glyphs = glyphs;
     }

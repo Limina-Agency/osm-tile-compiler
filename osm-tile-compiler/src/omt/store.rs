@@ -10,7 +10,7 @@ use super::render::Record;
 use super::spill::{RunReader, RunWriter};
 use crate::control::Control;
 use crate::{
-    ArchiveCenter, CompileBounds,
+    ArchiveCenter, CompileBounds, TileFormat,
     archive::ArchiveOptions,
     output::{ArchiveSpec, ArchiveTarget},
     tile_geometry::{TileGeometry, TilePoint, TileRingGroup},
@@ -1040,6 +1040,7 @@ impl Store {
             metadata_json: &metadata,
             min_zoom: minzoom,
             max_zoom: maxzoom,
+            tile_format: options.tile_format,
         })?;
         let mut writing = crate::profiling::Accumulator::new("omt_archive_write");
         let mut stats = TileStatsBuilder::new(TILE_WARNING_BYTES);
@@ -1078,6 +1079,7 @@ impl Store {
                             counters,
                             timings,
                             options.gzip_level,
+                            options.tile_format,
                             control,
                         )
                     })
@@ -1691,7 +1693,7 @@ fn metadata(
         "name": options.name,
         "version": super::OMT_SCHEMA_VERSION,
         "type": "baselayer",
-        "format": "pbf",
+        "format": options.tile_format.metadata_format(),
         "minzoom": min,
         "maxzoom": max,
         "description": options.description,
@@ -1730,6 +1732,7 @@ struct EncodeTimings {
     protobuf_gzip: crate::profiling::Accumulator,
     hash: crate::profiling::Accumulator,
     reuse: crate::profiling::Accumulator,
+    mlt: crate::profiling::Accumulator,
 }
 impl EncodeTimings {
     fn new() -> Self {
@@ -1741,6 +1744,7 @@ impl EncodeTimings {
             protobuf_gzip: crate::profiling::Accumulator::new("omt_protobuf_gzip"),
             hash: crate::profiling::Accumulator::new("omt_merge_cache_hash"),
             reuse: crate::profiling::Accumulator::new("omt_merge_cache_read"),
+            mlt: crate::profiling::Accumulator::new("omt_mlt_transcode"),
         }
     }
 }
@@ -1756,6 +1760,7 @@ fn encode_layer_records(
     name: &str,
     mut records: Vec<Record>,
     timings: &mut EncodeTimings,
+    tile_format: TileFormat,
     control: &Control,
 ) -> Result<Option<Vec<u8>>, String> {
     control.check()?;
@@ -1771,7 +1776,19 @@ fn encode_layer_records(
     if layer.num_features() == 0 {
         return Ok(None);
     }
-    Ok(Some(timings.protobuf_gzip.measure(|| layer.encode())))
+    let mvt = timings.protobuf_gzip.measure(|| layer.encode());
+    match tile_format {
+        TileFormat::Mvt => Ok(Some(mvt)),
+        // The MVT layer is transcoded, so that both formats hold the same
+        // features down to the coordinate.
+        TileFormat::Mlt => {
+            let mlt = timings
+                .mlt
+                .measure(|| crate::mlt::from_mvt(&mvt))
+                .map_err(|e| format!("Failed to encode layer {name} as MLT: {e}"))?;
+            Ok((!mlt.is_empty()).then_some(mlt))
+        }
+    }
 }
 
 /// Gzips a tile's layers; `None` when it has none.
@@ -1804,6 +1821,7 @@ fn encode_job(
     counters: Option<&merge_cache::Counters>,
     timings: &mut EncodeTimings,
     gzip_level: u32,
+    tile_format: TileFormat,
     control: &Control,
 ) -> Result<(Option<EncodedTile>, Option<TileEntry>), String> {
     let id = job.id;
@@ -1917,7 +1935,7 @@ fn encode_job(
                         .map(EncodedRecord::decode)
                         .collect::<Result<Vec<_>, _>>()
                 })?;
-                encode_layer_records(name, records, timings, control)?
+                encode_layer_records(name, records, timings, tile_format, control)?
             }
         };
         let size = bytes.as_ref().map_or(0, Vec::len);

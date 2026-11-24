@@ -67,6 +67,8 @@ pub struct ArchiveOptions {
     pub attribution: String,
     /// The gzip level of the tiles, 0 (stored) to 9 (smallest, slowest).
     pub gzip_level: u32,
+    /// How the tiles are encoded: MVT, or (experimental) MLT.
+    pub tile_format: crate::TileFormat,
 }
 
 impl Default for ArchiveOptions {
@@ -76,6 +78,7 @@ impl Default for ArchiveOptions {
             description: "Native Rust OpenMapTiles profile".into(),
             attribution: DEFAULT_ATTRIBUTION.into(),
             gzip_level: 6,
+            tile_format: crate::TileFormat::Mvt,
         }
     }
 }

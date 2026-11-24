@@ -475,6 +475,7 @@ pub(crate) fn compile(
         &request.merge_cache,
         &request.temp_dir,
         request.archive.gzip_level,
+        request.archive.tile_format,
         &mut warnings,
     )?;
     let omitted = |dataset| request.omit_sources.contains(&dataset);

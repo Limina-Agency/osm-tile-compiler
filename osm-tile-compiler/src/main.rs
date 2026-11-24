@@ -80,6 +80,9 @@ struct CompilerProcessRequest {
     /// [default: no].
     #[serde(default)]
     sar: bool,
+    /// The tiles' encoding, `mvt` or (experimental) `mlt` [default: mvt].
+    #[serde(default)]
+    tile_format: osm_tile_compiler::TileFormat,
 }
 
 fn emit(event: serde_json::Value) -> Result<(), String> {
@@ -217,6 +220,7 @@ fn run() -> Result<(), WorkerError> {
     compile.languages = request.languages;
     compile.building_levels = request.building_levels;
     compile.sar = request.sar;
+    compile.archive.tile_format = request.tile_format;
     // Each stage is reported once, as before; downloads also with their
     // fraction.
     let mut last = None;

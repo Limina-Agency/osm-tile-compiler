@@ -77,6 +77,7 @@ pub(crate) fn tile_type_name(code: u8) -> &'static str {
         3 => "jpeg",
         4 => "webp",
         5 => "avif",
+        6 => "mlt",
         _ => "unknown",
     }
 }

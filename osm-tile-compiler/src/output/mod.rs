@@ -7,6 +7,7 @@ mod pmtiles;
 
 pub(crate) use self::pmtiles::PmtilesArchiveWriter;
 use crate::{ArchiveCenter, CompileBounds};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,6 +58,69 @@ impl OutputFormat {
     }
 }
 
+/// The encoding of the tiles in an archive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum TileFormat {
+    /// Mapbox Vector Tiles 2.1, the default, which every viewer reads.
+    #[default]
+    Mvt,
+    /// MapLibre Tiles (MLT) v1, which MapLibre GL JS 5.12, MapLibre
+    /// Android 12.1 and MapLibre iOS 6.2 read, given `"encoding": "mlt"` on
+    /// the source. The tiles hold the same features as the MVT ones;
+    /// experimental.
+    Mlt,
+}
+
+impl TileFormat {
+    pub const ALL: [Self; 2] = [Self::Mvt, Self::Mlt];
+
+    /// The identifier the command line takes: `mvt` or `mlt`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Mvt => "mvt",
+            Self::Mlt => "mlt",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|format| format.id() == id)
+    }
+
+    /// The format's name in messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mvt => "MVT",
+            Self::Mlt => "MLT",
+        }
+    }
+
+    /// The PMTiles header's tile type.
+    pub(crate) fn pmtiles(self) -> ::pmtiles::TileType {
+        match self {
+            Self::Mvt => ::pmtiles::TileType::Mvt,
+            Self::Mlt => ::pmtiles::TileType::Mlt,
+        }
+    }
+
+    /// The PMTiles header's tile type byte.
+    pub(crate) fn pmtiles_code(self) -> u8 {
+        match self {
+            Self::Mvt => 1,
+            Self::Mlt => 6,
+        }
+    }
+
+    /// The metadata's `format`, as MBTiles and TileJSON name it.
+    pub(crate) fn metadata_format(self) -> &'static str {
+        match self {
+            Self::Mvt => "pbf",
+            Self::Mlt => "mlt",
+        }
+    }
+}
+
 /// What an archive declares besides its tiles.
 pub(crate) struct ArchiveSpec<'a> {
     pub bounds: &'a CompileBounds,
@@ -65,9 +129,10 @@ pub(crate) struct ArchiveSpec<'a> {
     pub metadata_json: &'a str,
     pub min_zoom: u8,
     pub max_zoom: u8,
+    pub tile_format: TileFormat,
 }
 
-/// Takes gzip-compressed MVT tiles in ascending tile id order (the PMTiles
+/// Takes gzip-compressed tiles in ascending tile id order (the PMTiles
 /// Hilbert id), each id at most once.
 pub(crate) trait TileWriter: Send {
     fn write_tile(&mut self, tile_id: u64, bytes: &[u8]) -> Result<(), String>;

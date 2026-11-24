@@ -1,0 +1,138 @@
+//! End-to-end test of `--tile-format mlt`: Monaco compiled to MLT holds, tile
+//! for tile and feature for feature, what Monaco compiled to MVT does, and
+//! the archive declares MLT.
+
+use osm_tile_compiler::archive::{ArchiveReader, inspect};
+use osm_tile_compiler::{Area, BasemapRequest, CompileBounds, TileFormat, compile_basemap};
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+mod common;
+#[allow(dead_code)]
+#[path = "../src/mlt/decode.rs"]
+mod decode;
+
+use common::{monaco_pbf, synthetic_sources};
+
+fn pbf_bounds(path: &Path) -> CompileBounds {
+    let index = osm_pbf_ingest::blob_index::PbfBlobIndex::scan(path).unwrap();
+    let b = index.header().bounds.unwrap();
+    CompileBounds::new(b.north, b.south, b.east, b.west)
+}
+
+fn compile(dir: &Path, sources: &Path, format: TileFormat, file: &str) -> PathBuf {
+    let output = dir.join(file);
+    let mut request = BasemapRequest::new(monaco_pbf(), &output, sources, dir.join("temp"));
+    request.area = Area::bounds(pbf_bounds(&monaco_pbf()));
+    request.threads = 2;
+    request.archive.tile_format = format;
+    compile_basemap(&request, |_| {}, || false).unwrap();
+    output
+}
+
+/// Every tile of the archive, by tile id, gunzipped.
+fn tiles(path: &Path) -> (u8, BTreeMap<u64, Vec<u8>>) {
+    let mut reader = ArchiveReader::open(path).unwrap();
+    let tile_type = reader.header.tile_type;
+    let mut tiles = BTreeMap::new();
+    reader
+        .visit_entries(|reader, entry| {
+            let stored = reader.tile(&entry)?;
+            let mut tile = Vec::new();
+            flate2::read::GzDecoder::new(&stored[..])
+                .read_to_end(&mut tile)
+                .map_err(|e| e.to_string())?;
+            for i in 0..u64::from(entry.run_length) {
+                tiles.insert(entry.tile_id + i, tile.clone());
+            }
+            Ok(())
+        })
+        .unwrap();
+    (tile_type, tiles)
+}
+
+#[test]
+fn monaco_in_mlt_holds_the_mvt_features() {
+    let temp = tempfile::tempdir().unwrap();
+    let sources = temp.path().join("sources");
+    synthetic_sources(&sources);
+    let mvt = compile(temp.path(), &sources, TileFormat::Mvt, "monaco.pmtiles");
+    let mlt = compile(temp.path(), &sources, TileFormat::Mlt, "monaco-mlt.pmtiles");
+
+    let (mvt_type, mvt_tiles) = tiles(&mvt);
+    let (mlt_type, mlt_tiles) = tiles(&mlt);
+    assert_eq!((mvt_type, mlt_type), (1, 6));
+    assert_eq!(
+        mvt_tiles.keys().collect::<Vec<_>>(),
+        mlt_tiles.keys().collect::<Vec<_>>()
+    );
+    let mut features = 0;
+    for (id, mvt) in &mvt_tiles {
+        let mlt = &mlt_tiles[id];
+        decode::same_as_mvt(mlt, mvt).unwrap_or_else(|e| panic!("tile {id}: {e}"));
+        features += decode::decode(mlt)
+            .unwrap()
+            .iter()
+            .map(|layer| layer.features.len())
+            .sum::<usize>();
+    }
+    assert!(features > 5_000, "{features} features");
+    let (mvt_bytes, mlt_bytes) = (
+        std::fs::metadata(&mvt).unwrap().len(),
+        std::fs::metadata(&mlt).unwrap().len(),
+    );
+    eprintln!("Monaco: MVT {mvt_bytes} bytes, MLT {mlt_bytes} bytes, {features} features");
+
+    // verify decodes every MLT tile, and finds the layers the metadata lists.
+    let report = inspect(&mlt).unwrap();
+    assert_eq!(report.problems, Vec::<String>::new());
+    assert_eq!(report.tile_type, "mlt");
+    assert_eq!(report.metadata["format"], "mlt");
+    let mvt_report = inspect(&mvt).unwrap();
+    // Each zoom has the same layers in the same number of tiles.
+    let layers = |report: &osm_tile_compiler::archive::ArchiveReport| {
+        report
+            .tile_stats
+            .zooms
+            .iter()
+            .map(|zoom| {
+                let tiles = zoom
+                    .layers
+                    .iter()
+                    .map(|(name, layer)| (name.clone(), layer.tiles));
+                (zoom.zoom, zoom.tiles, tiles.collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(layers(&report), layers(&mvt_report));
+}
+
+#[test]
+fn mlt_mbtiles_declare_their_format() {
+    let temp = tempfile::tempdir().unwrap();
+    let sources = temp.path().join("sources");
+    synthetic_sources(&sources);
+    let output = compile(temp.path(), &sources, TileFormat::Mlt, "monaco.mbtiles");
+    let db = rusqlite::Connection::open(&output).unwrap();
+    let format: String = db
+        .query_row(
+            "SELECT value FROM metadata WHERE name = 'format'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(format, "mlt");
+    let tile: Vec<u8> = db
+        .query_row(
+            "SELECT tile_data FROM tiles WHERE zoom_level = 14 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut raw = Vec::new();
+    flate2::read::GzDecoder::new(&tile[..])
+        .read_to_end(&mut raw)
+        .unwrap();
+    assert!(!decode::decode(&raw).unwrap().is_empty());
+}
