@@ -231,6 +231,37 @@ fn usage_errors_exit_with_2() {
             "unknown apply option '--frob'",
         ),
         (
+            &["apply", "a", "b", "-o", "c", "--trusted-key", "abc"],
+            "--trusted-key: abc is neither a public key nor a readable file",
+        ),
+        (
+            &["apply", "a", "b", "-o", "c", "--sign", "k"],
+            "unknown apply option '--sign'",
+        ),
+        (&["keygen"], "keygen needs a key file"),
+        (&["sign", "a"], "sign needs --key"),
+        (
+            &["verify-signature", "a", "--key", "k"],
+            "unknown verify-signature option '--key'",
+        ),
+        (
+            &["update", "a.pbf", "c.osc", "-o", "b", "--max-zoom", "3"],
+            "--min-zoom and --max-zoom choose the zooms of --changed-tiles",
+        ),
+        (
+            &[
+                "compile",
+                "in.pbf",
+                "--output",
+                "out.pmtiles",
+                "--sources",
+                "s",
+                "--sign-delta",
+                "k",
+            ],
+            "--sign-delta signs the --delta-from delta",
+        ),
+        (
             &["compile", "in.pbf", "--gzip-level", "10"],
             "--gzip-level must be 0-9",
         ),
@@ -811,6 +842,90 @@ fn diff_and_apply_rebuild_a_compiled_archive() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(text(&output.stderr).contains("is not the archive this delta applies to"));
     assert!(!wrong.exists());
+
+    // A key signs the delta; apply then trusts it, or refuses another key.
+    let key = path("release.key");
+    let output = run(["keygen".as_ref(), key.as_os_str()]);
+    assert!(output.status.success(), "{output:?}");
+    let public = text(&output.stdout).trim().to_string();
+    assert_eq!(public.len(), 64);
+    let public_file = path("release.key.pub");
+    assert_eq!(
+        std::fs::read_to_string(&public_file).unwrap().trim(),
+        public
+    );
+    let output = run([
+        "sign".as_ref(),
+        delta.as_os_str(),
+        "--key".as_ref(),
+        key.as_os_str(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let trusted = path("trusted.pmtiles");
+    let output = run([
+        "apply".as_ref(),
+        old.as_os_str(),
+        delta.as_os_str(),
+        "-o".as_ref(),
+        trusted.as_os_str(),
+        "--trusted-key".as_ref(),
+        public_file.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["trusted"], true);
+    assert_eq!(report["signed_by"][0], public.as_str());
+    let stranger = path("stranger.key");
+    assert!(
+        run(["keygen".as_ref(), stranger.as_os_str()])
+            .status
+            .success()
+    );
+    let refused = path("refused.pmtiles");
+    let output = run([
+        "apply".as_ref(),
+        old.as_os_str(),
+        delta.as_os_str(),
+        "-o".as_ref(),
+        refused.as_os_str(),
+        "--trusted-key".as_ref(),
+        path("stranger.key.pub").as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(text(&output.stderr).contains("not trusted"), "{output:?}");
+    assert!(!refused.exists());
+    let output = run([
+        "verify-signature".as_ref(),
+        delta.as_os_str(),
+        "--trusted-key".as_ref(),
+        public.as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+
+    // An archive gets a detached signature beside it.
+    let output = run([
+        "sign".as_ref(),
+        new.as_os_str(),
+        "--key".as_ref(),
+        key.as_os_str(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(path("new.pmtiles.sig").exists());
+    let output = run([
+        "verify-signature".as_ref(),
+        new.as_os_str(),
+        "--trusted-key".as_ref(),
+        public.as_ref(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let output = run([
+        "verify-signature".as_ref(),
+        old.as_os_str(),
+        "--signature".as_ref(),
+        path("new.pmtiles.sig").as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
 }
 
 /// Serves one file on 127.0.0.1 as a static file server or object store
