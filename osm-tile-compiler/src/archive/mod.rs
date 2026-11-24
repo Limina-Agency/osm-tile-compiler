@@ -9,6 +9,7 @@ use std::path::Path;
 mod check;
 mod delta;
 mod extract;
+mod http;
 mod reader;
 mod tile_patch;
 
@@ -19,7 +20,7 @@ pub use delta::partial_path;
 pub use delta::{
     ApplyReport, ArchiveDigest, DELTA_FORMAT, DELTA_VERSION, DeltaManifest, DiffReport, TileChanges,
 };
-pub use extract::{ExtractReport, ExtractRequest, extract};
+pub use extract::{ExtractReport, ExtractRequest, extract, is_remote_source};
 #[doc(hidden)]
 pub use reader::{ArchiveReader, Entry, Header};
 

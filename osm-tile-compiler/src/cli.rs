@@ -41,7 +41,7 @@ Usage:
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
-  osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
+  osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
@@ -60,7 +60,7 @@ Usage:
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
-  osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
+  osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
   osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
   osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
@@ -86,7 +86,9 @@ Commands:
                    encoding; exits with 1 if anything is wrong
   extract          Cut an area out of a PMTiles archive into a new one: the
                    tiles within a box, a polygon and zooms, copied byte for
-                   byte
+                   byte. The archive may be an http:// or https:// URL; it
+                   is read by range requests, so only the parts the area
+                   needs are downloaded
   diff             Experimental: write a delta that turns OLD.pmtiles into
                    NEW.pmtiles, carrying only the parts OLD doesn't hold
   apply            Experimental: rebuild NEW.pmtiles from OLD.pmtiles and a
@@ -191,7 +193,8 @@ Extract options:
   --json                Print the extract report as JSON on stdout
   The tiles kept are those a compile limited to the same box or polygon
   writes. Tiles are not cut: features in kept tiles keep their full
-  geometry, as in the source.
+  geometry, as in the source. A URL's server must answer range requests,
+  as any server PMTiles viewers read from does.
 
 Diff and apply options:
   --output <FILE>       File to write; must not exist yet
@@ -1923,7 +1926,15 @@ fn verify(path: &Path, json: bool) -> Result<(), String> {
 
 fn extract(args: ExtractArgs) -> Result<(), String> {
     let _cooperating = interrupt::cooperate();
-    let mut request = archive::ExtractRequest::new(&args.input, &args.output);
+    let url = args
+        .input
+        .to_str()
+        .filter(|text| archive::is_remote_source(text))
+        .map(str::to_owned);
+    let mut request = match &url {
+        Some(url) => archive::ExtractRequest::remote(url, &args.output),
+        None => archive::ExtractRequest::new(&args.input, &args.output),
+    };
     request.bounds = args.bounds;
     if let Some(polygon) = &args.polygon {
         request.polygon = Some(osm_tile_compiler::CompileArea::read(polygon)?);
@@ -1939,6 +1950,11 @@ fn extract(args: ExtractArgs) -> Result<(), String> {
         })?);
     }
     let started = Instant::now();
+    if let Some(url) = &url
+        && !args.json
+    {
+        eprintln!("Reading {url} by range requests");
+    }
     let report = archive::extract(&request, interrupt::requested)?;
     if args.json {
         println!(
@@ -1957,6 +1973,13 @@ fn extract(args: ExtractArgs) -> Result<(), String> {
             report.zooms[1],
             started.elapsed().as_secs_f64()
         );
+        if url.is_some() {
+            eprintln!(
+                "Downloaded {} in {} range requests",
+                megabytes(report.bytes_read),
+                report.requests
+            );
+        }
     }
     Ok(())
 }
