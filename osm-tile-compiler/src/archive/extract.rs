@@ -6,6 +6,11 @@
 //! this compiler or another writer. The tiles kept are the ones a compile
 //! limited to the same box or polygon writes: those whose square meets the
 //! box, and, with a polygon, those whose square meets the polygon.
+//!
+//! The source may also be an `http://` or `https://` URL of an archive on a
+//! server that answers range requests. Then only the header, the root
+//! directory, the leaf directories that may address kept tiles and the kept
+//! tiles themselves are requested, nearby tiles together in one range.
 use super::reader::{ArchiveReader, Entry};
 use crate::compile_area::TileCoverage;
 use crate::compile_bounds::ArchiveCenter;
@@ -21,13 +26,26 @@ use std::path::PathBuf;
 const MAX_LATITUDE: f64 = 85.051_128_779_806_59;
 /// How many directory entries pass between checks of the cancel callback.
 const CANCEL_CHECK_ENTRIES: u64 = 4096;
+/// Kept tiles are read in batches of at most this many tiles...
+const BATCH_TILES: usize = 65_536;
+/// ...or this many stored bytes.
+const BATCH_BYTES: u64 = 64 << 20;
+/// Over HTTP, tiles this close in the data section are read in one range,
+/// along with the bytes between them...
+const HTTP_GAP_BYTES: u64 = 256 << 10;
+/// ...up to ranges this long.
+const HTTP_RANGE_BYTES: u64 = 8 << 20;
 
 /// What [`extract`] cuts out, and where it writes it.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ExtractRequest {
-    /// The PMTiles archive to read.
+    /// The PMTiles archive to read, unless [`source_url`](Self::source_url)
+    /// is set.
     pub source: PathBuf,
+    /// The `http://` or `https://` URL of the archive to read instead of
+    /// [`source`](Self::source). The server must answer range requests.
+    pub source_url: Option<String>,
     /// The PMTiles archive to write; it must not exist yet.
     pub output: PathBuf,
     /// Keep only the tiles that meet this box [default: the source's bounds].
@@ -45,12 +63,27 @@ impl ExtractRequest {
     pub fn new(source: impl Into<PathBuf>, output: impl Into<PathBuf>) -> Self {
         Self {
             source: source.into(),
+            source_url: None,
             output: output.into(),
             bounds: None,
             polygon: None,
             zoom: None,
         }
     }
+
+    /// Copies every tile of the archive at `url`, read by HTTP range
+    /// requests, into `output`.
+    pub fn remote(url: impl Into<String>, output: impl Into<PathBuf>) -> Self {
+        let mut request = Self::new(PathBuf::new(), output);
+        request.source_url = Some(url.into());
+        request
+    }
+}
+
+/// Whether `text` is a URL [`ExtractRequest::remote`] reads.
+pub fn is_remote_source(text: &str) -> bool {
+    let lower = text.get(..8).unwrap_or(text).to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 /// What [`extract`] wrote.
@@ -73,6 +106,11 @@ pub struct ExtractReport {
     pub bounds: [f64; 4],
     /// The output's center: longitude, latitude and zoom.
     pub center: (f64, f64, u8),
+    /// For a source read over HTTP, the range requests made; otherwise 0.
+    pub requests: u64,
+    /// For a source read over HTTP, the bytes those requests returned;
+    /// otherwise 0.
+    pub bytes_read: u64,
 }
 
 /// The rows and columns of tiles a box meets at one zoom.
@@ -104,6 +142,20 @@ impl ZoomWindow {
         }
     }
 
+    /// Whether any tile of the `2^k` by `2^k` square of this zoom's tiles
+    /// from column `x` and row `y` is in the window.
+    fn meets_square(&self, x: u32, y: u32, k: u8) -> bool {
+        let side = 1u64 << k;
+        let (x, y) = (u64::from(x), u64::from(y));
+        let (top, bottom) = (u64::from(self.rows.0), u64::from(self.rows.1));
+        y <= bottom
+            && top < y + side
+            && self
+                .columns
+                .iter()
+                .any(|&(first, last)| x <= u64::from(last) && u64::from(first) < x + side)
+    }
+
     fn contains(&self, x: u32, y: u32) -> bool {
         (self.rows.0..=self.rows.1).contains(&y)
             && self
@@ -133,6 +185,95 @@ impl Selection {
                 .as_ref()
                 .is_none_or(|coverage| coverage.contains(z, coord.x(), coord.y()))
     }
+
+    /// Whether any tile ID in `first..end` may be kept, judged by zoom and
+    /// box alone. Within a zoom, a run of tile IDs splits into aligned runs
+    /// of `4^k`, and the Hilbert curve fills each such run with one square
+    /// of `2^k` by `2^k` tiles: the children of one tile `k` zooms up.
+    fn may_keep(&self, first: u64, end: u64) -> bool {
+        (self.zoom.0..=self.zoom.1).any(|z| {
+            let base = zoom_base(z);
+            let count = 1u64 << (2 * u32::from(z));
+            let mut lo = first.max(base).saturating_sub(base);
+            let hi = end.min(base + count).saturating_sub(base);
+            let window = &self.windows[usize::from(z - self.zoom.0)];
+            while lo < hi {
+                let mut k = 0u8;
+                while k < z
+                    && lo.is_multiple_of(1u64 << (2 * (k + 1)))
+                    && lo + (1u64 << (2 * (k + 1))) <= hi
+                {
+                    k += 1;
+                }
+                let parent = TileCoord::from(
+                    TileId::new(zoom_base(z - k) + (lo >> (2 * k))).expect("a valid tile ID"),
+                );
+                let (x, y) = (parent.x() << k, parent.y() << k);
+                if window.meets_square(x, y, k) {
+                    return true;
+                }
+                lo += 1u64 << (2 * k);
+            }
+            false
+        })
+    }
+}
+
+/// The first tile ID of zoom `z`: the tiles of all lower zooms.
+fn zoom_base(z: u8) -> u64 {
+    ((1u64 << (2 * u32::from(z))) - 1) / 3
+}
+
+/// Stored tile bytes of one batch, by their offset in the data section.
+type Contents = std::collections::HashMap<u64, Vec<u8>>;
+
+/// Reads the stored bytes of `entries` (offset, length), each distinct
+/// offset once. Over HTTP, nearby tiles share one range request.
+fn read_contents(reader: &mut ArchiveReader, entries: &[Entry]) -> Result<Contents, String> {
+    let mut tiles: Vec<(u64, u32)> = entries.iter().map(|e| (e.offset, e.length)).collect();
+    tiles.sort_unstable();
+    tiles.dedup_by_key(|tile| tile.0);
+    let data_offset = reader.header.data_offset;
+    let data_length = reader.header.data_length;
+    for &(offset, length) in &tiles {
+        if offset
+            .checked_add(u64::from(length))
+            .is_none_or(|end| end > data_length)
+        {
+            return Err(format!("a tile at {offset} lies beyond the data section"));
+        }
+    }
+    let (gap, longest) = if reader.is_remote() {
+        (HTTP_GAP_BYTES, HTTP_RANGE_BYTES)
+    } else {
+        (0, 0)
+    };
+    // Spans of the data section: (start, end, the tiles in it).
+    let mut spans: Vec<(u64, u64, std::ops::Range<usize>)> = Vec::new();
+    for (i, &(offset, length)) in tiles.iter().enumerate() {
+        let end = offset + u64::from(length);
+        match spans.last_mut() {
+            Some((start, span_end, members))
+                if offset <= span_end.saturating_add(gap) && end - *start <= longest.max(1) =>
+            {
+                *span_end = (*span_end).max(end);
+                members.end = i + 1;
+            }
+            _ => spans.push((offset, end, i..i + 1)),
+        }
+    }
+    let ranges: Vec<(u64, u64)> = spans
+        .iter()
+        .map(|(start, end, _)| (data_offset + start, end - start))
+        .collect();
+    let mut contents = Contents::with_capacity(tiles.len());
+    for ((start, _, members), bytes) in spans.into_iter().zip(reader.read_many(&ranges)?) {
+        for &(offset, length) in &tiles[members] {
+            let at = (offset - start) as usize;
+            contents.insert(offset, bytes[at..at + length as usize].to_vec());
+        }
+    }
+    Ok(contents)
 }
 
 /// The bounds a header declares, or the whole world where they are empty, as
@@ -252,9 +393,19 @@ pub fn extract(
             request.output.display()
         )));
     }
-    let mut reader = ArchiveReader::open(&request.source).map_err(invalid)?;
+    let (mut reader, source) = match &request.source_url {
+        Some(url) => {
+            if !is_remote_source(url) {
+                return Err(invalid(format!("{url} is not an http:// or https:// URL")));
+            }
+            (ArchiveReader::open_url(url).map_err(invalid)?, url.clone())
+        }
+        None => (
+            ArchiveReader::open(&request.source).map_err(invalid)?,
+            request.source.display().to_string(),
+        ),
+    };
     let header = reader.header.clone();
-    let source = request.source.display();
     if header.min_zoom > header.max_zoom {
         return Err(invalid(format!(
             "{source} declares zooms {} to {}",
@@ -363,27 +514,18 @@ pub fn extract(
     let (mut tiles, mut source_tiles, mut tile_bytes, mut visited) = (0u64, 0u64, 0u64, 0u64);
     let mut contents = std::collections::HashSet::new();
     let mut cancelled = false;
-    reader
-        .visit_entries(|reader, entry: Entry| {
-            visited += 1;
-            if visited.is_multiple_of(CANCEL_CHECK_ENTRIES) && should_cancel() {
-                cancelled = true;
-                return Err("cancelled".into());
+    // Kept tiles wait here, in tile ID order, until a batch is read.
+    let mut pending: Vec<(TileCoord, Entry)> = Vec::new();
+    let mut pending_bytes = 0u64;
+    let mut flush =
+        |reader: &mut ArchiveReader, pending: &mut Vec<(TileCoord, Entry)>| -> Result<(), String> {
+            if pending.is_empty() {
+                return Ok(());
             }
-            source_tiles += u64::from(entry.run_length);
-            let mut stored: Option<Vec<u8>> = None;
-            for i in 0..u64::from(entry.run_length) {
-                let tile_id = entry.tile_id + i;
-                let coord = TileCoord::from(
-                    TileId::new(tile_id).map_err(|e| format!("tile ID {tile_id}: {e}"))?,
-                );
-                if !selection.keeps(coord) {
-                    continue;
-                }
-                if stored.is_none() {
-                    stored = Some(reader.tile(&entry)?);
-                }
-                let bytes = stored.as_deref().unwrap();
+            let entries: Vec<Entry> = pending.iter().map(|(_, entry)| *entry).collect();
+            let stored = read_contents(reader, &entries)?;
+            for (coord, entry) in pending.drain(..) {
+                let bytes = &stored[&entry.offset];
                 writer
                     .add_tile(coord, bytes, Some(entry.offset))
                     .map_err(|e| format!("Failed to write tile {coord:?}: {e}"))?;
@@ -393,7 +535,47 @@ pub fn extract(
                 }
             }
             Ok(())
-        })
+        };
+    // The header's count stands in for the tiles under the leaves that are
+    // skipped; without one, every leaf is read to count them.
+    let skip_leaves = header.addressed_tiles > 0;
+    reader
+        .visit_entries_within(
+            |first, end| !skip_leaves || selection.may_keep(first, end),
+            |reader, entry: Entry| {
+                visited += 1;
+                if visited.is_multiple_of(CANCEL_CHECK_ENTRIES) && should_cancel() {
+                    cancelled = true;
+                    return Err("cancelled".into());
+                }
+                source_tiles += u64::from(entry.run_length);
+                let mut kept_entry = false;
+                for i in 0..u64::from(entry.run_length) {
+                    let tile_id = entry.tile_id + i;
+                    let coord = TileCoord::from(
+                        TileId::new(tile_id).map_err(|e| format!("tile ID {tile_id}: {e}"))?,
+                    );
+                    if !selection.keeps(coord) {
+                        continue;
+                    }
+                    pending.push((coord, entry));
+                    kept_entry = true;
+                }
+                if kept_entry {
+                    pending_bytes += u64::from(entry.length);
+                }
+                if pending.len() >= BATCH_TILES || pending_bytes >= BATCH_BYTES {
+                    if should_cancel() {
+                        cancelled = true;
+                        return Err("cancelled".into());
+                    }
+                    flush(reader, &mut pending)?;
+                    pending_bytes = 0;
+                }
+                Ok(())
+            },
+        )
+        .and_then(|()| flush(&mut reader, &mut pending))
         .map_err(|e| {
             if cancelled {
                 CompileError::Cancelled
@@ -401,6 +583,9 @@ pub fn extract(
                 CompileError::other(format!("Failed to read {source}: {e}"))
             }
         })?;
+    if skip_leaves {
+        source_tiles = header.addressed_tiles;
+    }
     if tiles == 0 {
         return Err(invalid(format!(
             "{source} holds no tiles in the area and zooms asked for"
@@ -440,6 +625,8 @@ pub fn extract(
             round7(center.latitude),
             center.zoom,
         ),
+        requests: reader.transferred().0,
+        bytes_read: reader.transferred().1,
     })
 }
 
@@ -464,6 +651,97 @@ mod tests {
         let world = CompileBounds::new(90.0, -90.0, 180.0, -180.0);
         assert_eq!(ZoomWindow::new(world, 2).rows, (0, 3));
         assert_eq!(ZoomWindow::new(world, 2).columns, [(0, 3)]);
+    }
+
+    #[test]
+    fn leaf_spans_are_kept_when_they_may_hold_a_kept_tile() {
+        // Brute force: a span may keep a tile when one of its tiles is in a
+        // window. Spans of every alignment, over zooms 0 to 6.
+        let boxes = [
+            CompileBounds::new(43.7517, 43.7247, 7.4396, 7.4092),
+            CompileBounds::new(-12.0, -21.0, -178.0, 177.0),
+            CompileBounds::new(60.0, 10.0, 40.0, -20.0),
+        ];
+        for bounds in boxes {
+            for zoom in [(0, 6), (3, 5), (6, 6)] {
+                let selection = Selection {
+                    zoom,
+                    windows: (zoom.0..=zoom.1)
+                        .map(|z| ZoomWindow::new(bounds, z))
+                        .collect(),
+                    coverage: None,
+                };
+                let keeps = |id: u64| selection.keeps(TileCoord::from(TileId::new(id).unwrap()));
+                let last = zoom_base(7);
+                let mut state = 12_345u64;
+                for _ in 0..3000 {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    let first = (state >> 33) % last;
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    let length = 1 + (state >> 33) % [5, 70, 1500][(state % 3) as usize];
+                    let end = (first + length).min(last);
+                    let expected = (first..end).any(keeps);
+                    assert_eq!(
+                        selection.may_keep(first, end),
+                        expected,
+                        "{first}..{end} for {bounds:?} at {zoom:?}"
+                    );
+                }
+                // Past the last zoom kept, and the root's open end.
+                assert!(!selection.may_keep(zoom_base(7), zoom_base(9)));
+                assert!(selection.may_keep(0, u64::MAX));
+            }
+        }
+    }
+
+    #[test]
+    fn leaves_outside_the_area_are_skipped() {
+        // Every tile of zooms 0-8, each with its own bytes: a directory
+        // that needs leaves.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("world.pmtiles");
+        let mut writer = PmTilesWriter::new(TileType::Mvt)
+            .precompressed(Compression::None)
+            .min_zoom(0)
+            .max_zoom(8)
+            .create(std::fs::File::create(&source).unwrap())
+            .unwrap();
+        let count = zoom_base(9);
+        for id in 0..count {
+            let coord = TileCoord::from(TileId::new(id).unwrap());
+            writer.add_tile(coord, &id.to_le_bytes()).unwrap();
+        }
+        writer.finalize().unwrap();
+        let reader = ArchiveReader::open(&source).unwrap();
+        assert!(reader.header.leaf_length > 0, "{:?}", reader.header);
+        drop(reader);
+
+        let bounds = CompileBounds::new(43.75, 43.72, 7.44, 7.41);
+        let mut request = ExtractRequest::new(&source, dir.path().join("monaco.pmtiles"));
+        request.bounds = Some(bounds);
+        let report = extract(&request, || false).unwrap();
+        assert_eq!(report.source_tiles, count);
+        let mut reader = ArchiveReader::open(&request.output).unwrap();
+        let mut kept = Vec::new();
+        reader
+            .visit_entries(|reader, entry| {
+                assert_eq!(reader.tile(&entry)?, entry.tile_id.to_le_bytes());
+                kept.push(entry.tile_id);
+                Ok(())
+            })
+            .unwrap();
+        let expected: Vec<u64> = (0..count)
+            .filter(|&id| {
+                let coord = TileCoord::from(TileId::new(id).unwrap());
+                ZoomWindow::new(bounds, coord.z()).contains(coord.x(), coord.y())
+            })
+            .collect();
+        assert_eq!(kept, expected);
+        assert_eq!(report.tiles, expected.len() as u64);
     }
 
     #[test]

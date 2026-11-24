@@ -5,6 +5,8 @@
 mod mbtiles;
 mod pmtiles;
 
+#[cfg(test)]
+pub(crate) use self::mbtiles::MbtilesWriter;
 pub(crate) use self::pmtiles::PmtilesArchiveWriter;
 use crate::{ArchiveCenter, CompileBounds};
 use serde::{Deserialize, Serialize};
