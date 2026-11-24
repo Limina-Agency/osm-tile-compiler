@@ -136,6 +136,15 @@ fn the_decoder_reads_the_specification_fixtures() {
 fn round_trip(tile: &[u8]) -> Vec<u8> {
     let mlt = from_mvt(tile).unwrap();
     decode::same_as_mvt(&mlt, tile).unwrap();
+    // Back to MVT, the tile holds the same features, and encodes to the same
+    // MLT bytes again.
+    let back = to_mvt(&mlt).unwrap();
+    decode::same_as_mvt(&mlt, &back).unwrap();
+    assert_eq!(
+        from_mvt(&back).unwrap(),
+        mlt,
+        "MLT to MVT to MLT changed the tile"
+    );
     mlt
 }
 

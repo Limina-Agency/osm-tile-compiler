@@ -22,11 +22,22 @@ fn pbf_bounds(path: &Path) -> CompileBounds {
 }
 
 fn compile(dir: &Path, sources: &Path, format: TileFormat, file: &str) -> PathBuf {
+    compile_with(dir, sources, format, file, |_| {})
+}
+
+fn compile_with(
+    dir: &Path,
+    sources: &Path,
+    format: TileFormat,
+    file: &str,
+    edit: impl FnOnce(&mut BasemapRequest),
+) -> PathBuf {
     let output = dir.join(file);
     let mut request = BasemapRequest::new(monaco_pbf(), &output, sources, dir.join("temp"));
     request.area = Area::bounds(pbf_bounds(&monaco_pbf()));
     request.threads = 2;
     request.archive.tile_format = format;
+    edit(&mut request);
     compile_basemap(&request, |_| {}, || false).unwrap();
     output
 }
@@ -135,4 +146,42 @@ fn mlt_mbtiles_declare_their_format() {
         .read_to_end(&mut raw)
         .unwrap();
     assert!(!decode::decode(&raw).unwrap().is_empty());
+}
+
+/// The search index and the building levels read an MLT basemap as the MVT
+/// one it was transcoded from: both come out byte for byte the same, but for
+/// the index naming its source archive.
+#[test]
+fn search_index_and_building_levels_read_mlt_basemaps() {
+    let temp = tempfile::tempdir().unwrap();
+    let sources = temp.path().join("sources");
+    synthetic_sources(&sources);
+    let both = |request: &mut BasemapRequest| {
+        request.building_levels = true;
+        request.search_index = true;
+    };
+    let mvt = compile_with(temp.path(), &sources, TileFormat::Mvt, "a.pmtiles", both);
+    let mlt = compile_with(temp.path(), &sources, TileFormat::Mlt, "b.pmtiles", both);
+
+    let levels = |archive: &Path| std::fs::read(osm_tile_compiler::building_levels_path(archive));
+    let (mvt_levels, mlt_levels) = (levels(&mvt).unwrap(), levels(&mlt).unwrap());
+    assert!(mvt_levels.len() > 1_000);
+    assert!(mvt_levels == mlt_levels, "the building levels differ");
+
+    let index = |archive: &Path| std::fs::read(osm_tile_compiler::search_index_path(archive));
+    let (mvt_index, mut mlt_index) = (index(&mvt).unwrap(), index(&mlt).unwrap());
+    // The metadata names the source, a.pmtiles or b.pmtiles: same length.
+    let at = mlt_index
+        .windows(9)
+        .position(|w| w == b"b.pmtiles")
+        .expect("the index names its source");
+    mlt_index[at] = b'a';
+    assert!(mvt_index.len() > 1_000);
+    assert!(mvt_index == mlt_index, "the search indexes differ");
+
+    let found = osm_tile_compiler::SearchIndex::open(&osm_tile_compiler::search_index_path(&mlt))
+        .unwrap()
+        .search(&osm_tile_compiler::SearchQuery::new("Monaco"))
+        .unwrap();
+    assert!(!found.is_empty());
 }

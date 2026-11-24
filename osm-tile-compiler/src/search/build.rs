@@ -178,9 +178,12 @@ pub(crate) fn write_index(
         ));
     }
     let mut reader = ArchiveReader::open(input)?;
-    if reader.header.tile_type != 1 {
-        return Err(format!("{} holds no vector tiles", input.display()));
-    }
+    // MVT, or MLT read as the MVT tiles it was transcoded from.
+    let mlt = match reader.header.tile_type {
+        1 => false,
+        6 => true,
+        _ => return Err(format!("{} holds no vector tiles", input.display())),
+    };
     let zoom = reader.header.max_zoom;
     let compression = reader.header.tile_compression;
     let metadata: serde_json::Value = serde_json::from_str(&reader.metadata()?)
@@ -209,7 +212,17 @@ pub(crate) fn write_index(
                     let mut items = TileItems::default();
                     for (entry, x, y) in chunk {
                         let stored = reader.tile(entry)?;
-                        let tile = crate::archive::decompress_tile(&stored, compression)?;
+                        let mut tile = crate::archive::decompress_tile(&stored, compression)?;
+                        if mlt {
+                            tile = crate::mlt::to_mvt(&tile)
+                                .map_err(|e| {
+                                    format!(
+                                        "tile {zoom}/{x}/{y} of {} is malformed: {e}",
+                                        input.display()
+                                    )
+                                })?
+                                .into();
+                        }
                         read_tile(&tile, zoom, *x, *y, &mut items).ok_or_else(|| {
                             format!("tile {zoom}/{x}/{y} of {} is malformed", input.display())
                         })?;
