@@ -16,7 +16,7 @@ flate2 = { version = "1.1", features = ["zlib-rs"] }
 geo = { version = "0.33.1", default-features = false }
 geo-types = { version = "0.7.20", default-features = false }
 geojson = "1.0"
-osm-pbf-ingest = "0.6.0"
+osm-pbf-ingest = "0.7.0"
 pmtiles = { version = "0.28.1", default-features = false }
 rayon = "1.10"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
@@ -40,9 +40,3 @@ unused_must_use = "warn"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
-
-# Until osm-pbf-ingest 0.7.0 is published with `changes::changed_area_with`:
-# then drop this, raise `osm-pbf-ingest` above and remove the allow-git
-# entry in deny.toml.
-[patch.crates-io]
-osm-pbf-ingest = { git = "https://github.com/Limina-Agency/osm-pbf-ingest", branch = "feat/changed-object-bounds" }

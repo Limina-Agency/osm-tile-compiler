@@ -1418,8 +1418,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "osm-pbf-ingest"
-version = "0.6.0"
-source = "git+https://github.com/Limina-Agency/osm-pbf-ingest?branch=feat%2Fchanged-object-bounds#bd84ec3fac7040111ef9d3a4975a1f5496ebd42a"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "162a8792fde597abec6860931076a69a9a7e9993eb0c0c8b32e9841c733a734e"
 dependencies = [
  "buffa",
  "compact_str",
