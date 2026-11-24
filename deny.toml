@@ -16,6 +16,12 @@ targets = [
 
 [advisories]
 version = 2
+ignore = [
+    # chrono is unmaintained (no vulnerability). It comes in only through
+    # parquet, which requires it, for the `geoparquet` feature; drop this
+    # once parquet moves off it.
+    { id = "RUSTSEC-2026-0543", reason = "chrono, unmaintained, required by parquet (geoparquet feature)" },
+]
 
 [licenses]
 version = 2
