@@ -668,6 +668,86 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_pass_interrupted_at_any_group_resumes_to_the_same_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let bounds = CompileBounds::new(20., -20., 20., -20.);
+        let shapes = shapes();
+        let threads = 3;
+        // Renders into a sort with more runs than one merge takes.
+        let render = |workspace: &std::path::Path| {
+            let mut store = Store::new(workspace).unwrap();
+            let mut pipeline = Pipeline::with_budget(
+                &store,
+                threads,
+                SortBudget::fixed(1),
+                bounds,
+                (2, 4),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+            for ordinal in 0..180 {
+                let (layer, geometry) = &shapes[ordinal % shapes.len()];
+                let feature = feature(ordinal, layer, geometry);
+                pipeline
+                    .push_source(ordinal as u64, &mut vec![feature])
+                    .unwrap();
+            }
+            pipeline.finish(&mut store).unwrap();
+            store
+        };
+        let write = |store: Store, name: &str| {
+            let output = temp.path().join(name);
+            let archive = fs::File::create(&output).unwrap();
+            store
+                .finish(
+                    &archive,
+                    &ArchiveHeader::for_test(bounds, 2, 4),
+                    threads,
+                    &crate::control::Control::detached(),
+                )
+                .unwrap();
+            fs::read(output).unwrap()
+        };
+        let reference = {
+            let workspace = temp.path().join("reference");
+            fs::create_dir(&workspace).unwrap();
+            write(render(&workspace), "reference.pmtiles")
+        };
+        for groups_done in [0, 1] {
+            let output = temp.path().join(format!("resumed-{groups_done}.pmtiles"));
+            let (checkpoints, _) =
+                crate::resume::Checkpoints::open(temp.path(), &output, "test".into()).unwrap();
+            let workspace = checkpoints.directory().to_path_buf();
+            let mut store = render(&workspace);
+            let sort = store.checkpoint(checkpoints.clone()).unwrap();
+            assert!(sort.runs.len() > MERGE_FAN_IN, "{} runs", sort.runs.len());
+            checkpoints
+                .commit_rendered(crate::resume::Rendered {
+                    sort,
+                    sources_processed: 0,
+                    profile_features: 0,
+                    supplement_seconds: 0.,
+                    osm_seconds: 0.,
+                    warnings: vec![],
+                    osm_data: Default::default(),
+                })
+                .unwrap();
+            store.interrupt_merge_pass(groups_done);
+            drop(store);
+            let sort = checkpoints.rendered().unwrap().sort;
+            assert!(!sort.pending.is_empty());
+            let store = Store::resume(&workspace, &sort, checkpoints.clone()).unwrap();
+            assert!(
+                checkpoints.rendered().unwrap().sort.pending.is_empty(),
+                "the recovered pass is recorded"
+            );
+            let resumed = write(store, &format!("resumed-{groups_done}.pmtiles"));
+            assert!(resumed == reference, "{groups_done} groups done");
+        }
+    }
+
+    #[test]
     fn worker_failure_surfaces_earliest_error_and_removes_runs() {
         let temp = tempfile::tempdir().unwrap();
         let bounds = CompileBounds::new(20., -20., 20., -20.);

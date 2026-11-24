@@ -154,13 +154,14 @@ impl MergeCache {
         options: &MergeCacheOptions,
         temp_dir: &Path,
         gzip_level: u32,
+        tile_format: crate::TileFormat,
         warnings: &mut Vec<String>,
     ) -> Result<Option<Self>, String> {
         if !options.write && options.reuse_from.is_none() {
             return Ok(None);
         }
         let reuse = match &options.reuse_from {
-            Some(archive) => match Reuse::open(archive, gzip_level)? {
+            Some(archive) => match Reuse::open(archive, gzip_level, tile_format)? {
                 Ok(reuse) => Some(reuse),
                 Err(reason) => {
                     warnings.push(reason);
@@ -314,7 +315,11 @@ impl Reuse {
     /// Opens `archive` and the index beside it for a compile at
     /// `gzip_level`. `Ok(Err(reason))` when the index is from another build
     /// and cannot be used; an error when it does not belong to the archive.
-    pub fn open(archive: &Path, gzip_level: u32) -> Result<Result<Self, String>, String> {
+    pub fn open(
+        archive: &Path,
+        gzip_level: u32,
+        tile_format: crate::TileFormat,
+    ) -> Result<Result<Self, String>, String> {
         let index_path = merge_cache_path(archive);
         let io = |e: std::io::Error| format!("Failed to read {}: {e}", index_path.display());
         let file = File::open(&index_path).map_err(io)?;
@@ -355,6 +360,15 @@ impl Reuse {
                 index_path.display(),
                 archive.display()
             ));
+        }
+        // Layers are copied as they are stored, so only into tiles of the
+        // same format.
+        if actual[99] != tile_format.pmtiles_code() {
+            return Ok(Err(format!(
+                "{} holds tiles of another format than {}; every tile is encoded again",
+                archive.display(),
+                tile_format.name()
+            )));
         }
         let mut entries = Vec::new();
         reader.visit_entries(|_, entry| {
