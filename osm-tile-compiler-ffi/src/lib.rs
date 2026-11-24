@@ -10,8 +10,11 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod archive_jobs;
+mod fetch_jobs;
 mod job;
 mod kinds;
+mod update_job;
 
 use job::{JobError, JobState, Shared};
 use std::ffi::{CStr, CString, c_char};
@@ -73,6 +76,28 @@ pub extern "C" fn otc_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
 }
 
+/// Reads `request_json` and parses the envelope and the kind's request: the
+/// kind and the work to run, or the status and error to return.
+unsafe fn parse_request(
+    request_json: *const c_char,
+) -> Result<(&'static str, job::Work), (i32, JobError)> {
+    if request_json.is_null() {
+        return Err((
+            OTC_ERROR_INVALID_ARGUMENT,
+            JobError::invalid_request("request_json is null"),
+        ));
+    }
+    let text = unsafe { CStr::from_ptr(request_json) }
+        .to_str()
+        .map_err(|_| {
+            (
+                OTC_ERROR_INVALID_ARGUMENT,
+                JobError::invalid_request("request_json is not UTF-8"),
+            )
+        })?;
+    kinds::parse(text).map_err(|e| (OTC_ERROR_INVALID_REQUEST, e))
+}
+
 /// Starts the job `request_json` describes, an envelope
 /// `{"abiVersion": 1, "kind": "...", "request": {...}}`.
 ///
@@ -107,21 +132,7 @@ pub unsafe extern "C" fn otc_job_start(
             JobError::internal("The library crashed while starting the job"),
         )),
         || {
-            if request_json.is_null() {
-                return Err((
-                    OTC_ERROR_INVALID_ARGUMENT,
-                    JobError::invalid_request("request_json is null"),
-                ));
-            }
-            let text = unsafe { CStr::from_ptr(request_json) }
-                .to_str()
-                .map_err(|_| {
-                    (
-                        OTC_ERROR_INVALID_ARGUMENT,
-                        JobError::invalid_request("request_json is not UTF-8"),
-                    )
-                })?;
-            let (kind, work) = kinds::parse(text).map_err(|e| (OTC_ERROR_INVALID_REQUEST, e))?;
+            let (kind, work) = unsafe { parse_request(request_json) }?;
             job::spawn(kind, work).map_err(|e| (OTC_ERROR_INTERNAL, e))
         },
     );
@@ -130,6 +141,35 @@ pub unsafe extern "C" fn otc_job_start(
             unsafe { *job_out = Box::into_raw(Box::new(OtcJob { shared })) };
             OTC_OK
         }
+        Err((status, error)) => {
+            unsafe { put(error_out, &error.to_json()) };
+            status
+        }
+    }
+}
+
+/// Checks `request_json` as [`otc_job_start`] does, without starting a job:
+/// for forms that check as the user types. Returns `OTC_OK` when
+/// `otc_job_start` would start it, else the status it would return, and
+/// sets `*error_out` as it does. A request that passes can still fail the
+/// job once it reads its files or the network.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn otc_validate(
+    request_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> i32 {
+    if !error_out.is_null() {
+        unsafe { *error_out = std::ptr::null_mut() };
+    }
+    let checked = guard(
+        Err((
+            OTC_ERROR_INTERNAL,
+            JobError::internal("The library crashed while checking the request"),
+        )),
+        || unsafe { parse_request(request_json) }.map(drop),
+    );
+    match checked {
+        Ok(()) => OTC_OK,
         Err((status, error)) => {
             unsafe { put(error_out, &error.to_json()) };
             status

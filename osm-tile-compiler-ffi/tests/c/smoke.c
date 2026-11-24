@@ -28,6 +28,12 @@ int main(int argc, char **argv) {
     }
     printf("rejected: %s\n", error);
     otc_string_free(error);
+    if (otc_validate("{\"abiVersion\":1,\"kind\":\"nope\"}", &error) !=
+            OTC_ERROR_INVALID_REQUEST || error == NULL) {
+        fprintf(stderr, "a bad request validated\n");
+        return 1;
+    }
+    otc_string_free(error);
 
     char request[4096];
     snprintf(request, sizeof request,

@@ -24,10 +24,24 @@
 //!                 is stored (a gzip level, or 255 for no compression);
 //!                 varint the new tile's stored length; varint patch length,
 //!                 then the patch (`tile_patch`)
+//! signatures   (version 2) each 97 bytes: u8 algorithm (1 ed25519), the
+//!              32-byte public key, the 64-byte signature
+//! count        (version 2) u32, the number of signatures
+//! magic        (version 2) 8 bytes "OTCSIGNS"
 //! ```
 //!
 //! The operations, run in order, write the new archive from its first byte to
 //! its last.
+//!
+//! Everything before the signatures, from the magic to the end operation, is
+//! what is signed: each signature signs `osm-tile-compiler delta v2`, a zero
+//! byte and that span's SHA-256. The manifest is part of it, so a valid
+//! signature vouches for both archives' SHA-256 as well as every operation;
+//! the footer stands outside it so that a delta can be signed after it is
+//! written, and by more than one key. `apply` with trusted keys reads the
+//! delta once to check its signatures before it writes anything, and checks
+//! the span again as it applies it. A version 1 delta, which has no footer,
+//! still applies, as an unsigned delta.
 //!
 //! A changed tile travels as a patch against the old tile at the same
 //! position when the new tile's stored bytes can be reproduced from its
@@ -35,6 +49,7 @@
 //! patch is smaller. Edits rarely change more than a little of a tile, so
 //! this is what keeps a delta small.
 use super::reader::{ArchiveReader, Entry};
+use super::signing::{self, PublicKey, Record, SecretKey, SignatureCheck};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,8 +61,16 @@ use std::path::{Path, PathBuf};
 /// The manifest's `format`.
 pub const DELTA_FORMAT: &str = "osm-tile-compiler-delta";
 /// The file layout's version; see `docs/formats.md` for when it changes.
-pub const DELTA_VERSION: u32 = 1;
+pub const DELTA_VERSION: u32 = 2;
 const MAGIC: &[u8; 8] = b"OTCDELTA";
+const FOOTER_MAGIC: &[u8; 8] = b"OTCSIGNS";
+/// A signature in the footer: algorithm, public key, signature.
+const RECORD_BYTES: u64 = 1 + 32 + 64;
+/// The footer's signature count and magic.
+const FOOTER_TAIL_BYTES: u64 = 4 + 8;
+/// More signatures than anyone adds: the footer of a delta claiming more is
+/// corrupt.
+const MAX_SIGNATURES: u32 = 64;
 /// A manifest is a few hundred bytes; anything far larger is not a delta.
 const MAX_MANIFEST_BYTES: u32 = 1 << 20;
 const TAG_END: u8 = 0;
@@ -81,7 +104,8 @@ pub struct TileChanges {
 pub struct DeltaManifest {
     /// Always `DELTA_FORMAT`.
     pub format: String,
-    /// Always `DELTA_VERSION`.
+    /// The layout's version: `DELTA_VERSION` for deltas this build writes,
+    /// or 1.
     pub version: u32,
     /// The archive the delta applies to.
     pub base: ArchiveDigest,
@@ -100,6 +124,17 @@ pub struct DeltaManifest {
     pub tiles: TileChanges,
 }
 
+/// What `diff` should do besides writing the delta.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct DiffOptions {
+    /// Sign the delta with this key.
+    pub sign_with: Option<SecretKey>,
+    /// Also write the tiles that differ (changed, added or removed), one
+    /// `z/x/y` per line, to this file, which must not exist yet.
+    pub changed_tiles: Option<PathBuf>,
+}
+
 /// What `diff` wrote.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
@@ -107,6 +142,10 @@ pub struct DiffReport {
     pub delta_bytes: u64,
     #[serde(flatten)]
     pub manifest: DeltaManifest,
+    /// The public keys, in hex, the delta is signed with.
+    pub signed_by: Vec<String>,
+    /// Where the list of tiles that differ was written, and how many it holds.
+    pub changed_tiles: Option<(PathBuf, u64)>,
 }
 
 /// What `apply` wrote.
@@ -116,6 +155,23 @@ pub struct ApplyReport {
     pub delta_bytes: u64,
     #[serde(flatten)]
     pub manifest: DeltaManifest,
+    /// The public keys, in hex, whose valid signatures the delta carries.
+    pub signed_by: Vec<String>,
+    /// Whether one of them is a key the caller trusts.
+    pub trusted: bool,
+}
+
+/// What checking a delta's signatures found, without applying it.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct DeltaVerification {
+    pub delta_bytes: u64,
+    #[serde(flatten)]
+    pub manifest: DeltaManifest,
+    /// The public keys, in hex, whose valid signatures the delta carries.
+    pub signed_by: Vec<String>,
+    /// Whether one of them is a key the caller trusts.
+    pub trusted: bool,
 }
 
 type Key = [u8; 16];
@@ -567,13 +623,20 @@ fn gap(
     Ok(Operation::Literal { offset, length })
 }
 
-/// Counts tile changes by walking both archives' entries in tile ID order.
+/// Counts tile changes by walking both archives' entries in tile ID order;
+/// with `differing`, also lists the tile IDs changed, added or removed.
 fn tile_changes(
     base: &[Entry],
     base_keys: &HashMap<Segment, Key>,
     target: &[Entry],
     target_keys: &HashMap<Segment, Key>,
+    mut differing: Option<&mut Vec<u64>>,
 ) -> TileChanges {
+    let mut differs = |id: u64| {
+        if let Some(list) = differing.as_deref_mut() {
+            list.push(id);
+        }
+    };
     let expand = |entries: &[Entry], keys: &HashMap<Segment, Key>| {
         let keyed: Vec<(Entry, Key)> = entries
             .iter()
@@ -595,26 +658,31 @@ fn tile_changes(
     loop {
         match (base.peek().copied(), target.peek().copied()) {
             (None, None) => break,
-            (Some(_), None) => {
+            (Some((b, _)), None) => {
                 changes.removed += 1;
+                differs(b);
                 base.next();
             }
-            (None, Some(_)) => {
+            (None, Some((t, _))) => {
                 changes.added += 1;
+                differs(t);
                 target.next();
             }
             (Some((b, bk)), Some((t, tk))) => {
                 if b < t {
                     changes.removed += 1;
+                    differs(b);
                     base.next();
                 } else if t < b {
                     changes.added += 1;
+                    differs(t);
                     target.next();
                 } else {
                     if bk == tk {
                         changes.unchanged += 1;
                     } else {
                         changes.changed += 1;
+                        differs(b);
                     }
                     base.next();
                     target.next();
@@ -726,7 +794,17 @@ enum Part {
 /// Writes the delta that turns the archive `base` into `target` to `output`,
 /// which must not exist yet. Before keeping it, rebuilds `target` from it
 /// and checks the result.
-pub(super) fn diff(base: &Path, target: &Path, output: &Path) -> Result<DiffReport, String> {
+pub(super) fn diff(
+    base: &Path,
+    target: &Path,
+    output: &Path,
+    options: &DiffOptions,
+) -> Result<DiffReport, String> {
+    if let Some(list) = &options.changed_tiles
+        && list.exists()
+    {
+        return Err(format!("{} already exists", list.display()));
+    }
     let ((base_digest, target_digest), (base_layout, target_layout)) = rayon::join(
         || rayon::join(|| digest(base), || digest(target)),
         || rayon::join(|| layout(base), || layout(target)),
@@ -902,17 +980,23 @@ pub(super) fn diff(base: &Path, target: &Path, output: &Path) -> Result<DiffRepo
         literal_bytes,
         patched_bytes,
         patched_tiles,
+        tiles: TileChanges::default(),
+    };
+    let mut differing = options.changed_tiles.as_ref().map(|_| Vec::new());
+    let manifest = DeltaManifest {
         tiles: tile_changes(
             &base_layout.tiles,
             &base_keys,
             &target_layout.tiles,
             &target_keys,
+            differing.as_mut(),
         ),
+        ..manifest
     };
 
     let (pending, file) = PendingFile::create(output)?;
     let failed = |e: std::io::Error| format!("Failed to write {}: {e}", output.display());
-    let mut out = BufWriter::with_capacity(BUFFER_BYTES, file);
+    let mut out = HashingWriter::new(BufWriter::with_capacity(BUFFER_BYTES, file));
     let manifest_json = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
     out.write_all(MAGIC).map_err(failed)?;
     out.write_all(&DELTA_VERSION.to_le_bytes())
@@ -947,28 +1031,254 @@ pub(super) fn diff(base: &Path, target: &Path, output: &Path) -> Result<DiffRepo
         }
     }
     out.write_all(&[TAG_END]).map_err(failed)?;
+    let HashingWriter {
+        inner: mut out,
+        hasher,
+        bytes: signed_bytes,
+    } = out;
+    let signed: [u8; 32] = hasher.finalize().into();
+    let mut records = Vec::new();
+    if let Some(key) = &options.sign_with {
+        signing::add(&mut records, key, &signing::delta_message(&signed));
+    }
+    write_footer(&mut out, &records).map_err(failed)?;
     let file = out.into_inner().map_err(|e| failed(e.into_error()))?;
     let delta_bytes = file.metadata().map_err(failed)?.len();
 
-    // Rebuild the target from what was written, without keeping it.
+    // Rebuild the target from what was written, without keeping it, and
+    // check the signatures.
+    let written = open_delta(&pending.temporary)?;
+    if written.signed_end != signed_bytes
+        || signed_digest(&pending.temporary, signed_bytes)? != signed
+    {
+        return Err("the delta was not written as it was made".into());
+    }
+    let checked = signing::check(
+        &written.records,
+        &signing::delta_message(&signed),
+        &[],
+        "the delta",
+    )?;
     let mut delta = BufReader::with_capacity(
         BUFFER_BYTES,
         File::open(&pending.temporary).map_err(failed)?,
     );
-    let written = read_manifest_from(&mut delta)?;
+    read_manifest_from(&mut delta)?;
     let mut rebuilt = HashingWriter::new(std::io::sink());
-    run(base, &written, &mut delta, &mut rebuilt)?;
-    if rebuilt.bytes != written.target.bytes || rebuilt.finish() != written.target.sha256 {
+    let mut operations = (&mut delta).take(written.signed_end - written.header_bytes);
+    run(base, &written.manifest, &mut operations, &mut rebuilt)?;
+    if operations.limit() != 0
+        || rebuilt.bytes != written.manifest.target.bytes
+        || rebuilt.finish() != written.manifest.target.sha256
+    {
         return Err(format!(
             "the delta does not rebuild {}; nothing was written",
             target.display()
         ));
     }
     pending.keep(file)?;
+    let changed_tiles = match (&options.changed_tiles, differing) {
+        (Some(path), Some(ids)) => {
+            let tiles = ids.into_iter().map(|id| {
+                let coord = pmtiles::TileCoord::from(
+                    pmtiles::TileId::new(id).expect("the archive's tile IDs are valid"),
+                );
+                (coord.z(), coord.x(), coord.y())
+            });
+            let mut tiles: Vec<_> = tiles.collect();
+            tiles.sort_unstable();
+            Some((path.clone(), crate::tile_list::write(path, tiles)?))
+        }
+        _ => None,
+    };
     Ok(DiffReport {
         delta_bytes,
         manifest,
+        signed_by: checked.signed_by,
+        changed_tiles,
     })
+}
+
+fn write_footer(out: &mut impl Write, records: &[Record]) -> std::io::Result<()> {
+    for record in records {
+        out.write_all(&[signing::ED25519])?;
+        out.write_all(&record.key)?;
+        out.write_all(&record.signature)?;
+    }
+    out.write_all(&(records.len() as u32).to_le_bytes())?;
+    out.write_all(FOOTER_MAGIC)
+}
+
+/// A delta's manifest and signatures, and where its parts lie.
+struct DeltaFile {
+    manifest: DeltaManifest,
+    bytes: u64,
+    /// The magic, version and manifest.
+    header_bytes: u64,
+    /// Where the signed span, up to and including the end operation, ends:
+    /// the footer's start, or the file's end for a version 1 delta.
+    signed_end: u64,
+    records: Vec<Record>,
+}
+
+/// Reads a delta's manifest and footer.
+fn open_delta(path: &Path) -> Result<DeltaFile, String> {
+    let named = |e: String| format!("{}: {e}", path.display());
+    let mut file =
+        File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    let bytes = file.metadata().map_err(|e| e.to_string())?.len();
+    let mut input = BufReader::new(&mut file);
+    let manifest = read_manifest_from(&mut input).map_err(named)?;
+    let header_bytes = input.stream_position().map_err(|e| e.to_string())?;
+    drop(input);
+    if manifest.version == 1 {
+        return Ok(DeltaFile {
+            manifest,
+            bytes,
+            header_bytes,
+            signed_end: bytes,
+            records: Vec::new(),
+        });
+    }
+    let footer_error = || named(corrupt("its signature footer is damaged"));
+    let tail_at = bytes
+        .checked_sub(FOOTER_TAIL_BYTES)
+        .filter(|&at| at > header_bytes)
+        .ok_or_else(footer_error)?;
+    let tail = read_at(&file, tail_at, FOOTER_TAIL_BYTES).map_err(|e| e.to_string())?;
+    let count = u32::from_le_bytes(tail[..4].try_into().unwrap());
+    if &tail[4..] != FOOTER_MAGIC || count > MAX_SIGNATURES {
+        return Err(footer_error());
+    }
+    let records_bytes = u64::from(count) * RECORD_BYTES;
+    let signed_end = tail_at
+        .checked_sub(records_bytes)
+        .filter(|&end| end > header_bytes)
+        .ok_or_else(footer_error)?;
+    let raw = read_at(&file, signed_end, records_bytes).map_err(|e| e.to_string())?;
+    let records = raw
+        .as_chunks::<{ RECORD_BYTES as usize }>()
+        .0
+        .iter()
+        .map(|record| {
+            if record[0] != signing::ED25519 {
+                return Err(named(corrupt("a signature names an unknown algorithm")));
+            }
+            Ok(Record {
+                key: record[1..33].try_into().unwrap(),
+                signature: record[33..].try_into().unwrap(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(DeltaFile {
+        manifest,
+        bytes,
+        header_bytes,
+        signed_end,
+        records,
+    })
+}
+
+/// The SHA-256 of a file's first `length` bytes.
+fn signed_digest(path: &Path, length: u64) -> Result<[u8; 32], String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    let mut hashing = HashingWriter::new(std::io::sink());
+    let read = std::io::copy(
+        &mut BufReader::with_capacity(BUFFER_BYTES, file).take(length),
+        &mut hashing,
+    )
+    .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    if read != length {
+        return Err(format!("{} changed while it was read", path.display()));
+    }
+    Ok(hashing.hasher.finalize().into())
+}
+
+/// Checks a delta's signatures: every one must be valid, and with `trusted`
+/// keys, one must be by a trusted key. Returns the signed span's digest when
+/// it was read.
+fn check_signatures(
+    path: &Path,
+    delta: &DeltaFile,
+    trusted: &[PublicKey],
+) -> Result<(SignatureCheck, Option<[u8; 32]>), String> {
+    let what = path.display().to_string();
+    if delta.records.is_empty() && trusted.is_empty() {
+        return Ok((
+            SignatureCheck {
+                signed_by: Vec::new(),
+                trusted: false,
+            },
+            None,
+        ));
+    }
+    if delta.records.is_empty() {
+        let checked = signing::check(&[], &[], trusted, &what)?;
+        return Ok((checked, None));
+    }
+    let digest = signed_digest(path, delta.signed_end)?;
+    let checked = signing::check(
+        &delta.records,
+        &signing::delta_message(&digest),
+        trusted,
+        &what,
+    )?;
+    Ok((checked, Some(digest)))
+}
+
+/// Checks the delta at `path`'s signatures without applying it.
+pub(super) fn verify(path: &Path, trusted: &[PublicKey]) -> Result<DeltaVerification, String> {
+    let delta = open_delta(path)?;
+    let (checked, _) = check_signatures(path, &delta, trusted)?;
+    Ok(DeltaVerification {
+        delta_bytes: delta.bytes,
+        manifest: delta.manifest,
+        signed_by: checked.signed_by,
+        trusted: checked.trusted,
+    })
+}
+
+/// Adds a signature by `key` to the delta at `path`, in place, replacing an
+/// earlier one by the same key. The operations and manifest are unchanged.
+pub(super) fn sign(path: &Path, key: &SecretKey) -> Result<SignatureCheck, String> {
+    let delta = open_delta(path)?;
+    if delta.manifest.version == 1 {
+        return Err(format!(
+            "{} is a version 1 delta, which has no room for signatures; write it again with diff",
+            path.display()
+        ));
+    }
+    let digest = signed_digest(path, delta.signed_end)?;
+    let message = signing::delta_message(&digest);
+    let mut records = delta.records;
+    let what = path.display().to_string();
+    signing::check(&records, &message, &[], &what)?;
+    signing::add(&mut records, key, &message);
+    let failed = |e: std::io::Error| format!("Failed to write {}: {e}", path.display());
+    let mut file = File::options().write(true).open(path).map_err(failed)?;
+    file.seek(SeekFrom::Start(delta.signed_end))
+        .map_err(failed)?;
+    let mut footer = Vec::new();
+    write_footer(&mut footer, &records).map_err(failed)?;
+    file.write_all(&footer).map_err(failed)?;
+    file.set_len(delta.signed_end + footer.len() as u64)
+        .map_err(failed)?;
+    file.sync_all().map_err(failed)?;
+    signing::check(&records, &message, &[], &what)
+}
+
+/// Hashes what is read through it.
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
 }
 
 fn read_manifest_from(input: &mut impl Read) -> Result<DeltaManifest, String> {
@@ -980,9 +1290,9 @@ fn read_manifest_from(input: &mut impl Read) -> Result<DeltaManifest, String> {
         return Err("not a delta archive".into());
     }
     let version = u32::from_le_bytes(lead[8..12].try_into().unwrap());
-    if version != DELTA_VERSION {
+    if version != 1 && version != DELTA_VERSION {
         return Err(format!(
-            "delta version {version} is not supported; this build reads version {DELTA_VERSION}"
+            "delta version {version} is not supported; this build reads versions 1 and {DELTA_VERSION}"
         ));
     }
     let length = u32::from_le_bytes(lead[12..16].try_into().unwrap());
@@ -995,7 +1305,7 @@ fn read_manifest_from(input: &mut impl Read) -> Result<DeltaManifest, String> {
         .map_err(|_| "the delta ends inside its manifest".to_string())?;
     let manifest: DeltaManifest =
         serde_json::from_slice(&json).map_err(|e| format!("the delta's manifest: {e}"))?;
-    if manifest.format != DELTA_FORMAT || manifest.version != DELTA_VERSION {
+    if manifest.format != DELTA_FORMAT || manifest.version != version {
         return Err("the delta's manifest names another format".into());
     }
     Ok(manifest)
@@ -1217,15 +1527,36 @@ fn run(
 }
 
 /// Applies the delta at `delta` to the archive `base`, writing the new
-/// archive to `output`, which must not exist yet. Checks `base` before and
-/// the result after; on any failure nothing is left at `output`.
-pub(super) fn apply(base: &Path, delta: &Path, output: &Path) -> Result<ApplyReport, String> {
+/// archive to `output`, which must not exist yet. Checks the delta's
+/// signatures first (all must be valid, and with `trusted` keys one must be
+/// by a trusted key), then `base`, and the result after; on any failure
+/// nothing is left at `output`.
+pub(super) fn apply(
+    base: &Path,
+    delta: &Path,
+    output: &Path,
+    trusted: &[PublicKey],
+) -> Result<ApplyReport, String> {
+    let opened = open_delta(delta)?;
+    let (checked, signed) = check_signatures(delta, &opened, trusted)?;
     let delta_file =
         File::open(delta).map_err(|e| format!("Failed to open {}: {e}", delta.display()))?;
-    let delta_bytes = delta_file.metadata().map_err(|e| e.to_string())?.len();
-    let mut input = BufReader::with_capacity(BUFFER_BYTES, delta_file);
+    let delta_bytes = opened.bytes;
+    let mut input = HashingReader {
+        inner: BufReader::with_capacity(BUFFER_BYTES, delta_file),
+        hasher: Sha256::new(),
+    };
     let manifest =
         read_manifest_from(&mut input).map_err(|e| format!("{}: {e}", delta.display()))?;
+    let changed = || {
+        format!(
+            "{} changed while it was applied; nothing was written",
+            delta.display()
+        )
+    };
+    if manifest != opened.manifest {
+        return Err(changed());
+    }
     let found = digest(base)?;
     if found != manifest.base {
         return Err(format!(
@@ -1239,7 +1570,21 @@ pub(super) fn apply(base: &Path, delta: &Path, output: &Path) -> Result<ApplyRep
     }
     let (pending, file) = PendingFile::create(output)?;
     let mut out = HashingWriter::new(BufWriter::with_capacity(BUFFER_BYTES, file));
-    run(base, &manifest, &mut input, &mut out)?;
+    let mut operations = (&mut input).take(opened.signed_end - opened.header_bytes);
+    run(base, &manifest, &mut operations, &mut out)?;
+    if operations.limit() != 0 {
+        return Err(format!(
+            "{}: {}",
+            delta.display(),
+            corrupt("it holds bytes after its end operation")
+        ));
+    }
+    if let Some(signed) = signed {
+        let read: [u8; 32] = input.hasher.finalize().into();
+        if read != signed {
+            return Err(changed());
+        }
+    }
     let bytes = out.bytes;
     let HashingWriter { inner, hasher, .. } = out;
     let sha256 = hex::encode(hasher.finalize());
@@ -1256,6 +1601,8 @@ pub(super) fn apply(base: &Path, delta: &Path, output: &Path) -> Result<ApplyRep
     Ok(ApplyReport {
         delta_bytes,
         manifest,
+        signed_by: checked.signed_by,
+        trusted: checked.trusted,
     })
 }
 
@@ -1284,10 +1631,10 @@ mod tests {
         archive(&base, base_tiles, r#"{"name":"a"}"#);
         archive(&target, target_tiles, r#"{"name":"b"}"#);
         let delta = dir.path().join("a-b.delta");
-        let report = diff(&base, &target, &delta).unwrap();
+        let report = diff(&base, &target, &delta, &DiffOptions::default()).unwrap();
         assert_eq!(read_manifest(&delta).unwrap(), report.manifest);
         let rebuilt = dir.path().join("rebuilt.pmtiles");
-        apply(&base, &delta, &rebuilt).unwrap();
+        apply(&base, &delta, &rebuilt, &[]).unwrap();
         assert_eq!(
             std::fs::read(&rebuilt).unwrap(),
             std::fs::read(&target).unwrap()
@@ -1368,9 +1715,9 @@ mod tests {
         archive(&b, &[(0, b"b")], "{}");
         archive(&c, &[(0, b"c")], "{}");
         let delta = dir.path().join("a-b.delta");
-        diff(&a, &b, &delta).unwrap();
+        diff(&a, &b, &delta, &DiffOptions::default()).unwrap();
         let out = dir.path().join("out.pmtiles");
-        let error = apply(&c, &delta, &out).unwrap_err();
+        let error = apply(&c, &delta, &out, &[]).unwrap_err();
         assert!(
             error.contains("is not the archive this delta applies to"),
             "{error}"
@@ -1386,17 +1733,17 @@ mod tests {
         archive(&a, &[(0, b"one"), (1, b"two")], "{}");
         archive(&b, &[(0, b"one"), (1, b"three")], "{}");
         let delta = dir.path().join("a-b.delta");
-        diff(&a, &b, &delta).unwrap();
+        diff(&a, &b, &delta, &DiffOptions::default()).unwrap();
         let mut bytes = std::fs::read(&delta).unwrap();
         let last = bytes.len() - 2;
         bytes[last] ^= 0xff;
         std::fs::write(&delta, &bytes).unwrap();
         let out = dir.path().join("out.pmtiles");
-        assert!(apply(&a, &delta, &out).is_err());
+        assert!(apply(&a, &delta, &out, &[]).is_err());
         assert!(!out.exists());
         bytes.truncate(bytes.len() - 5);
         std::fs::write(&delta, &bytes).unwrap();
-        assert!(apply(&a, &delta, &out).is_err());
+        assert!(apply(&a, &delta, &out, &[]).is_err());
         assert!(!out.exists());
     }
 
@@ -1407,7 +1754,11 @@ mod tests {
         archive(&a, &[(0, b"a")], "{}");
         let delta = dir.path().join("a.delta");
         std::fs::write(&delta, b"keep").unwrap();
-        assert!(diff(&a, &a, &delta).unwrap_err().contains("already exists"));
+        assert!(
+            diff(&a, &a, &delta, &DiffOptions::default())
+                .unwrap_err()
+                .contains("already exists")
+        );
         assert_eq!(std::fs::read(&delta).unwrap(), b"keep");
     }
 
@@ -1453,7 +1804,7 @@ mod tests {
                     .num_threads(threads)
                     .build()
                     .unwrap()
-                    .install(|| diff(&a, &b, &delta))
+                    .install(|| diff(&a, &b, &delta, &DiffOptions::default()))
                     .unwrap();
                 std::fs::read(&delta).unwrap()
             })
@@ -1462,8 +1813,175 @@ mod tests {
         let report = read_manifest(&dir.path().join("4.delta")).unwrap();
         assert!(report.patched_tiles > 200, "{report:?}");
         let rebuilt = dir.path().join("rebuilt.pmtiles");
-        apply(&a, &dir.path().join("4.delta"), &rebuilt).unwrap();
+        apply(&a, &dir.path().join("4.delta"), &rebuilt, &[]).unwrap();
         assert_eq!(std::fs::read(&rebuilt).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    /// Two small archives that differ in one tile, and their unsigned delta.
+    fn unsigned_delta(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let (a, b) = (dir.join("a.pmtiles"), dir.join("b.pmtiles"));
+        archive(&a, &[(0, b"one"), (1, b"two")], "{}");
+        archive(&b, &[(0, b"one"), (1, b"three"), (2, b"four")], "{}");
+        let delta = dir.join("a-b.delta");
+        diff(&a, &b, &delta, &DiffOptions::default()).unwrap();
+        (a, b, delta)
+    }
+
+    #[test]
+    fn a_signed_delta_applies_with_a_trusted_key_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));
+        archive(&a, &[(0, b"one")], "{}");
+        archive(&b, &[(0, b"two")], "{}");
+        let (key, other) = (
+            SecretKey::from_seed(&[1; 32]),
+            SecretKey::from_seed(&[2; 32]),
+        );
+        let delta = dir.path().join("a-b.delta");
+        let options = DiffOptions {
+            sign_with: Some(key.clone()),
+            ..DiffOptions::default()
+        };
+        let report = diff(&a, &b, &delta, &options).unwrap();
+        assert_eq!(report.signed_by, [key.public_key().to_hex()]);
+        let checked = verify(&delta, &[key.public_key()]).unwrap();
+        assert!(checked.trusted);
+        assert_eq!(checked.manifest, report.manifest);
+        let refused = verify(&delta, &[other.public_key()]).unwrap_err();
+        assert!(refused.contains("not trusted"), "{refused}");
+        let out = dir.path().join("out.pmtiles");
+        let error = apply(&a, &delta, &out, &[other.public_key()]).unwrap_err();
+        assert!(error.contains("not trusted"), "{error}");
+        assert!(!out.exists() && !partial_path(&out).exists());
+        let applied = apply(&a, &delta, &out, &[key.public_key()]).unwrap();
+        assert!(applied.trusted);
+        assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&b).unwrap());
+        // Without trusted keys a signed delta applies as any other.
+        let plain = dir.path().join("plain.pmtiles");
+        assert!(!apply(&a, &delta, &plain, &[]).unwrap().trusted);
+    }
+
+    #[test]
+    fn a_changed_signed_delta_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _, delta) = unsigned_delta(dir.path());
+        let key = SecretKey::from_seed(&[1; 32]);
+        sign(&delta, &key).unwrap();
+        let original = std::fs::read(&delta).unwrap();
+        // A byte of the operations, and a byte of the manifest.
+        let footer = (RECORD_BYTES + FOOTER_TAIL_BYTES) as usize;
+        for at in [original.len() - footer - 3, 30] {
+            let mut bytes = original.clone();
+            bytes[at] ^= 0x01;
+            std::fs::write(&delta, &bytes).unwrap();
+            let out = dir.path().join("out.pmtiles");
+            let error = apply(&a, &delta, &out, &[]).unwrap_err();
+            assert!(
+                error.contains("does not match") || error.contains("manifest"),
+                "{error}"
+            );
+            assert!(!out.exists() && !partial_path(&out).exists());
+        }
+        // The signature itself.
+        let mut bytes = original.clone();
+        let at = original.len() - FOOTER_TAIL_BYTES as usize - 10;
+        bytes[at] ^= 0x01;
+        std::fs::write(&delta, &bytes).unwrap();
+        assert!(verify(&delta, &[]).unwrap_err().contains("does not match"));
+    }
+
+    #[test]
+    fn signing_adds_to_a_delta_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, delta) = unsigned_delta(dir.path());
+        let unsigned = std::fs::read(&delta).unwrap();
+        let (one, two) = (
+            SecretKey::from_seed(&[1; 32]),
+            SecretKey::from_seed(&[2; 32]),
+        );
+        let required = verify(&delta, &[one.public_key()]).unwrap_err();
+        assert!(required.contains("not signed"), "{required}");
+        sign(&delta, &one).unwrap();
+        sign(&delta, &two).unwrap();
+        let again = sign(&delta, &one).unwrap();
+        assert_eq!(
+            again.signed_by,
+            [two.public_key().to_hex(), one.public_key().to_hex()]
+        );
+        let signed = std::fs::read(&delta).unwrap();
+        let span = unsigned.len() - FOOTER_TAIL_BYTES as usize;
+        assert_eq!(signed[..span], unsigned[..span]);
+        assert_eq!(signed.len(), unsigned.len() + 2 * RECORD_BYTES as usize);
+        let out = dir.path().join("out.pmtiles");
+        let applied = apply(&a, &delta, &out, &[two.public_key()]).unwrap();
+        assert_eq!(applied.signed_by.len(), 2);
+        assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    #[test]
+    fn a_version_1_delta_still_applies_unsigned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, delta) = unsigned_delta(dir.path());
+        let mut bytes = std::fs::read(&delta).unwrap();
+        bytes.truncate(bytes.len() - FOOTER_TAIL_BYTES as usize);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let at = text.find(r#""version":2"#).unwrap() + r#""version":"#.len();
+        bytes[at] = b'1';
+        std::fs::write(&delta, &bytes).unwrap();
+        assert_eq!(read_manifest(&delta).unwrap().version, 1);
+        let out = dir.path().join("out.pmtiles");
+        assert!(apply(&a, &delta, &out, &[]).unwrap().signed_by.is_empty());
+        assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&b).unwrap());
+        let key = SecretKey::from_seed(&[1; 32]);
+        assert!(sign(&delta, &key).unwrap_err().contains("version 1"));
+        let required = apply(
+            &a,
+            &delta,
+            &dir.path().join("x.pmtiles"),
+            &[key.public_key()],
+        );
+        assert!(required.unwrap_err().contains("not signed"));
+    }
+
+    #[test]
+    fn bytes_after_the_end_operation_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _, delta) = unsigned_delta(dir.path());
+        let mut bytes = std::fs::read(&delta).unwrap();
+        let at = bytes.len() - FOOTER_TAIL_BYTES as usize;
+        bytes.splice(at..at, [0u8; 3]);
+        std::fs::write(&delta, &bytes).unwrap();
+        let error = apply(&a, &delta, &dir.path().join("out.pmtiles"), &[]).unwrap_err();
+        assert!(error.contains("after its end operation"), "{error}");
+    }
+
+    #[test]
+    fn lists_the_tiles_that_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.pmtiles"), dir.path().join("b.pmtiles"));
+        archive(
+            &a,
+            &[(0, b"world"), (1, b"x"), (2, b"y"), (3, b"gone")],
+            "{}",
+        );
+        archive(
+            &b,
+            &[(0, b"world"), (1, b"x"), (2, b"z"), (5, b"new")],
+            "{}",
+        );
+        let list = dir.path().join("tiles.txt");
+        let options = DiffOptions {
+            changed_tiles: Some(list.clone()),
+            ..DiffOptions::default()
+        };
+        let report = diff(&a, &b, &dir.path().join("a-b.delta"), &options).unwrap();
+        // Tile IDs 2, 3 and 5 are 1/0/1, 1/1/1 and 2/0/0.
+        assert_eq!(
+            std::fs::read_to_string(&list).unwrap(),
+            "1/0/1\n1/1/1\n2/0/0\n"
+        );
+        assert_eq!(report.changed_tiles, Some((list, 3)));
     }
 
     /// A trial that guessed the wrong gzip level still settles on the level

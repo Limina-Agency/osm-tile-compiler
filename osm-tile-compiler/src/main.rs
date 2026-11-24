@@ -22,12 +22,10 @@ static TUNE_ALLOCATOR: extern "C" fn() = {
 };
 
 mod cli;
+mod completions;
 mod interrupt;
-use osm_tile_compiler::{
-    BasemapRequest, CompileError, CompileStage, LayerSelection, ReadScope, SourcesPolicy,
-    SupplementalDataset, compile_basemap,
-};
-use serde::Deserialize;
+mod worker_request;
+use osm_tile_compiler::{CompileError, CompileStage, compile_basemap};
 use serde_json::json;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -40,47 +38,6 @@ const PROTOCOL_VERSION: u32 = 1;
 
 /// Raised when the host closes stdin: the compile stops and cleans up.
 static CANCELLED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CompilerProcessRequest {
-    input_pbf_path: PathBuf,
-    /// More extracts to merge with `inputPbfPath` [default: none].
-    #[serde(default)]
-    extra_input_pbf_paths: Vec<PathBuf>,
-    sources_dir: PathBuf,
-    output_pmtiles_path: PathBuf,
-    temp_dir: PathBuf,
-    manifest_path: PathBuf,
-    /// A GeoJSON or Osmosis `.poly` file limiting the compile to its area.
-    #[serde(default)]
-    polygon_path: Option<PathBuf>,
-    /// Read only the OSM data in and near the polygon [default: no].
-    #[serde(default)]
-    area_only: bool,
-    /// Layers to write [default: all]; not together with `excludeLayers`.
-    #[serde(default)]
-    layers: Option<Vec<String>>,
-    /// Layers to leave out.
-    #[serde(default)]
-    exclude_layers: Option<Vec<String>>,
-    /// `name:<lang>` languages to write, as `--languages` takes them
-    /// [default: all the schema lists].
-    #[serde(default)]
-    languages: Option<Vec<String>>,
-    /// Supplemental datasets to compile without, by id (`water_polygons`,
-    /// `natural_earth`, `lake_centerlines`); they are not downloaded.
-    #[serde(default)]
-    omit_sources: Vec<String>,
-    /// Whether to write the building levels beside the archive
-    /// [default: no].
-    #[serde(default)]
-    building_levels: bool,
-    /// Whether to also write the search-and-rescue layer `sar`
-    /// [default: no].
-    #[serde(default)]
-    sar: bool,
-}
 
 fn emit(event: serde_json::Value) -> Result<(), String> {
     let stdout = io::stdout();
@@ -168,55 +125,8 @@ fn run() -> Result<(), WorkerError> {
     if args.next().is_some() {
         return Err(WorkerError::invalid(USAGE));
     }
-    let bytes = std::fs::read(&request_path).map_err(|error| {
-        WorkerError::invalid(format!(
-            "Failed to read compiler request {request_path:?}: {error}"
-        ))
-    })?;
-    let request: CompilerProcessRequest = serde_json::from_slice(&bytes).map_err(|error| {
-        WorkerError::invalid(format!(
-            "Invalid compiler request {request_path:?}: {error}"
-        ))
-    })?;
-    let omit_sources = request
-        .omit_sources
-        .iter()
-        .map(|id| {
-            SupplementalDataset::from_id(id)
-                .ok_or_else(|| WorkerError::invalid(format!("unknown supplemental dataset '{id}'")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut compile = BasemapRequest::new(
-        request.input_pbf_path,
-        request.output_pmtiles_path,
-        request.sources_dir,
-        request.temp_dir,
-    );
-    compile.extra_inputs = request.extra_input_pbf_paths;
-    compile.sources_policy = SourcesPolicy::FetchAndVerify;
-    compile.omit_sources = omit_sources;
-    // `areaOnly` without a polygon reads the whole extract, as before.
-    let read = if request.area_only && request.polygon_path.is_some() {
-        ReadScope::NearArea
-    } else {
-        ReadScope::WholeExtract
-    };
-    compile.area.polygon = request.polygon_path.map(Into::into);
-    compile.area.read = read;
-    compile.layers = match (request.layers, request.exclude_layers) {
-        (Some(_), Some(_)) => {
-            return Err(WorkerError::invalid(
-                "give either the layers to write or those to leave out, not both",
-            ));
-        }
-        (Some(only), None) => LayerSelection::only(only),
-        (None, Some(except)) => LayerSelection::except(except),
-        (None, None) => LayerSelection::All,
-    };
-    compile.languages = request.languages;
-    compile.building_levels = request.building_levels;
-    compile.sar = request.sar;
+    let (compile, manifest_path) =
+        worker_request::read(&request_path).map_err(WorkerError::invalid)?;
     // Each stage is reported once, as before; downloads also with their
     // fraction.
     let mut last = None;
@@ -234,7 +144,7 @@ fn run() -> Result<(), WorkerError> {
         || CANCELLED.load(Ordering::Relaxed) || interrupt::requested(),
     )?;
     std::fs::write(
-        &request.manifest_path,
+        &manifest_path,
         serde_json::to_vec_pretty(&output.manifest()).map_err(|e| e.to_string())?,
     )
     .map_err(|e| format!("Failed to write compiler manifest: {e}"))?;

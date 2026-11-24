@@ -212,6 +212,18 @@ with no network but the server's:
 osm-tile-compiler serve berlin.pmtiles --style-pack berlin-style --host 0.0.0.0
 ```
 
+### Shell completions
+
+```sh
+source <(osm-tile-compiler completions bash)   # in ~/.bashrc
+source <(osm-tile-compiler completions zsh)    # in ~/.zshrc
+osm-tile-compiler completions fish | source    # in ~/.config/fish/config.fish
+```
+
+They complete the commands, each command's options, and the values the
+tool knows: formats, layers, supplemental datasets, replication sources and
+shells.
+
 ## Choosing what to compile
 
 ### Area
@@ -352,6 +364,8 @@ metadata. Tiles over 1 MiB compressed produce a warning at compile time.
 osm-tile-compiler extract malopolskie.pmtiles --output tatras.pmtiles --bounds 19.70 49.15 20.25 49.35
 # A search area drawn as a polygon, without the street-level zoom
 osm-tile-compiler extract poland.pmtiles --output search.pmtiles --polygon area.geojson --max-zoom 13
+# The same from an archive on a web server or object store
+osm-tile-compiler extract https://example.com/poland.pmtiles --output tatras.pmtiles --bounds 19.70 49.15 20.25 49.35
 ```
 
 `extract` writes a new archive holding the tiles of an existing one within
@@ -363,6 +377,17 @@ polygon writes, and they are not cut: features keep their full geometry, as
 in the source. The header and metadata get the new bounds, center and zooms;
 everything else in the metadata is kept. It reads any PMTiles v3 archive.
 From Rust, `archive::extract` takes an `ExtractRequest`.
+
+The source can be an `http://` or `https://` URL on any server that answers
+range requests, as the ones PMTiles viewers read from do. `extract` then
+downloads only what the area needs: the header and root directory in one
+request, the leaf directories that may address kept tiles, and the kept
+tiles, nearby ones together in one range and eight ranges at a time. A box
+in central Berlin from a 42 MB Berlin archive takes 8 requests and 3.1 MB.
+The output is byte for byte the one a local copy gives. A server that
+ignores ranges is refused, and an archive that changes while it is read
+(another length or ETag) fails the extract; either way nothing is written.
+From Rust, `ExtractRequest::remote(url, output)`.
 
 ## Keeping an extract fresh (experimental)
 
@@ -401,6 +426,27 @@ box; `--no-clip` keeps every change, for diffs already cut to the region.
 Recompiling and diffing against the archive from before gave an 88 kB delta
 (240 tiles changed, 38 added). From Rust, the same is
 `update_extract`, built on `osm_pbf_ingest::changes`.
+
+`update --changed-tiles reach.txt` also writes which tiles the changes reach,
+one `z/x/y` per line at zooms 0 to 14 (`--min-zoom`, `--max-zoom`), the list
+osm2pgsql's expiry writes and Tilekiln and other renderers regenerate from. It
+covers the boxes of every changed object before and after, of every way whose
+node moved, and of every multipolygon or boundary whose member changed,
+widened by a quarter of a tile (64 pixels) for features and labels drawn
+across a tile's edge. `diff
+--changed-tiles` writes the tiles that actually differ between two archives in
+the same format. For the 13 hours of planet diffs on Małopolskie above, the
+list held 5,112 tiles and covered all 278 tiles that recompiling changed; it
+took 1.2 s on top of the update. The list is wide on purpose: most edits (new
+address points, untagged nodes) change no tile, and two effects reach far from
+an edit. Labels are drawn beyond their feature's tile, and the
+profile orders a way's routes (`route_1`, `route_2`, ...) as Planetiler
+does, by an index over every route, boundary, river and building relation in
+the extract, so a change to any such relation can reorder the routes of ways
+anywhere. The list therefore also holds every way in two or more routes
+whenever such a relation changes. Without that rule and the margin, the list
+held 1,571 tiles but missed 93 of the 278; with a whole tile's margin it held
+7,936.
 
 A recompile after an update can also skip the tiles the update left alone:
 
@@ -451,9 +497,31 @@ of OpenStreetMap edits gave a 63 kB delta: 245 of its 11,305 tiles changed and
 27 were added. `diff` took 1.4 s and `apply` 0.7 s on a 4-core cloud VM. Recompiling with
 `--languages en` instead, which changes half the tiles, gave a 5.8 MB delta.
 
+A delta can be signed, so a device applies only updates from someone it
+trusts, whichever way they arrive (a mesh, USB, a shared drive):
+
+```sh
+osm-tile-compiler keygen release.key                     # writes release.key and release.key.pub
+osm-tile-compiler diff old.pmtiles new.pmtiles --output update.delta --sign release.key
+osm-tile-compiler apply old.pmtiles update.delta --output new.pmtiles --trusted-key release.key.pub
+```
+
+`apply --trusted-key` (64 hex digits or a `.pub` file, repeatable) refuses a
+delta without a valid signature by a trusted key before it writes anything.
+Each signature is ed25519 over the SHA-256 of the whole delta before its
+signature footer, the manifest included, so it vouches for both archives'
+digests as well as every operation. `sign FILE.delta --key KEY` adds a
+signature to an existing delta, beside any others, and `verify-signature`
+checks one. Whole archives are signed the same way with a detached
+`<archive>.sig` file: `sign new.pmtiles --key release.key`, then
+`verify-signature new.pmtiles --trusted-key release.key.pub`. Without
+`--trusted-key`, an unsigned delta applies as before, but one whose signature
+does not match never does.
+
 The delta format is experimental: a delta applies only with a build that reads
 its version (`docs/formats.md`). From Rust, the same is
-`archive::{diff, apply, read_delta_manifest}`.
+`archive::{diff_with, apply_trusted, verify_delta, sign_delta, sign_file,
+verify_file_signature, read_delta_manifest}`.
 
 ## Using it as a library
 
@@ -512,7 +580,9 @@ let output: Result<BasemapOutput, CompileError> =
 
 Apps that would rather run a separate process can start the binary as a
 worker (`--request <request.json>`), which reports progress as JSON lines on
-stdout. [`docs/formats.md`](docs/formats.md) describes the request, the manifest and the other
+stdout. `compile --request <request.json>` runs the same request from a
+terminal, with the command line's progress instead, and writes the manifest
+where the request says: handy to rerun what an app asked for. [`docs/formats.md`](docs/formats.md) describes the request, the manifest and the other
 formats the compiler writes, and how their versions change.
 
 ## Performance

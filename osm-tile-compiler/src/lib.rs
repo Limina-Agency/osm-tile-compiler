@@ -101,6 +101,7 @@ mod sources;
 pub mod stage_profile;
 mod style_pack;
 mod tile_geometry;
+mod tile_list;
 mod tile_slicer;
 mod tile_stats;
 mod updates;
@@ -134,10 +135,11 @@ pub use style_pack::{
     DEFAULT_GLYPHS_URL, DEFAULT_SPRITE_URL, STYLE_FONTSTACKS, StylePackEvent, StylePackReport,
     StylePackRequest, maplibre_style, with_sar_layers, write_style_pack,
 };
+pub use tile_list::{CHANGED_TILE_BUFFER_PIXELS, TileAddress, read_tile_list};
 pub use tile_stats::{LayerStats, TILE_WARNING_BYTES, TileSize, TileStats, ZoomStats};
 pub use updates::{
-    ClipTo, DEFAULT_MAX_DIFFS, PLANET_REPLICATION, Replication, UpdateEvent, UpdateReport,
-    UpdateRequest, update_extract,
+    ChangedTilesReport, ChangedTilesRequest, ClipTo, DEFAULT_MAX_DIFFS, PLANET_REPLICATION,
+    Replication, UpdateEvent, UpdateReport, UpdateRequest, update_extract,
 };
 
 /// The languages whose `name:<lang>` attributes a

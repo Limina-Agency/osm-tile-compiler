@@ -1,6 +1,6 @@
 //! The human command line: `compile`, `building-levels`, `fetch-sources`,
 //! `style`, `inspect`, `verify`, `extract`, `diff`, `apply`, `update`, `serve`,
-//! `help`, `--version`.
+//! `keygen`, `sign`, `verify-signature`, `completions`, `help`, `--version`.
 //! Progress goes to stderr; stdout carries only what was asked for (help,
 //! the version, `--json`). Usage errors exit with 2, failures with 1, and
 //! a command stopped by Ctrl-C with 130 (see `interrupt`).
@@ -8,12 +8,12 @@ mod serve;
 
 use crate::interrupt;
 use osm_tile_compiler::{
-    ArchiveCenter, Area, BasemapRequest, BuildingLevelsReport, ClipTo, CompileBounds, CompileError,
-    CompileStage, DEFAULT_MAX_DIFFS, ExtractEvent, FetchEvent, FetchMode, LayerSelection,
-    OMT_LANGUAGES as LANGUAGES, OMT_LAYERS as LAYERS, OutputFormat, ReadScope, Replication,
-    SourcesPolicy, StylePackEvent, StylePackRequest, SupplementalDataset, UpdateEvent,
-    UpdateReport, UpdateRequest, ZoomRange,
-    archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest},
+    ArchiveCenter, Area, BasemapRequest, BuildingLevelsReport, ChangedTilesRequest, ClipTo,
+    CompileBounds, CompileError, CompileStage, DEFAULT_MAX_DIFFS, ExtractEvent, FetchEvent,
+    FetchMode, LayerSelection, OMT_LANGUAGES as LANGUAGES, OMT_LAYERS as LAYERS, OutputFormat,
+    ReadScope, Replication, SourcesPolicy, StylePackEvent, StylePackRequest, SupplementalDataset,
+    UpdateEvent, UpdateReport, UpdateRequest, ZoomRange,
+    archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest, PublicKey, SecretKey},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
     kib, maplibre_style, resolve_languages, update_extract, with_sar_layers,
     write_building_levels_cancellable, write_style_pack,
@@ -34,40 +34,50 @@ const UPDATED_PBF: &str = ".osm-tile-compiler-updated.osm.pbf";
 /// local server the tests run.
 const GEOFABRIK_INDEX_VAR: &str = "OSM_TILE_COMPILER_GEOFABRIK_INDEX";
 
-const USAGE: &str = "\
+pub(crate) const USAGE: &str = "\
 Usage:
   osm-tile-compiler compile <INPUT.pbf>... --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile --request <REQUEST.json> [--threads <N>] [--json]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
-  osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
-  osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
-  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
+  osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
+  osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--sign <KEY>] [--changed-tiles <FILE>] [--json]
+  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--trusted-key <KEY>]... [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
   osm-tile-compiler serve <ARCHIVE>... [--style-pack <DIR>] [--host <ADDR>] [--port <N>]
+  osm-tile-compiler keygen <FILE.key>
+  osm-tile-compiler sign <FILE> --key <FILE.key> [--json]
+  osm-tile-compiler verify-signature <FILE> [--trusted-key <KEY>]... [--signature <FILE.sig>] [--json]
+  osm-tile-compiler completions <bash|zsh|fish>
   osm-tile-compiler help | --help
   osm-tile-compiler --version";
 
-const HELP: &str = "\
+pub(crate) const HELP: &str = "\
 Compiles an OpenStreetMap PBF extract into an OpenMapTiles-schema vector
 basemap, written as one PMTiles or MBTiles archive.
 
 Usage:
   osm-tile-compiler compile <INPUT.pbf>... --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
   osm-tile-compiler compile --area <NAME> --output <FILE.pmtiles|FILE.mbtiles> --sources <DIR> [OPTIONS]
+  osm-tile-compiler compile --request <REQUEST.json> [--threads <N>] [--json]
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler style <ARCHIVE_URL> [--glyphs <URL>] [--sprite <URL>] [--offline <DIR>] [--sar]
   osm-tile-compiler inspect <FILE.pmtiles> [--json]
   osm-tile-compiler verify <FILE.pmtiles> [--json]
-  osm-tile-compiler extract <INPUT.pmtiles> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
-  osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--json]
-  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--json]
+  osm-tile-compiler extract <INPUT.pmtiles|URL> --output <FILE.pmtiles> [--bounds <W S E N>] [--polygon <FILE>] [OPTIONS]
+  osm-tile-compiler diff <OLD.pmtiles> <NEW.pmtiles> --output <FILE.delta> [--sign <KEY>] [--changed-tiles <FILE>] [--json]
+  osm-tile-compiler apply <OLD.pmtiles> <FILE.delta> --output <NEW.pmtiles> [--trusted-key <KEY>]... [--json]
   osm-tile-compiler update <INPUT.pbf> [CHANGES.osc...] --output <NEW.pbf> [OPTIONS]
   osm-tile-compiler serve <ARCHIVE>... [--style-pack <DIR>] [--host <ADDR>] [--port <N>]
+  osm-tile-compiler keygen <FILE.key>
+  osm-tile-compiler sign <FILE> --key <FILE.key> [--json]
+  osm-tile-compiler verify-signature <FILE> [--trusted-key <KEY>]... [--signature <FILE.sig>] [--json]
+  osm-tile-compiler completions <bash|zsh|fish>
   osm-tile-compiler help | --help
   osm-tile-compiler --version
 
@@ -90,7 +100,9 @@ Commands:
                    encoding; exits with 1 if anything is wrong
   extract          Cut an area out of a PMTiles archive into a new one: the
                    tiles within a box, a polygon and zooms, copied byte for
-                   byte
+                   byte. The archive may be an http:// or https:// URL; it
+                   is read by range requests, so only the parts the area
+                   needs are downloaded
   diff             Experimental: write a delta that turns OLD.pmtiles into
                    NEW.pmtiles, carrying only the parts OLD doesn't hold
   apply            Experimental: rebuild NEW.pmtiles from OLD.pmtiles and a
@@ -102,8 +114,25 @@ Commands:
   serve            Serve archives (PMTiles or MBTiles) over HTTP for a
                    preview: tiles, TileJSON, a MapLibre style for each, and
                    the glyphs and sprite of an offline style pack
+  keygen           Write a new ed25519 signing key to FILE.key and its public
+                   key to FILE.key.pub, for sign, diff --sign and
+                   --trusted-key
+  sign             Sign FILE with a key: a delta in place, in its footer;
+                   any other file, such as an archive, in FILE.sig beside it.
+                   Signatures by other keys are kept
+  verify-signature Check FILE's signatures (a delta's own, or FILE.sig's):
+                   exits with 1 unless every signature matches and, with
+                   --trusted-key, one is by a trusted key
+  completions      Print a completion script for bash, zsh or fish:
+                   'source <(osm-tile-compiler completions bash)' in
+                   ~/.bashrc, the same with zsh in ~/.zshrc, or
+                   'osm-tile-compiler completions fish | source' in fish
 
 Compile options:
+  --request <FILE>      Compile what a worker request asks for (the JSON the
+                        worker mode below reads), printing progress as the
+                        command line does, and write its manifest where the
+                        request says. Only --threads and --json go with it
   --area <NAME>         Instead of INPUT.pbf, compile Geofabrik's extract of a
                         region: its identifier (malopolskie, us/georgia), its
                         name (Małopolskie) or its ISO code (PL-12). It is
@@ -177,6 +206,8 @@ Compile options:
   --delta-from <OLD.pmtiles>
                         Experimental: also write <NAME>.delta beside the
                         archive, the delta that turns OLD.pmtiles into it
+  --sign-delta <FILE.key>
+                        Sign the --delta-from delta with this key
   --merge-cache         Experimental: also write <NAME>.merge-cache beside
                         the archive, so that a later compile can reuse its
                         tiles with --reuse-from
@@ -198,13 +229,31 @@ Extract options:
   --json                Print the extract report as JSON on stdout
   The tiles kept are those a compile limited to the same box or polygon
   writes. Tiles are not cut: features in kept tiles keep their full
-  geometry, as in the source.
+  geometry, as in the source. A URL's server must answer range requests,
+  as any server PMTiles viewers read from does.
 
 Diff and apply options:
   --output <FILE>       File to write; must not exist yet
+  --sign <FILE.key>     diff: sign the delta with this key (see keygen)
+  --changed-tiles <FILE>
+                        diff: also write the tiles that differ between the
+                        archives (changed, added or removed), one z/x/y per
+                        line; must not exist yet
+  --trusted-key <KEY>   apply: require a signature by this public key, given
+                        as 64 hex digits or a .pub file; repeat to trust
+                        several. The signature is checked before anything is
+                        written. Without it, an unsigned delta applies, but
+                        one whose signature does not match never does
   --json                Print the delta's manifest and size as JSON on stdout
   The delta format is experimental and may change between releases; a delta
   applies only with a build that reads its version.
+
+Signing options:
+  --key <FILE.key>      sign: the secret key keygen wrote
+  --trusted-key <KEY>   verify-signature: as for apply
+  --signature <FILE>    verify-signature: the signature file of a file that is
+                        not a delta [default: FILE.sig]
+  --json                Print what was checked as JSON on stdout
 
 Update options (experimental):
   --output <FILE>       Updated PBF to write; must not exist yet
@@ -223,6 +272,15 @@ Update options (experimental):
   --no-clip             Keep every change, for diffs already cut to the region;
                         planet diffs need the clip
   --threads <N>         Worker threads [default: available cores]
+  --changed-tiles <FILE>
+                        Also write the tiles the changes reach, one z/x/y per
+                        line, as osm2pgsql's expire lists are: every tile a
+                        changed object, a way whose node moved or a
+                        multipolygon whose member changed reaches, before or
+                        after, with a quarter tile around it for labels; must
+                        not exist yet
+  --min-zoom <N>, --max-zoom <N>
+                        Zooms --changed-tiles lists [default: 0 and 14]
   --json                Print the update report as JSON on stdout
   Changes to objects the input holds are always kept; new objects are kept
   when they are inside the box or reach into the extract. Rewritten blocks
@@ -308,6 +366,7 @@ struct CompileArgs {
     languages: Option<Vec<String>>,
     changes: ChangeArgs,
     delta_from: Option<PathBuf>,
+    sign_delta: Option<PathBuf>,
     merge_cache: osm_tile_compiler::MergeCacheOptions,
 }
 
@@ -380,6 +439,7 @@ struct UpdateArgs {
     bounds: Option<CompileBounds>,
     threads: Option<usize>,
     json: bool,
+    changed_tiles: Option<ChangedTilesRequest>,
 }
 
 /// What `compile` reads: a PBF, or a region's extract to download.
@@ -414,16 +474,44 @@ enum Command {
     Help,
     Version,
     Compile(Box<CompileArgs>),
+    CompileRequest(RequestArgs),
     BuildingLevels(BuildingLevelsArgs),
     FetchSources(PathBuf),
     Style(StyleArgs),
-    Inspect { archive: PathBuf, json: bool },
-    Verify { archive: PathBuf, json: bool },
+    Inspect {
+        archive: PathBuf,
+        json: bool,
+    },
+    Verify {
+        archive: PathBuf,
+        json: bool,
+    },
     Extract(Box<ExtractArgs>),
     Diff(DeltaArgs),
     Apply(DeltaArgs),
     Update(Box<UpdateArgs>),
     Serve(serve::ServeArgs),
+    Completions(String),
+    Keygen(PathBuf),
+    Sign {
+        file: PathBuf,
+        key: PathBuf,
+        json: bool,
+    },
+    VerifySignature {
+        file: PathBuf,
+        trusted: Vec<PublicKey>,
+        signature: Option<PathBuf>,
+        json: bool,
+    },
+}
+
+/// `compile --request <FILE>`.
+#[derive(Debug)]
+struct RequestArgs {
+    request: PathBuf,
+    threads: Option<usize>,
+    json: bool,
 }
 
 #[derive(Debug)]
@@ -445,6 +533,12 @@ struct DeltaArgs {
     other: PathBuf,
     output: PathBuf,
     json: bool,
+    /// `diff --sign`.
+    sign: Option<PathBuf>,
+    /// `diff --changed-tiles`.
+    changed_tiles: Option<PathBuf>,
+    /// `apply --trusted-key`.
+    trusted: Vec<PublicKey>,
 }
 
 /// Runs the command line on `args` (without the program name) and returns the
@@ -471,6 +565,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
             Ok(())
         }
         Command::Compile(args) => compile(*args),
+        Command::CompileRequest(args) => compile_request(args),
         Command::BuildingLevels(args) => building_levels(args),
         Command::FetchSources(directory) => fetch_sources(&directory),
         Command::Style(args) => style(args),
@@ -481,6 +576,19 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::Apply(args) => apply(args),
         Command::Update(args) => update(*args),
         Command::Serve(args) => serve::run(args),
+        Command::Keygen(path) => keygen(&path),
+        Command::Sign { file, key, json } => sign(&file, &key, json),
+        Command::VerifySignature {
+            file,
+            trusted,
+            signature,
+            json,
+        } => verify_signature(&file, &trusted, signature.as_deref(), json),
+        Command::Completions(shell) => {
+            let script = crate::completions::script(&shell, NAME).expect("checked when parsed");
+            print!("{script}");
+            Ok(())
+        }
     };
     match result {
         Ok(()) => 0,
@@ -495,6 +603,12 @@ pub fn main(args: Vec<OsString>) -> i32 {
     }
 }
 
+/// The usage error `args` give, if any. For the completions' test.
+#[cfg(test)]
+pub(crate) fn usage_error(args: &[OsString]) -> Option<String> {
+    parse(args).err()
+}
+
 fn parse(args: &[OsString]) -> Result<Command, String> {
     let Some(first) = args.first() else {
         return Err("no command given".into());
@@ -503,6 +617,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
     match first.to_str() {
         Some("help" | "--help" | "-h") => Ok(Command::Help),
         Some("--version" | "-V") => Ok(Command::Version),
+        Some("compile") if rest.iter().any(|arg| arg == "--request") => parse_compile_request(rest),
         Some("compile") => parse_compile(rest),
         Some("building-levels") => parse_building_levels(rest),
         Some("fetch-sources") => parse_fetch_sources(rest),
@@ -512,6 +627,9 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some(name @ ("diff" | "apply")) => parse_delta_command(name, rest),
         Some("update") => parse_update(rest),
         Some("serve") => serve::parse(rest),
+        Some("keygen") => parse_keygen(rest),
+        Some(name @ ("sign" | "verify-signature")) => parse_signature_command(name, rest),
+        Some("completions") => parse_completions(rest),
         _ => Err(format!("unknown command '{}'", first.to_string_lossy())),
     }
 }
@@ -596,6 +714,46 @@ fn parse_bounds<'a>(
     Ok(CompileBounds::new(north, south, east, west))
 }
 
+/// `compile --request <FILE> [--threads <N>] [--json]`: everything else
+/// comes from the request.
+fn parse_compile_request(args: &[OsString]) -> Result<Command, String> {
+    let mut request = None;
+    let mut threads = None;
+    let mut json = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match option(arg).as_deref() {
+            Some("--help" | "-h") => return Ok(Command::Help),
+            Some("--request") => request = Some(PathBuf::from(value(&mut args, "--request")?)),
+            Some("--json") => json = true,
+            Some("--threads") => {
+                let count: usize = number(value(&mut args, "--threads")?, "--threads")?;
+                if count == 0 {
+                    return Err("--threads must be at least 1".into());
+                }
+                threads = Some(count);
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "compile --request takes its options from the request; only \
+                     --threads and --json go with it, not '{flag}'"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "compile --request takes its input from the request, not '{}'",
+                    arg.to_string_lossy()
+                ));
+            }
+        }
+    }
+    Ok(Command::CompileRequest(RequestArgs {
+        request: request.ok_or("--request needs a value")?,
+        threads,
+        json,
+    }))
+}
+
 fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut input = None;
     let mut extra_inputs = Vec::new();
@@ -625,6 +783,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
     let mut languages = None;
     let mut changes = ChangeArgs::default();
     let mut delta_from = None;
+    let mut sign_delta = None;
     let mut merge_cache = osm_tile_compiler::MergeCacheOptions::default();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -735,6 +894,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
                 languages = Some(list);
             }
             "--delta-from" => delta_from = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--sign-delta" => sign_delta = Some(PathBuf::from(value(&mut args, &flag)?)),
             "--merge-cache" => merge_cache.write = true,
             "--reuse-from" => {
                 merge_cache.reuse_from = Some(PathBuf::from(value(&mut args, &flag)?));
@@ -823,6 +983,9 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         },
         (None, None) => unreachable!("checked above"),
     };
+    if sign_delta.is_some() && delta_from.is_none() {
+        return Err("--sign-delta signs the --delta-from delta; give --delta-from".into());
+    }
     Ok(Command::Compile(Box::new(CompileArgs {
         input,
         extra_inputs,
@@ -848,6 +1011,7 @@ fn parse_compile(args: &[OsString]) -> Result<Command, String> {
         languages,
         changes,
         delta_from,
+        sign_delta,
         merge_cache,
     })))
 }
@@ -859,6 +1023,8 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
     let mut bounds = None;
     let mut threads = None;
     let mut json = false;
+    let mut changed_tiles = None;
+    let (mut min_zoom, mut max_zoom) = (None, None);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let Some(flag) = option(arg) else {
@@ -868,6 +1034,9 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
         match flag.as_str() {
             "--help" | "-h" => return Ok(Command::Help),
             "--output" | "-o" => output = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--changed-tiles" => changed_tiles = Some(PathBuf::from(value(&mut args, &flag)?)),
+            "--min-zoom" => min_zoom = Some(number(value(&mut args, &flag)?, &flag)?),
+            "--max-zoom" => max_zoom = Some(number(value(&mut args, &flag)?, &flag)?),
             "--bounds" => bounds = Some(parse_bounds(&mut args, &flag)?),
             "--threads" => {
                 let count: usize = number(value(&mut args, &flag)?, &flag)?;
@@ -895,6 +1064,20 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
         return Err("--bounds and --no-clip cannot be combined".into());
     }
     let output = output.ok_or("update needs --output <NEW.pbf>")?;
+    if changed_tiles.is_none() && (min_zoom.is_some() || max_zoom.is_some()) {
+        return Err("--min-zoom and --max-zoom choose the zooms of --changed-tiles".into());
+    }
+    let changed_tiles = match changed_tiles {
+        Some(path) => Some(ChangedTilesRequest {
+            output: path,
+            zooms: ZoomRange::new(
+                min_zoom.unwrap_or(0),
+                max_zoom.unwrap_or(ZoomRange::MAX_ZOOM),
+            )
+            .map_err(String::from)?,
+        }),
+        None => None,
+    };
     Ok(Command::Update(Box::new(UpdateArgs {
         input,
         output,
@@ -902,6 +1085,7 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
         bounds,
         threads,
         json,
+        changed_tiles,
     })))
 }
 
@@ -1040,16 +1224,45 @@ fn parse_extract(args: &[OsString]) -> Result<Command, String> {
     })))
 }
 
+fn parse_completions(args: &[OsString]) -> Result<Command, String> {
+    let shells = "bash, zsh or fish";
+    match args {
+        [shell] if option(shell).is_none() => {
+            let shell = shell.to_string_lossy().into_owned();
+            if crate::completions::SHELLS.contains(&shell.as_str()) {
+                Ok(Command::Completions(shell))
+            } else {
+                Err(format!(
+                    "unknown shell '{shell}'; completions are for {shells}"
+                ))
+            }
+        }
+        [flag] if matches!(flag.to_str(), Some("--help" | "-h")) => Ok(Command::Help),
+        [] => Err(format!("completions needs a shell: {shells}")),
+        _ => Err(format!("completions takes one shell: {shells}")),
+    }
+}
+
 fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String> {
     let mut paths = Vec::new();
     let mut output = None;
     let mut json = false;
+    let (mut sign, mut changed_tiles, mut trusted) = (None, None, Vec::new());
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match option(arg).as_deref() {
             Some("--help" | "-h") => return Ok(Command::Help),
             Some("--json") => json = true,
             Some("--output" | "-o") => output = Some(PathBuf::from(value(&mut args, "--output")?)),
+            Some(flag @ "--sign") if name == "diff" => {
+                sign = Some(PathBuf::from(value(&mut args, flag)?));
+            }
+            Some(flag @ "--changed-tiles") if name == "diff" => {
+                changed_tiles = Some(PathBuf::from(value(&mut args, flag)?));
+            }
+            Some(flag @ "--trusted-key") if name == "apply" => {
+                trusted.push(trusted_key(value(&mut args, flag)?)?);
+            }
             Some(flag) => return Err(format!("unknown {name} option '{flag}'")),
             None => paths.push(PathBuf::from(arg)),
         }
@@ -1068,11 +1281,73 @@ fn parse_delta_command(name: &str, args: &[OsString]) -> Result<Command, String>
         other,
         output,
         json,
+        sign,
+        changed_tiles,
+        trusted,
     };
     Ok(if name == "diff" {
         Command::Diff(args)
     } else {
         Command::Apply(args)
+    })
+}
+
+/// A `--trusted-key` value: 64 hex digits or a public key file.
+fn trusted_key(text: &std::ffi::OsStr) -> Result<PublicKey, String> {
+    PublicKey::parse(&text.to_string_lossy()).map_err(|e| format!("--trusted-key: {e}"))
+}
+
+fn parse_keygen(args: &[OsString]) -> Result<Command, String> {
+    let mut path = None;
+    for arg in args {
+        match option(arg).as_deref() {
+            Some("--help" | "-h") => return Ok(Command::Help),
+            Some(flag) => return Err(format!("unknown keygen option '{flag}'")),
+            None if path.is_some() => return Err("keygen takes one key file".into()),
+            None => path = Some(PathBuf::from(arg)),
+        }
+    }
+    Ok(Command::Keygen(
+        path.ok_or("keygen needs a key file to write")?,
+    ))
+}
+
+fn parse_signature_command(name: &str, args: &[OsString]) -> Result<Command, String> {
+    let mut file = None;
+    let (mut key, mut signature, mut trusted, mut json) = (None, None, Vec::new(), false);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match option(arg).as_deref() {
+            Some("--help" | "-h") => return Ok(Command::Help),
+            Some("--json") => json = true,
+            Some(flag @ "--key") if name == "sign" => {
+                key = Some(PathBuf::from(value(&mut args, flag)?));
+            }
+            Some(flag @ "--trusted-key") if name == "verify-signature" => {
+                trusted.push(trusted_key(value(&mut args, flag)?)?);
+            }
+            Some(flag @ "--signature") if name == "verify-signature" => {
+                signature = Some(PathBuf::from(value(&mut args, flag)?));
+            }
+            Some(flag) => return Err(format!("unknown {name} option '{flag}'")),
+            None if file.is_some() => return Err(format!("{name} takes one file")),
+            None => file = Some(PathBuf::from(arg)),
+        }
+    }
+    let file = file.ok_or_else(|| format!("{name} needs a file"))?;
+    Ok(if name == "sign" {
+        Command::Sign {
+            file,
+            key: key.ok_or("sign needs --key <FILE.key>")?,
+            json,
+        }
+    } else {
+        Command::VerifySignature {
+            file,
+            trusted,
+            signature,
+            json,
+        }
     })
 }
 
@@ -1580,6 +1855,11 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         }
         None => None,
     };
+    // Read before the compile, so a bad key fails before any work.
+    let sign_key = match &args.sign_delta {
+        Some(path) => Some(SecretKey::read(path)?),
+        None => None,
+    };
     if let Some(polygon) = &args.polygon {
         // Read here too, so a bad polygon fails before any download.
         osm_tile_compiler::CompileArea::read(polygon)?;
@@ -1723,28 +2003,7 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     if args.profile.is_some() {
         osm_tile_compiler::stage_profile::start(threads);
     }
-    let start = Instant::now();
-    let mut stage = None;
-    let output = compile_basemap(
-        &request,
-        |progress| {
-            if progress.stage == CompileStage::FetchSources {
-                let percent = progress
-                    .fraction
-                    .map(|f| format!(" {:.0}%", f * 100.0))
-                    .unwrap_or_default();
-                status.update(&format!("{}{percent}", progress.message));
-            } else if stage != Some(progress.stage) {
-                status.line(&format!(
-                    "[{:>7.1}s] {}",
-                    start.elapsed().as_secs_f64(),
-                    progress.message
-                ));
-            }
-            stage = Some(progress.stage);
-        },
-        interrupt::requested,
-    );
+    let output = run_compile(&request, &mut status);
     let profile = osm_tile_compiler::stage_profile::finish();
     if let Some(updated) = &updated_input {
         let _ = std::fs::remove_file(updated);
@@ -1762,9 +2021,64 @@ fn compile(args: CompileArgs) -> Result<(), String> {
     })?;
     cleanup?;
     let result = &output.result;
+    report_compile(&mut status, &output);
+    write_profile(&mut status, args.profile.as_deref(), profile)?;
+    if let Some((old, delta_path)) = &delta {
+        let _partial = interrupt::remove_on_exit(archive::partial_path(delta_path));
+        let mut options = archive::DiffOptions::default();
+        options.sign_with = sign_key.clone();
+        let report = archive::diff_with(old, &args.output, delta_path, &options)?;
+        status.line(&format!(
+            "Wrote {}: {}{}",
+            delta_path.display(),
+            delta_summary(&report.manifest, report.delta_bytes),
+            signed_summary(&report.signed_by)
+        ));
+    }
+    if args.json {
+        let json = serde_json::to_string_pretty(result).map_err(|e| e.to_string())?;
+        println!("{json}");
+    }
+    Ok(())
+}
+
+/// Runs a compile, printing a line as each stage starts and download
+/// progress in place.
+fn run_compile(
+    request: &BasemapRequest,
+    status: &mut Status,
+) -> Result<osm_tile_compiler::BasemapOutput, CompileError> {
+    let start = Instant::now();
+    let mut stage = None;
+    compile_basemap(
+        request,
+        |progress| {
+            if progress.stage == CompileStage::FetchSources {
+                let percent = progress
+                    .fraction
+                    .map(|f| format!(" {:.0}%", f * 100.0))
+                    .unwrap_or_default();
+                status.update(&format!("{}{percent}", progress.message));
+            } else if stage != Some(progress.stage) {
+                status.line(&format!(
+                    "[{:>7.1}s] {}",
+                    start.elapsed().as_secs_f64(),
+                    progress.message
+                ));
+            }
+            stage = Some(progress.stage);
+        },
+        interrupt::requested,
+    )
+}
+
+/// The summary of a finished compile: what it wrote, how current its data
+/// is, its largest tile, the merge cache, warnings and building levels.
+fn report_compile(status: &mut Status, output: &osm_tile_compiler::BasemapOutput) {
+    let result = &output.result;
     status.line(&format!(
         "Wrote {}: {} tiles, {} features in {:.1} s",
-        args.output.display(),
+        output.archive.display(),
         result.tiles,
         result.profile_features,
         result.total_seconds
@@ -1789,20 +2103,42 @@ fn compile(args: CompileArgs) -> Result<(), String> {
         status.line(&format!("warning: {warning}"));
     }
     if let Some((path, report)) = &output.building_levels {
-        report_levels(&mut status, path, report);
+        report_levels(status, path, report);
     }
-    write_profile(&mut status, args.profile.as_deref(), profile)?;
-    if let Some((old, delta_path)) = &delta {
-        let _partial = interrupt::remove_on_exit(archive::partial_path(delta_path));
-        let report = archive::diff(old, &args.output, delta_path)?;
-        status.line(&format!(
-            "Wrote {}: {}",
-            delta_path.display(),
-            delta_summary(&report.manifest, report.delta_bytes)
-        ));
+}
+
+/// `compile --request`: the compile a worker request asks for, with the
+/// command line's progress, and its manifest written where it says.
+fn compile_request(args: RequestArgs) -> Result<(), String> {
+    let _cooperating = interrupt::cooperate();
+    let (mut request, manifest) = crate::worker_request::read(&args.request)?;
+    if let Some(threads) = args.threads {
+        request.threads = threads;
     }
+    let mut status = Status::new();
+    status.line(&format!(
+        "Compiling {} into {} as {} asks ({} threads)",
+        request.input_pbf.display(),
+        request.output.display(),
+        args.request.display(),
+        request.threads
+    ));
+    let output = run_compile(&request, &mut status).map_err(|error| match error {
+        CompileError::Cancelled => format!(
+            "the compile was cancelled; {} was not written",
+            request.output.display()
+        ),
+        error => error.to_string(),
+    })?;
+    report_compile(&mut status, &output);
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&output.manifest()).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("Failed to write the manifest {}: {e}", manifest.display()))?;
+    status.line(&format!("Wrote {}", manifest.display()));
     if args.json {
-        let json = serde_json::to_string_pretty(result).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string_pretty(&output.result).map_err(|e| e.to_string())?;
         println!("{json}");
     }
     Ok(())
@@ -1816,9 +2152,10 @@ fn update(args: UpdateArgs) -> Result<(), String> {
         Some(bounds) => ClipTo::Bounds(bounds),
         None => ClipTo::HeaderBounds { fallback: None },
     };
-    let request = args
+    let mut request = args
         .changes
         .request(&args.input, &args.output, clip, threads);
+    request.changed_tiles = args.changed_tiles;
     let mut status = Status::new();
     let report = run_update(&request, &mut status)?;
     if args.json {
@@ -1892,6 +2229,22 @@ fn run_update(request: &UpdateRequest, status: &mut Status) -> Result<UpdateRepo
             .map(|[first, last]| format!("; now at diff {last} (from {first})"))
             .unwrap_or_default()
     ));
+    if let Some(tiles) = &report.changed_tiles {
+        status.line(&format!(
+            "Wrote {}: {} tiles the changes reach, from {} boxes{}",
+            tiles.output.display(),
+            tiles.tiles,
+            tiles.boxes,
+            if tiles.nodes_missing > 0 {
+                format!(
+                    "; {} nodes neither file places were left out",
+                    tiles.nodes_missing
+                )
+            } else {
+                String::new()
+            }
+        ));
+    }
     Ok(report)
 }
 
@@ -1946,7 +2299,15 @@ fn verify(path: &Path, json: bool) -> Result<(), String> {
 
 fn extract(args: ExtractArgs) -> Result<(), String> {
     let _cooperating = interrupt::cooperate();
-    let mut request = archive::ExtractRequest::new(&args.input, &args.output);
+    let url = args
+        .input
+        .to_str()
+        .filter(|text| archive::is_remote_source(text))
+        .map(str::to_owned);
+    let mut request = match &url {
+        Some(url) => archive::ExtractRequest::remote(url, &args.output),
+        None => archive::ExtractRequest::new(&args.input, &args.output),
+    };
     request.bounds = args.bounds;
     if let Some(polygon) = &args.polygon {
         request.polygon = Some(osm_tile_compiler::CompileArea::read(polygon)?);
@@ -1962,6 +2323,11 @@ fn extract(args: ExtractArgs) -> Result<(), String> {
         })?);
     }
     let started = Instant::now();
+    if let Some(url) = &url
+        && !args.json
+    {
+        eprintln!("Reading {url} by range requests");
+    }
     let report = archive::extract(&request, interrupt::requested)?;
     if args.json {
         println!(
@@ -1980,6 +2346,13 @@ fn extract(args: ExtractArgs) -> Result<(), String> {
             report.zooms[1],
             started.elapsed().as_secs_f64()
         );
+        if url.is_some() {
+            eprintln!(
+                "Downloaded {} in {} range requests",
+                megabytes(report.bytes_read),
+                report.requests
+            );
+        }
     }
     Ok(())
 }
@@ -2007,8 +2380,13 @@ fn delta_summary(manifest: &DeltaManifest, delta_bytes: u64) -> String {
 }
 
 fn diff(args: DeltaArgs) -> Result<(), String> {
+    let mut options = archive::DiffOptions::default();
+    if let Some(key) = &args.sign {
+        options.sign_with = Some(SecretKey::read(key)?);
+    }
+    options.changed_tiles = args.changed_tiles.clone();
     let _partial = interrupt::remove_on_exit(archive::partial_path(&args.output));
-    let report = archive::diff(&args.base, &args.other, &args.output)?;
+    let report = archive::diff_with(&args.base, &args.other, &args.output, &options)?;
     if args.json {
         println!(
             "{}",
@@ -2016,28 +2394,125 @@ fn diff(args: DeltaArgs) -> Result<(), String> {
         );
     } else {
         eprintln!(
-            "Wrote {}: {}",
+            "Wrote {}: {}{}",
             args.output.display(),
-            delta_summary(&report.manifest, report.delta_bytes)
+            delta_summary(&report.manifest, report.delta_bytes),
+            signed_summary(&report.signed_by)
+        );
+        if let Some((path, tiles)) = &report.changed_tiles {
+            eprintln!("Wrote {}: {tiles} tiles differ", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn signed_summary(signed_by: &[String]) -> String {
+    if signed_by.is_empty() {
+        "; not signed".into()
+    } else {
+        format!("; signed by {}", signed_by.join(", "))
+    }
+}
+
+fn apply(args: DeltaArgs) -> Result<(), String> {
+    let _partial = interrupt::remove_on_exit(archive::partial_path(&args.output));
+    let report = archive::apply_trusted(&args.base, &args.other, &args.output, &args.trusted)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        eprintln!(
+            "Wrote {} (SHA-256 {}): {}{}{}",
+            args.output.display(),
+            report.manifest.target.sha256,
+            delta_summary(&report.manifest, report.delta_bytes),
+            signed_summary(&report.signed_by),
+            if report.trusted {
+                ", a trusted key"
+            } else {
+                ""
+            }
         );
     }
     Ok(())
 }
 
-fn apply(args: DeltaArgs) -> Result<(), String> {
-    let _partial = interrupt::remove_on_exit(archive::partial_path(&args.output));
-    let report = archive::apply(&args.base, &args.other, &args.output)?;
-    if args.json {
+fn keygen(path: &Path) -> Result<(), String> {
+    let key = SecretKey::generate()?;
+    let public = key.write_pair(path)?;
+    eprintln!(
+        "Wrote the secret key to {} and the public key to {}; keep the secret key private",
+        path.display(),
+        public.display()
+    );
+    println!("{}", key.public_key());
+    Ok(())
+}
+
+fn sign(file: &Path, key: &Path, json: bool) -> Result<(), String> {
+    let key = SecretKey::read(key)?;
+    let (checked, place) = if archive::is_delta(file) {
+        (archive::sign_delta(file, &key)?, file.to_path_buf())
+    } else {
+        (
+            archive::sign_file(file, &key)?,
+            archive::signature_path(file),
+        )
+    };
+    if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&checked).map_err(|e| e.to_string())?
         );
     } else {
         eprintln!(
-            "Wrote {} (SHA-256 {}): {}",
-            args.output.display(),
-            report.manifest.target.sha256,
-            delta_summary(&report.manifest, report.delta_bytes)
+            "Signed {} with {}: {} now holds {} signature{}",
+            file.display(),
+            key.public_key(),
+            place.display(),
+            checked.signed_by.len(),
+            if checked.signed_by.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
+    Ok(())
+}
+
+fn verify_signature(
+    file: &Path,
+    trusted: &[PublicKey],
+    signature: Option<&Path>,
+    json: bool,
+) -> Result<(), String> {
+    let (json_text, signed_by, trusted) = if archive::is_delta(file) {
+        if signature.is_some() {
+            return Err(
+                "a delta carries its own signatures; --signature is for other files".into(),
+            );
+        }
+        let verified = archive::verify_delta(file, trusted)?;
+        let text = serde_json::to_string_pretty(&verified).map_err(|e| e.to_string())?;
+        (text, verified.signed_by, verified.trusted)
+    } else {
+        let checked = archive::verify_file_signature(file, signature, trusted)?;
+        let text = serde_json::to_string_pretty(&checked).map_err(|e| e.to_string())?;
+        (text, checked.signed_by, checked.trusted)
+    };
+    if json {
+        println!("{json_text}");
+    } else if signed_by.is_empty() {
+        eprintln!("{}: not signed", file.display());
+    } else {
+        eprintln!(
+            "{}: every signature matches; signed by {}{}",
+            file.display(),
+            signed_by.join(", "),
+            if trusted { ", a trusted key" } else { "" }
         );
     }
     Ok(())
