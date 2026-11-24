@@ -189,7 +189,14 @@ fn a_killed_cli_compile_resumes_with_the_same_command() {
         let args = compile_args(&inputs, &output, &sources, true);
         let killed = cli(&args, Some(checkpoint));
         assert!(!killed.status.success(), "{checkpoint}: {killed:?}");
-        assert_eq!(killed.status.code(), None, "{checkpoint}: not aborted");
+        // An abort is a signal on Unix; on Windows it is the fast-fail exit
+        // status STATUS_STACK_BUFFER_OVERRUN.
+        let aborted = if cfg!(windows) {
+            Some(0xC000_0409_u32 as i32)
+        } else {
+            None
+        };
+        assert_eq!(killed.status.code(), aborted, "{checkpoint}: not aborted");
         let scratch = temp.path().join(format!("{checkpoint}.pmtiles.tmp"));
         assert!(scratch.is_dir(), "{checkpoint}: the scratch is gone");
         let resumed = cli(&args, None);
