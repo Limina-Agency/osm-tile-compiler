@@ -498,7 +498,13 @@ fn hex(bytes: &[u8]) -> String {
 /// Forces a file's data to disk, so that a checkpoint naming it survives a
 /// power loss, not only a kill.
 pub(crate) fn sync_file(path: &Path) -> Result<(), String> {
-    File::open(path)
+    // Windows flushes only a handle opened for writing (FlushFileBuffers
+    // fails with "Access is denied" on a read-only one). Opening for writing
+    // without truncating leaves the file as it is.
+    File::options()
+        .read(true)
+        .write(cfg!(windows))
+        .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|e| format!("Failed to sync {}: {e}", path.display()))
 }
