@@ -301,7 +301,7 @@ gives these sentences for an app to show.
 the attribution must keep crediting OpenMapTiles and OpenStreetMap.
 The metadata also says what made the archive and how current its data is,
 so an app can show "map data as of" and pick the newest of several
-archives: `generator` (`osm-tile-compiler 0.3.0`), and from the extract's
+archives: `generator` (`osm-tile-compiler 0.4.0`), and from the extract's
 header `osm_data_timestamp` (RFC 3339, UTC), `osm_replication_sequence` and
 `osm_replication_url`. Those three are left out when the header doesn't give
 them. `inspect` prints them, and `CompileResult::osm_data` has the same.

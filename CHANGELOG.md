@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-11-24)
 
 ### Breaking
 
@@ -13,9 +13,42 @@
   `UpdateRequest` gains `changed_tiles` and `UpdateReport` gains
   `changed_tiles`, so code that builds either with a struct literal needs the
   new field (`UpdateRequest::new` sets it to `None`).
+- `CompileStage` has a new `SearchIndex` stage, after `BuildingLevels`, and
+  `CompileStage::ALL` lists eight stages. Like `FetchSources` it is not part
+  of `overall`.
+- `ExtractReport` gains `requests` and `bytes_read`.
+- Depends on osm-pbf-ingest 0.7.0.
 
 ### New
 
+- An offline search index beside the archive: `compile --search-index`
+  (`BasemapRequest::search_index`) and the new `search-index` command write
+  `<NAME>-search.idx`, the names of the archive's highest zoom: places, POIs,
+  streets, peaks, lakes, rivers and the `sar` layer's huts, springs and
+  emergency points (also by ref), each with the nearest city, town or
+  village as its context. `search` and `SearchIndex::open`/`search` match
+  words regardless of case and diacritics (`fold_search_text`: Łódź = lodz),
+  the last word as a prefix, and rank by prominence, whole-name match and
+  distance from an optional point, within an optional box and layers. On
+  Małopolskie the index is 4.9 MB beside a 153.7 MB archive, built in 2.5 s,
+  and queries take 0.3 to 2 ms. The format (version 1) is in
+  [docs/search.md](docs/search.md). PMTiles and MVT archives only.
+- Python bindings: the new `osm-tile-compiler-python` crate builds the
+  `osm_tile_compiler` module (PyO3, abi3 wheels for CPython 3.10 and later,
+  with maturin) over compile, extract, update, diff, apply,
+  read_delta_manifest, inspect and verify. Every call releases the GIL;
+  compile and update report progress to a callable, and compile, extract
+  and update stop on a `CancelToken`, a callable or Ctrl-C. Errors are an
+  exception tree under `osm_tile_compiler.Error` with stable `kind` and
+  `stage`. CI builds and tests the wheels on Linux, macOS and Windows; they
+  are not on PyPI yet.
+- C ABI: new job kinds `extract`, `update`, `diff`, `apply` (with
+  `trustedKeys`), `inspect`, `verify` and `verify_delta`, which do what their
+  commands do and return the same reports, and `fetch_sources` and
+  `fetch_extract`, which download a compile's supplemental datasets or a
+  Geofabrik region ahead of it with byte progress. `otc_validate` runs
+  `otc_job_start`'s checks without starting a job. `compile_basemap` takes
+  `resume`. See [docs/c-abi.md](docs/c-abi.md).
 - Experimental MapLibre Tile (MLT) output: `compile --tile-format mlt`
   (`ArchiveOptions::tile_format`, `TileFormat::Mlt`, `tileFormat: "mlt"` in
   the worker request) writes every tile as MLT instead of MVT, in PMTiles
@@ -96,8 +129,6 @@
   `changed_tiles` says how many tiles at each zoom.
 - `diff --changed-tiles FILE` writes the tiles that differ between the two
   archives (changed, added or removed), in the same format.
-- C ABI: `apply` takes `trustedKeys`, and the new `verify_delta` kind checks
-  a delta's signatures without applying it.
 - `scripts/build-xcframework.sh` builds the C ABI as an iOS XCFramework
   (`aarch64-apple-ios` and `aarch64-apple-ios-sim`, header and module map).
 - `ios/DeviceTest`, a SwiftUI app that compiles a region on an iPhone
