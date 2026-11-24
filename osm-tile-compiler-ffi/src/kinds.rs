@@ -9,7 +9,7 @@
 //! mirror can go.
 
 use crate::job::{JobError, Progress, Work};
-use crate::{archive_jobs, update_job};
+use crate::{archive_jobs, fetch_jobs, update_job};
 use osm_tile_compiler::{
     ArchiveCenter, Area, AreaPolygon, BasemapRequest, CompileBounds, CompileError, LayerSelection,
     OutputFormat, ReadScope, SourcesPolicy, StylePackEvent, StylePackRequest, SupplementalDataset,
@@ -43,6 +43,8 @@ pub const KINDS: &[&str] = &[
     "apply",
     "inspect",
     "verify",
+    "fetch_sources",
+    "fetch_extract",
 ];
 
 /// Parses an envelope and its request: the kind and the work to run.
@@ -70,6 +72,14 @@ pub fn parse(json: &str) -> Result<(&'static str, Work), JobError> {
         "verify" => Ok((
             "verify",
             archive_jobs::archive_report_work("verify", envelope.request)?,
+        )),
+        "fetch_sources" => Ok((
+            "fetch_sources",
+            fetch_jobs::fetch_sources_work(envelope.request)?,
+        )),
+        "fetch_extract" => Ok((
+            "fetch_extract",
+            fetch_jobs::fetch_extract_work(envelope.request)?,
         )),
         other => Err(JobError::invalid_request(format!(
             "Unknown request kind '{other}'; this library runs: {}",

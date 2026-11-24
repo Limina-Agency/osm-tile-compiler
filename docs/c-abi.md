@@ -22,8 +22,8 @@ The header is [`osm-tile-compiler-ffi/include/osm_tile_compiler.h`](../osm-tile-
   UI wants. The compile already throttles its own progress to 200 ms, so a
   poll every 100 to 500 ms misses nothing that matters.
 - **One job type for every request kind.** Starting, polling, cancelling and
-  collecting a result work the same for a compile, an extract, an update or
-  a delta apply. Wrappers write that once.
+  collecting a result work the same for a compile, a download, an extract,
+  an update or a delta apply. Wrappers write that once.
 
 ## Lifecycle
 
@@ -47,6 +47,7 @@ otc_job_free(job);
 | `otc_abi_version()` | The ABI version, `1`. Check it equals `OTC_ABI_VERSION` at startup. |
 | `otc_version()` | The library's version string; static. |
 | `otc_job_start(json, &job, &error)` | Parses the envelope and the kind's request, then starts the job on a thread of its own. A request that cannot be parsed fails here, synchronously, with `OTC_ERROR_INVALID_REQUEST` and an error JSON. |
+| `otc_validate(json, &error)` | The same checks as `otc_job_start`, without starting a job: for forms that check as the user types. A request that passes can still fail its job once it reads files or the network. |
 | `otc_job_state(job)` | `OTC_JOB_RUNNING`, `_SUCCEEDED`, `_FAILED` or `_CANCELLED`. |
 | `otc_job_poll(job)` | The progress JSON. |
 | `otc_job_wait(job, ms)` | Blocks up to `ms` for the job to end; returns the state. Not for a UI thread with a large timeout. |
@@ -318,6 +319,38 @@ five problems in the message, so a host that only needs a yes or no checks
 `addressed_tiles`, `tile_entries`, `tile_contents`), `file_bytes`, the
 parsed `metadata` and `tile_stats`.
 
+### `fetch_sources` and `fetch_extract`
+
+```json
+{ "directory": "/…/omt-sources", "datasets": ["natural_earth", "lake_centerlines"], "mode": "verify" }
+{ "directory": "/…/downloads", "area": "Małopolskie", "indexUrl": "https://download.geofabrik.de/index-v1-nogeom.json" }
+```
+
+`fetch_sources` downloads the supplemental datasets into `directory` ahead
+of a compile, which then runs with `sourcesPolicy` `use_present`.
+`datasets` defaults to all three (`water_polygons`, about 1 GB,
+`natural_earth`, `lake_centerlines`); they are fetched smallest first.
+`mode` `verify` (the default) keeps a file whose recorded SHA-256 still
+matches and downloads the rest; `only_missing` keeps any file present,
+unchecked. Progress has the stage `fetch_sources`; `fraction` is the current
+dataset's bytes and `overall` weighs each dataset by its size. The result is
+`{"directory", "datasets": [ids], "inputs": [{"file", "url", "bytes",
+"sha256"}]}`, with the provenance of each dataset checked or downloaded
+(none for files `only_missing` kept). Failed downloads fail with `download`;
+a cancel takes effect within one 256 KB read and leaves no partial file.
+
+`fetch_extract` looks `area` up in Geofabrik's index, as `compile --area`
+does (an identifier such as `malopolskie` or `us/georgia`, a name in any
+case and with or without diacritics, or an ISO code), and downloads its
+`.osm.pbf` into `directory` as `<id>.osm.pbf`, which `compile_basemap`
+then takes as `inputPbf`. An extract already there is kept; remove it for a
+newer one. `indexUrl` points at a mirror's index. Progress has the stage
+`fetch_extract`, with the download's fraction when the server sends a
+length. The result is `{"path", "bytes", "downloaded", "extract": {"id",
+"name", "parent", "isoCodes", "url"}}`. A name the index lacks, or one that
+matches several extracts, fails with `invalid_request`; the message of an
+ambiguous one lists the candidates.
+
 ## Versioning
 
 `OTC_ABI_VERSION` covers the function signatures, the status and state
@@ -328,11 +361,7 @@ semantic versioning, like the Rust API.
 
 ## Planned next
 
-- Request kinds: `fetch_sources` (download the supplemental datasets ahead of
-  a compile, with byte progress) and `fetch_extract` (a Geofabrik area).
-- `otc_validate(json, &error)`: the same checks as `otc_job_start` without
-  starting a job, for forms that check as the user types.
 - Packaging: an XCFramework for iOS and a JNI-ready `.so` per Android ABI
   (with the CI thread's iOS and Android builds), then the Swift package (F4)
-  and Kotlin AAR (F5) as thin wrappers over these ten functions.
+  and Kotlin AAR (F5) as thin wrappers over these eleven functions.
 - On-device numbers (F6) and a low-memory mode for phones (P8).
