@@ -90,8 +90,8 @@
   runs, up to half of the memory available when rendering starts;
   `compile --sort-memory <MIB>` and `BasemapRequest::sort_memory` set that
   cap. An intermediate pass merges only the smallest runs needed. Regional
-  extracts are unchanged; three regions merged into one 369 MiB PBF peak at
-  728 MiB with 2 threads, against 876 MiB in 0.1.3.
+  extracts are unchanged; Poland compiles in 385 s with a 2865 MiB peak on 2
+  threads, against 487 s and 2994 MiB in 0.1.3.
 - The final merge decodes sort runs ahead of the merge on up to `threads`
   worker threads, so the merging thread only orders records. With the
   encoders stubbed out, merging Małopolskie's runs takes 1.6 s instead of
