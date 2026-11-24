@@ -2223,15 +2223,7 @@ fn encode_job(
                         .map(EncodedRecord::decode)
                         .collect::<Result<Vec<_>, _>>()
                 })?;
-                encode_layer_records(
-                    name,
-                    records,
-                    timings,
-                    tile_format,
-                    omt_rules,
-                    top,
-                    control,
-                )?
+                encode_layer_records(name, records, timings, tile_format, omt_rules, top, control)?
             }
         };
         let size = bytes.as_ref().map_or(0, Vec::len);
