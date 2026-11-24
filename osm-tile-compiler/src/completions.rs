@@ -74,6 +74,7 @@ pub(crate) const COMMANDS: &[Command] = &[
             ("--description", Text),
             ("--attribution", Text),
             ("--gzip-level", Text),
+            ("--schema", File),
             // Filled with the layer names when the script is written.
             ("--layers", Words(&[])),
             ("--exclude-layers", Words(&[])),
@@ -119,6 +120,12 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "Download or verify the supplemental datasets",
         arguments: Dir,
         options: &[],
+    },
+    Command {
+        name: "schema",
+        about: "Verify a tile schema's examples, or list its layers",
+        arguments: File,
+        options: &[("--json", Flag)],
     },
     Command {
         name: "style",

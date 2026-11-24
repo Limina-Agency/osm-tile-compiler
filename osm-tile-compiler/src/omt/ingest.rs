@@ -4,9 +4,9 @@
 //! Ring joins retain OSM node identity; nested relation members and the
 //! reference's sub-metre damaged-ring repair remain explicit limitations.
 use super::{
-    Profile,
     input_area::{Extent, InputArea},
     pipeline::{Pipeline, lock},
+    profile::Profile,
     types::{Source, SourceKind, Tags},
 };
 use crate::control::{CompileStage, Control};
@@ -251,9 +251,9 @@ pub(super) struct Index {
 }
 
 /// A unit of source assembly that runs on a render worker.
-pub(super) struct Job {
+pub(super) struct Job<P> {
     index: Arc<Index>,
-    pub profile: Arc<Profile>,
+    pub profile: Arc<P>,
     pub ordinal: u64,
     task: Task,
 }
@@ -291,12 +291,12 @@ const STAGE_UNITS: u64 = 1000;
 const NODES_SHARE: f64 = 0.1;
 
 #[allow(clippy::too_many_arguments)]
-pub fn read_osm(
+pub fn read_osm<P: Profile>(
     pbf: &Path,
     temp: &Path,
     workers: usize,
-    pipeline: &mut Pipeline,
-    profile: &Arc<Profile>,
+    pipeline: &mut Pipeline<P>,
+    profile: &Arc<P>,
     control: &Control,
     area: Option<InputArea>,
     progress: &mut dyn FnMut(&str),
@@ -487,15 +487,15 @@ impl Drop for NodeStoreDir {
 /// Pass 2 callbacks run on the calling thread. They only forward batches to the
 /// render workers, apart from the motorway junction nodes: ways need to know
 /// which nodes are junctions, and junctions are emitted after all ways.
-struct SourceSink<'a> {
-    pipeline: &'a mut Pipeline,
+struct SourceSink<'a, P: Profile> {
+    pipeline: &'a mut Pipeline<P>,
     index: Arc<Index>,
-    profile: Arc<Profile>,
+    profile: Arc<P>,
     jobs: u64,
     junctions: HashMap<i64, Source>,
     junction_ids: Arc<HashSet<i64>>,
 }
-impl SourceSink<'_> {
+impl<P: Profile> SourceSink<'_, P> {
     /// Queues `task` as job number `job`. Jobs are numbered in serial order.
     fn submit(&mut self, job: u64, task: Task) -> Result<(), String> {
         self.pipeline.submit(Job {
@@ -570,7 +570,7 @@ impl SourceSink<'_> {
         Ok(())
     }
 }
-impl Pass2Sink for SourceSink<'_> {
+impl<P: Profile> Pass2Sink for SourceSink<'_, P> {
     fn on_relation_batch(&mut self, _: RelationBatch) -> Result<(), String> {
         Ok(())
     }
@@ -606,7 +606,7 @@ fn node_source(n: &NormalizedNode) -> Result<Source, String> {
     })
 }
 
-impl Job {
+impl<P> Job<P> {
     /// Assembles the job's sources in serial emission order. `emit` receives
     /// each source with its ordinal.
     pub fn run(

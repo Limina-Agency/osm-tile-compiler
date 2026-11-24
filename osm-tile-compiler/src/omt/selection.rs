@@ -105,6 +105,16 @@ impl Selection {
     }
 }
 
+impl super::profile::FeatureFilter for Selection {
+    fn keep(&self, feature: &mut Feature) -> bool {
+        if !self.has_layer(&feature.layer) {
+            return false;
+        }
+        self.strip_names(feature);
+        true
+    }
+}
+
 fn layer_index(name: &str) -> Result<usize, String> {
     (0..KNOWN)
         .find(|index| known(*index) == name)

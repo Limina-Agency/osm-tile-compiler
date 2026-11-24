@@ -339,6 +339,7 @@ struct CompileOptions {
     tile_format: String,
     sar: bool,
     sort_memory: Option<u64>,
+    schema: Option<String>,
 }
 
 fn basemap_request(
@@ -438,6 +439,10 @@ fn basemap_request(
         })?;
     request.sar = options.sar;
     request.sort_memory = options.sort_memory;
+    if let Some(schema) = &options.schema {
+        request.schema =
+            osm_tile_compiler::TileSchema::from_name_or_path(schema).map_err(invalid)?;
+    }
     request.validate()?;
     Ok(request)
 }
@@ -466,7 +471,8 @@ fn compile_output(output: &BasemapOutput) -> Value {
     read = "whole_extract".to_string(), center = None, name = None, description = None,
     attribution = None, gzip_level = None, min_zoom = None, max_zoom = None, threads = None,
     layers = None, exclude_layers = None, languages = None, building_levels = false,
-    search_index = false, tile_format = "mvt".to_string(), sar = false, sort_memory = None, progress = None, cancel = None,
+    search_index = false, tile_format = "mvt".to_string(), sar = false, sort_memory = None, schema = None,
+    progress = None, cancel = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn compile(
@@ -498,6 +504,7 @@ fn compile(
     tile_format: String,
     sar: bool,
     sort_memory: Option<u64>,
+    schema: Option<String>,
     progress: Option<Bound<'_, PyAny>>,
     cancel: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
@@ -525,6 +532,7 @@ fn compile(
         tile_format,
         sar,
         sort_memory,
+        schema,
     };
     let request = basemap_request(input_pbf, output, sources, temp_dir, options)
         .map_err(|error| to_py_err(py, &error))?;

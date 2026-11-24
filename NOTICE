@@ -9,3 +9,9 @@ MapTiler.com & OpenMapTiles contributors and Copyright (c) 2014, Mapbox: code
 under the BSD 3-Clause License, design under CC-BY 4.0. Maps using it must
 visibly credit OpenMapTiles and OpenStreetMap contributors. See
 osm-tile-compiler/style/LICENSE.md.
+
+osm-tile-compiler/src/omt/schema/shortbread.yml and shortbread.spec.yml are
+Planetiler's Shortbread schema and its examples
+(https://github.com/onthegomap/planetiler, v0.10.2), Copyright (c) Planetiler
+contributors, under the Apache License 2.0. The Shortbread schema itself is
+specified at https://shortbread-tiles.org.

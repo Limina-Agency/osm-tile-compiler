@@ -58,9 +58,11 @@ deliberate and explained in its pull request.
 1. ~~`--layers` / `--exclude-layers`; selected layers stay identical to a full
    build.~~
 2. ~~Language selection for `name:*` fields.~~
-3. One schema description driving rendering and metadata.
-4. A `Profile` trait separating the OMT schema from the engine (refactor only;
-   byte-identical output).
+3. ~~One schema description driving rendering and metadata: YAML schemas in
+   Planetiler's custom map format, and Shortbread built in
+   ([schemas.md](schemas.md)).~~
+4. ~~A `Profile` trait separating the OMT schema from the engine (refactor only;
+   byte-identical output).~~
 
 ## Lane F — Scale and performance
 
