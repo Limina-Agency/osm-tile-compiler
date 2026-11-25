@@ -23,6 +23,8 @@ pub(crate) const TILE: i32 = SIDE as i32 * CELL;
 const WORLD: f64 = (1u32 << super::trees::ZOOM) as f64 * TILE as f64;
 const EARTH_METRES: f64 = 40_075_016.685_578_49;
 const MAX_LATITUDE: f64 = 85.051_128_779_806_59;
+/// Metres past a road's built edge (`hd_roads::built_half_width`) where none is grown.
+const VERGE: f64 = 1.0;
 /// Metres round a mapped tree where none is grown.
 const CLEAR_OF_TREE: f64 = 2.5;
 
@@ -72,7 +74,9 @@ fn what<'a>(get: impl Fn(&str) -> Option<&'a str>, closed: bool) -> Option<What>
             7
         } else if is("wetland", &["reedbed", "marsh", "fen"]) {
             8
-        } else if is("landuse", &["grass", "village_green", "recreation_ground"]) || is("leisure", &["park", "garden", "common"]) {
+        } else if is("landuse", &["grass", "village_green", "recreation_ground"])
+            || is("leisure", &["park", "garden", "common"])
+        {
             9
         } else {
             0
@@ -101,13 +105,12 @@ fn what<'a>(get: impl Fn(&str) -> Option<&'a str>, closed: bool) -> Option<What>
         {
             return Some(What::Clear);
         }
-
     }
     if get("tunnel").is_some_and(|t| t != "no") {
         return None;
     }
     let half = if let Some(highway) = get("highway") {
-        match highway {
+        let class: f64 = match highway {
             "motorway" | "trunk" => 8.0,
             "motorway_link" | "trunk_link" | "primary" | "primary_link" => 6.0,
             "secondary" | "secondary_link" | "tertiary" | "tertiary_link" => 5.0,
@@ -116,7 +119,10 @@ fn what<'a>(get: impl Fn(&str) -> Option<&'a str>, closed: bool) -> Option<What>
             "track" => 2.2,
             "path" | "footway" | "cycleway" | "bridleway" | "steps" => 1.4,
             _ => return None,
-        }
+        };
+        // as wide as HD roads build it, where that is wider
+        let built = crate::hd_roads::built_half_width(&get).map_or(0.0, |half| half + VERGE);
+        class.max(built)
     } else if let Some(railway) = get("railway") {
         match railway {
             "rail" | "light_rail" => 5.0,
@@ -193,7 +199,9 @@ fn field_way(pieces: &[Arc<[[i32; 2]]>]) -> u8 {
             }
         }
     }
-    let most = (0..16).max_by(|&a, &b| along[a].total_cmp(&along[b])).unwrap_or(0);
+    let most = (0..16)
+        .max_by(|&a, &b| along[a].total_cmp(&along[b]))
+        .unwrap_or(0);
     most as u8 * 16
 }
 
@@ -210,8 +218,13 @@ impl Feature {
             && s.cover == 7
         {
             // its crop's number from where it is, the same each time it is read
-            let first = pieces.first().and_then(|p| p.first()).copied().unwrap_or([0, 0]);
-            let own = (first[0] as u32).wrapping_mul(0x9e37_79b9) ^ (first[1] as u32).wrapping_mul(0x85eb_ca6b);
+            let first = pieces
+                .first()
+                .and_then(|p| p.first())
+                .copied()
+                .unwrap_or([0, 0]);
+            let own = (first[0] as u32).wrapping_mul(0x9e37_79b9)
+                ^ (first[1] as u32).wrapping_mul(0x85eb_ca6b);
             s.kind = field_way(&pieces) | (own >> 28) as u8;
         }
         let mut bounds = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
@@ -858,6 +871,22 @@ mod tests {
     }
 
     #[test]
+    fn roads_clear_as_wide_as_hd_roads_build_them() {
+        let half = |tags: &[(&str, &str)]| match told(tags, false) {
+            Some(What::Strip(half)) => half,
+            other => panic!("{tags:?}: {other:?}"),
+        };
+        // a road built wider than its class's strip clears what it is built as and a verge
+        let six = [("highway", "primary"), ("lanes", "6")];
+        let built =
+            crate::hd_roads::built_half_width(|k| six.iter().find(|t| t.0 == k).map(|t| t.1));
+        assert_eq!(half(&six), built.unwrap() + VERGE);
+        assert!(half(&six) > half(&[("highway", "primary")]));
+        // and never less than its class's strip
+        assert!(half(&[("highway", "track")]) >= 2.2);
+    }
+
+    #[test]
     fn a_fields_rows_run_along_its_longest_edges() {
         // 200 by 40 units, its long sides running east; then turned a quarter (north)
         let east: Arc<[[i32; 2]]> = Arc::from([[0, 0], [200, 0], [200, 40], [0, 40], [0, 0]]);
@@ -865,7 +894,8 @@ mod tests {
         let north: Arc<[[i32; 2]]> = Arc::from([[0, 0], [40, 0], [40, -200], [0, -200], [0, 0]]);
         assert_eq!(field_way(&[north]), 8 * 16);
         // north-east: y runs south
-        let diagonal: Arc<[[i32; 2]]> = Arc::from([[0, 0], [100, -100], [110, -90], [10, 10], [0, 0]]);
+        let diagonal: Arc<[[i32; 2]]> =
+            Arc::from([[0, 0], [100, -100], [110, -90], [10, 10], [0, 0]]);
         assert_eq!(field_way(&[diagonal]), 4 * 16);
     }
 

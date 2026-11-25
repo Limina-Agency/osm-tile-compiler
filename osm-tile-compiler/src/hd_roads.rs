@@ -208,6 +208,22 @@ use std::time::Instant;
 use structures::{Group, Index, Obstacle, Portal};
 use things::{Fence, Kept, Mapped, Things};
 
+/// Metres from a way with these tags out to the far edge of what it is built
+/// as: its surface off its line, then the parking, cycle track and sidewalk
+/// beside it on the wider side. `None` for what is not a road here. The tree
+/// stands (`stands.rs`) keep this clear, so trees and HD roads agree on where
+/// a road ends.
+pub(crate) fn built_half_width<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<f64> {
+    let p = profile::profile(get)?;
+    let edge = (p.centre - p.width / 2.0)
+        .abs()
+        .max((p.centre + p.width / 2.0).abs());
+    let beside = (0..2)
+        .map(|i| p.parking[i] + p.sides[i].track + p.sides[i].sidewalk)
+        .fold(0.0, f64::max);
+    Some(edge + beside)
+}
+
 /// The `format` of an HD roads archive's metadata.
 pub const HD_ROADS_FORMAT: &str = "hd-roads";
 /// The `version` of an HD roads archive's metadata.
