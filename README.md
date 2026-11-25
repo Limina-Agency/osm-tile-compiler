@@ -239,7 +239,7 @@ shells.
 `--area NAME` compiles a Geofabrik extract instead of a local PBF, as
 Planetiler's `--area` does. NAME is looked up in Geofabrik's index: an
 identifier (`malopolskie`, `us/georgia`), a name with or without accents
-(`Małopolskie`, `Lesser Poland Voivodeship`) or an ISO code (`PL-12`). A
+(`Małopolskie`, `Lesser Poland Voivodeship`) or an ISO code (`US-GA`). A
 name that several regions share, such as `Georgia`, is refused with their
 identifiers. The extract is saved in `--download-dir` (by default the
 `--sources` directory) as `<ID>.osm.pbf` and reused by later compiles;
@@ -423,6 +423,23 @@ osm-tile-compiler search tatras.pmtiles murowaniec --near 20.00 49.24
 
 From Rust, `SearchIndex::open` and `SearchIndex::search`. How it matches
 and its file format are in [docs/search.md](docs/search.md).
+
+## Trees
+
+The OpenMapTiles schema has no trees. `trees` writes them to an archive of their
+own, for renderers that stand a model at each: the places of those mapped one
+by one (`natural=tree` nodes), and what their tags say of their height, crown,
+leaf type and cycle, and genus; the lines of rows of trees (`natural=tree_row`)
+and hedges (`barrier=hedge`, a hedge mapped as an area as lines 1 m apart
+across it), cut at each tile's edges, with what their tags say of them, for a
+renderer to plant as far apart as it chooses. With them, a grid of 3 m cells of where woods, scrub, orchards and
+swamps are, for a renderer to grow trees in, with their leaf type and genus:
+clear of roads, railways, water, buildings, power lines, pistes and the mapped
+trees.
+
+```sh
+osm-tile-compiler trees monaco-latest.osm.pbf monaco-trees.pmtiles
+```
 
 ## Checking archives
 

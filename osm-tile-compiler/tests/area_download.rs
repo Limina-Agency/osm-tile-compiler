@@ -24,7 +24,7 @@ use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
 const INDEX_VAR: &str = "OSM_TILE_COMPILER_GEOFABRIK_INDEX";
-const MONACO_PATH: &str = "/europe/monaco-latest.osm.pbf";
+const MONACO_PATH: &str = "/europe/monaco/monaco-latest.osm.pbf";
 
 fn recorded_index() -> String {
     let path =

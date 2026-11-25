@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- Experimental `hd-roads` (`write_hd_roads`): the roads of an extract at
+  their true width, with their lanes, markings, bridges, tunnel portals,
+  barriers and street furniture, as an archive of their own
+  ([docs/formats.md](docs/formats.md), *HD road archives*).
+- `trees` (`write_trees`): the trees mapped one by one or in rows in an
+  extract, and its woods, scrub, orchards and swamps as a grid to grow trees
+  in, as an archive of their own.
+- Tree archives are version 2: each tile ends with the lines of its rows of
+  trees and hedges (`barrier=hedge`), which version 1 did not have, and a
+  row's trees are no longer written as trees 8 m apart. `TreesReport` has
+  `rows`, `row_km`, `hedges` and `hedge_km` in place of `in_rows`.
+
 ## 0.5.0 (2026-11-25)
 
 ### Changed

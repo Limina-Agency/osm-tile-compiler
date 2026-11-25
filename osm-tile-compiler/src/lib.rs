@@ -62,7 +62,8 @@
 //!
 //! Besides compiling, the crate fetches the inputs ([`fetch_sources`],
 //! [`fetch_extract`]), writes building levels for an archive
-//! ([`write_building_levels`]) and a search index of its names
+//! ([`write_building_levels`]), the mapped trees of an extract ([`write_trees`]),
+//! its roads at their true width ([`write_hd_roads`]) and a search index of its names
 //! ([`write_search_index`], queried with [`SearchIndex`]), inspects, cuts, diffs and patches archives
 //! ([`archive`]), and writes the MapLibre style for an archive
 //! ([`maplibre_style`]) or an offline pack of it with its fonts and icons
@@ -106,11 +107,13 @@ mod search;
 mod serve;
 mod sources;
 pub mod stage_profile;
+mod stands;
 mod style_pack;
 mod tile_geometry;
 mod tile_list;
 mod tile_slicer;
 mod tile_stats;
+mod trees;
 mod updates;
 
 pub use basemap::{
@@ -157,6 +160,7 @@ pub use style_pack::{
 };
 pub use tile_list::{CHANGED_TILE_BUFFER_PIXELS, TileAddress, read_tile_list};
 pub use tile_stats::{LayerStats, TILE_WARNING_BYTES, TileSize, TileStats, ZoomStats};
+pub use trees::{TREE_GENERA, TREES_FORMAT, TREES_VERSION, TreesReport, trees_path, write_trees};
 pub use updates::{
     ChangedTilesReport, ChangedTilesRequest, ClipTo, DEFAULT_MAX_DIFFS, PLANET_REPLICATION,
     Replication, UpdateEvent, UpdateReport, UpdateRequest, update_extract,

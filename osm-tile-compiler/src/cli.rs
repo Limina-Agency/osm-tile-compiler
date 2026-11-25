@@ -18,7 +18,7 @@ use osm_tile_compiler::{
     archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest, PublicKey, SecretKey},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
     kib, maplibre_style, resolve_languages, update_extract, with_sar_layers,
-    write_building_levels_cancellable, write_hd_roads, write_style_pack,
+    write_building_levels_cancellable, write_hd_roads, write_style_pack, write_trees,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -48,6 +48,7 @@ Usage:
   osm-tile-compiler search-index <INPUT.pmtiles> [--output <FILE.idx>] [--threads <N>] [--json]
   osm-tile-compiler search <FILE.idx|FILE.pmtiles> <QUERY>... [--near <LON LAT>] [OPTIONS]
   osm-tile-compiler hd-roads <INPUT.pbf> <OUTPUT.pmtiles> [--threads <N>]
+  osm-tile-compiler trees <INPUT.osm.pbf> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler schema verify <FILE.yml|shortbread> [--json]
   osm-tile-compiler schema layers <FILE.yml|shortbread|openmaptiles>
@@ -80,6 +81,7 @@ Usage:
   osm-tile-compiler search-index <INPUT.pmtiles> [--output <FILE.idx>] [--threads <N>] [--json]
   osm-tile-compiler search <FILE.idx|FILE.pmtiles> <QUERY>... [--near <LON LAT>] [OPTIONS]
   osm-tile-compiler hd-roads <INPUT.pbf> <OUTPUT.pmtiles> [--threads <N>]
+  osm-tile-compiler trees <INPUT.osm.pbf> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler schema verify <FILE.yml|shortbread> [--json]
   osm-tile-compiler schema layers <FILE.yml|shortbread|openmaptiles>
@@ -104,6 +106,8 @@ Commands:
   compile          Compile INPUT.pbf (several are merged first, for an area
                    across extracts), or the Geofabrik extract of a region,
                    into a new PMTiles archive
+  trees            Write the mapped trees, rows, hedges and woods of an extract
+                   to a new archive, for renderers that stand a model at each tree
   building-levels  Write the building levels of a compiled archive to a new
                    PMTiles archive: its buildings as boxes for far views
   search-index     Write the search index of a compiled archive beside it, as
@@ -172,7 +176,7 @@ Compile options:
                         request says. Only --threads and --json go with it
   --area <NAME>         Instead of INPUT.pbf, compile Geofabrik's extract of a
                         region: its identifier (malopolskie, us/georgia), its
-                        name (Małopolskie) or its ISO code (PL-12). It is
+                        name (Małopolskie) or its ISO code (US-GA). It is
                         downloaded into --download-dir as <ID>.osm.pbf, or
                         the one already there is used; remove it to download
                         a newer one. OSM_TILE_COMPILER_GEOFABRIK_INDEX names
@@ -576,19 +580,15 @@ enum Input {
     Area { name: String, directory: PathBuf },
 }
 
+/// What a command that derives one archive from another file takes:
+/// `building-levels`, `trees` and `hd-roads`.
 #[derive(Debug)]
-struct BuildingLevelsArgs {
+struct DeriveArgs {
     input: PathBuf,
     output: PathBuf,
     threads: Option<usize>,
+    /// `--profile`, which only `building-levels` takes.
     profile: Option<PathBuf>,
-}
-
-#[derive(Debug)]
-struct HdRoadsArgs {
-    input: PathBuf,
-    output: PathBuf,
-    threads: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -610,10 +610,11 @@ enum Command {
     Version,
     Compile(Box<CompileArgs>),
     CompileRequest(RequestArgs),
-    BuildingLevels(BuildingLevelsArgs),
+    BuildingLevels(DeriveArgs),
     SearchIndex(search::SearchIndexArgs),
     Search(search::SearchArgs),
-    HdRoads(HdRoadsArgs),
+    HdRoads(DeriveArgs),
+    Trees(DeriveArgs),
     FetchSources(PathBuf),
     SchemaVerify {
         schema: osm_tile_compiler::TileSchema,
@@ -720,6 +721,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::SearchIndex(args) => search::search_index(args),
         Command::Search(args) => search::search(args),
         Command::HdRoads(args) => hd_roads(args),
+        Command::Trees(args) => trees(args),
         Command::FetchSources(directory) => fetch_sources(&directory),
         Command::SchemaVerify { schema, json } => schema_verify(&schema, json),
         Command::SchemaLayers(schema) => {
@@ -782,10 +784,14 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("--version" | "-V") => Ok(Command::Version),
         Some("compile") if rest.iter().any(|arg| arg == "--request") => parse_compile_request(rest),
         Some("compile") => parse_compile(rest),
-        Some("building-levels") => parse_building_levels(rest),
+        Some("building-levels") => Ok(parse_derive("building-levels", "input", true, rest)?
+            .map_or(Command::Help, Command::BuildingLevels)),
+        Some("trees") => Ok(parse_derive("trees", "input .osm.pbf", false, rest)?
+            .map_or(Command::Help, Command::Trees)),
         Some("search-index") => search::parse_search_index(rest),
         Some("search") => search::parse_search(rest),
-        Some("hd-roads") => parse_hd_roads(rest),
+        Some("hd-roads") => Ok(parse_derive("hd-roads", "input PBF", false, rest)?
+            .map_or(Command::Help, Command::HdRoads)),
         Some("fetch-sources") => parse_fetch_sources(rest),
         Some("schema") => parse_schema(rest),
         Some("style") => parse_style(rest),
@@ -1384,7 +1390,14 @@ fn parse_update(args: &[OsString]) -> Result<Command, String> {
     })))
 }
 
-fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
+/// The arguments of `command`, which derives an archive from an `input`;
+/// `None` for help. `--profile` is taken where `profiled`.
+fn parse_derive(
+    command: &str,
+    input: &str,
+    profiled: bool,
+    args: &[OsString],
+) -> Result<Option<DeriveArgs>, String> {
     let mut paths = Vec::new();
     let mut threads = None;
     let mut profile = None;
@@ -1395,7 +1408,7 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
             continue;
         };
         match flag.as_str() {
-            "--help" | "-h" => return Ok(Command::Help),
+            "--help" | "-h" => return Ok(None),
             "--threads" => {
                 let count: usize = number(value(&mut args, &flag)?, &flag)?;
                 if count == 0 {
@@ -1403,59 +1416,23 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
                 }
                 threads = Some(count);
             }
-            "--profile" => profile = Some(PathBuf::from(value(&mut args, &flag)?)),
-            _ => return Err(format!("unknown building-levels option '{flag}'")),
+            "--profile" if profiled => profile = Some(PathBuf::from(value(&mut args, &flag)?)),
+            _ => return Err(format!("unknown {command} option '{flag}'")),
         }
     }
     let mut paths = paths.into_iter();
     match (paths.next(), paths.next(), paths.next()) {
-        (Some(input), Some(output), None) => Ok(Command::BuildingLevels(BuildingLevelsArgs {
+        (Some(input), Some(output), None) => Ok(Some(DeriveArgs {
             input,
             output,
             threads,
             profile,
         })),
         (_, _, Some(extra)) => Err(format!(
-            "unexpected argument '{}': building-levels takes two archives",
+            "unexpected argument '{}': {command} takes an input and an output",
             extra.display()
         )),
-        _ => Err("building-levels needs an input and an output archive".into()),
-    }
-}
-
-fn parse_hd_roads(args: &[OsString]) -> Result<Command, String> {
-    let mut paths = Vec::new();
-    let mut threads = None;
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let Some(flag) = option(arg) else {
-            paths.push(PathBuf::from(arg));
-            continue;
-        };
-        match flag.as_str() {
-            "--help" | "-h" => return Ok(Command::Help),
-            "--threads" => {
-                let count: usize = number(value(&mut args, &flag)?, &flag)?;
-                if count == 0 {
-                    return Err("--threads must be at least 1".into());
-                }
-                threads = Some(count);
-            }
-            _ => return Err(format!("unknown hd-roads option '{flag}'")),
-        }
-    }
-    let mut paths = paths.into_iter();
-    match (paths.next(), paths.next(), paths.next()) {
-        (Some(input), Some(output), None) => Ok(Command::HdRoads(HdRoadsArgs {
-            input,
-            output,
-            threads,
-        })),
-        (_, _, Some(extra)) => Err(format!(
-            "unexpected argument '{}': hd-roads takes an extract and an archive",
-            extra.display()
-        )),
-        _ => Err("hd-roads needs an input PBF and an output archive".into()),
+        _ => Err(format!("{command} needs an {input} and an output archive")),
     }
 }
 
@@ -2115,7 +2092,7 @@ fn write_profile(
     Ok(())
 }
 
-fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
+fn building_levels(args: DeriveArgs) -> Result<(), String> {
     let mut status = Status::new();
     let threads = args
         .threads
@@ -2142,7 +2119,7 @@ fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
     write_profile(&mut status, args.profile.as_deref(), profile)
 }
 
-fn hd_roads(args: HdRoadsArgs) -> Result<(), String> {
+fn hd_roads(args: DeriveArgs) -> Result<(), String> {
     let mut status = Status::new();
     let threads = args
         .threads
@@ -2207,6 +2184,45 @@ fn hd_roads(args: HdRoadsArgs) -> Result<(), String> {
         report.groups,
         report.pieces,
         report.crossings,
+        megabytes(report.raw_bytes),
+        megabytes(report.gz_bytes)
+    ));
+    Ok(())
+}
+
+fn trees(args: DeriveArgs) -> Result<(), String> {
+    let mut status = Status::new();
+    let threads = args
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    status.line(&format!(
+        "Writing the trees and woods of {} into {} ({threads} threads)",
+        args.input.display(),
+        args.output.display()
+    ));
+    let _cooperating = interrupt::cooperate();
+    let report =
+        write_trees(&args.input, &args.output, threads, interrupt::requested).map_err(|error| {
+            match error {
+                CompileError::Cancelled => {
+                    format!("cancelled; {} was not written", args.output.display())
+                }
+                error => error.to_string(),
+            }
+        })?;
+    status.line(&format!(
+        "Wrote {} in {:.1} s: {} trees, {} rows of trees ({:.0} km), {} hedges ({:.0} km) and {:.0} km2 of stands in {} tiles, {} trees with a leaf type or genus, {} with a height, {} raw, {} gzipped",
+        args.output.display(),
+        report.seconds,
+        report.trees,
+        report.rows,
+        report.row_km,
+        report.hedges,
+        report.hedge_km,
+        report.stand_km2,
+        report.tiles,
+        report.with_kind,
+        report.with_height,
         megabytes(report.raw_bytes),
         megabytes(report.gz_bytes)
     ));

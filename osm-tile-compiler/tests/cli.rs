@@ -43,6 +43,10 @@ fn help_and_version_print_to_stdout() {
             stdout.contains("hd-roads <INPUT.pbf>"),
             "{args:?}: {stdout}"
         );
+        assert!(
+            stdout.contains("trees <INPUT.osm.pbf>"),
+            "{args:?}: {stdout}"
+        );
         assert!(stdout.contains("fetch-sources <DIR>"), "{args:?}: {stdout}");
         assert!(stdout.contains("style <ARCHIVE_URL>"), "{args:?}: {stdout}");
         assert!(stdout.contains("update <INPUT.pbf>"), "{args:?}: {stdout}");
@@ -223,6 +227,15 @@ fn usage_errors_exit_with_2() {
         (
             &["hd-roads", "a", "b", "--frob"],
             "unknown hd-roads option '--frob'",
+        ),
+        (
+            &["trees", "a"],
+            "trees needs an input .osm.pbf and an output",
+        ),
+        (&["trees", "a", "b", "c"], "unexpected argument 'c'"),
+        (
+            &["trees", "a", "b", "--frob"],
+            "unknown trees option '--frob'",
         ),
         (&["fetch-sources"], "fetch-sources needs a directory"),
         (&["fetch-sources", "a", "b"], "unexpected argument 'b'"),

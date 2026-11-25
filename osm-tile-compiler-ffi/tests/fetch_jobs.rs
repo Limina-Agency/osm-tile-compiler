@@ -69,7 +69,7 @@ fn geofabrik() -> String {
             let path = request_line.split_whitespace().nth(1).unwrap_or_default();
             let (status, body) = match path {
                 "/index-v1-nogeom.json" => ("200 OK", index.as_bytes()),
-                "/europe/monaco-latest.osm.pbf" => ("200 OK", pbf.as_slice()),
+                "/europe/monaco/monaco-latest.osm.pbf" => ("200 OK", pbf.as_slice()),
                 _ => ("404 Not Found", b"not found".as_slice()),
             };
             let _ = write!(

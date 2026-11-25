@@ -6,7 +6,7 @@
 //! it is already in the directory.
 use crate::control::{CANCELLED, CompileError};
 use crate::sources::{agent, transfer};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},
@@ -66,24 +66,31 @@ struct Properties {
     urls: Urls,
 }
 
-/// ISO codes as Geofabrik lists them: an array of strings, as the index long
-/// did and the fixtures record, or a single string, which the live index
-/// gave by November 2026 (`"iso3166-1:alpha2": "AF"`). Anything else, or
-/// `null`, is no codes rather than an unreadable index: one odd entry must
-/// not stop every `--area` lookup.
-fn codes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+/// ISO codes as Geofabrik lists them: one string, with a comma between the
+/// codes of an extract that covers several countries (`"PS,IL"`), as the live
+/// index gives them since November 2026 (`"iso3166-1:alpha2": "AF"`), or an
+/// array of strings, as the index long did. Anything else, or `null`, is no
+/// codes rather than an unreadable index: one odd entry must not stop every
+/// `--area` lookup.
+fn codes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Codes {
-        One(String),
-        Many(Vec<String>),
+        Text(String),
+        List(Vec<String>),
         Other(serde::de::IgnoredAny),
     }
-    Ok(match Codes::deserialize(deserializer)? {
-        Codes::One(code) => vec![code],
-        Codes::Many(codes) => codes,
+    let codes = match Codes::deserialize(deserializer)? {
+        Codes::Text(text) => text.split(',').map(String::from).collect(),
+        Codes::List(list) => list,
         Codes::Other(_) => Vec::new(),
-    })
+    };
+    Ok(codes
+        .iter()
+        .map(|code| code.trim())
+        .filter(|code| !code.is_empty())
+        .map(String::from)
+        .collect())
 }
 
 #[derive(Deserialize, Default)]
@@ -473,6 +480,51 @@ mod tests {
         assert_eq!(codes, [vec!["AF"], vec!["US-GA"], vec!["PL"], vec![]]);
         assert_eq!(find_extract(&index, "AF").unwrap().id, "afghanistan");
         assert_eq!(find_extract(&index, "US-GA").unwrap().id, "us/georgia");
+    }
+
+    #[test]
+    fn reads_iso_codes_as_text_list_or_nothing() {
+        let codes = |properties: &str| {
+            let json = format!(
+                r#"{{"features": [{{"properties": {{"id": "a", "name": "A",
+                "urls": {{"pbf": "https://example.org/a.osm.pbf"}}{properties}}}}}]}}"#
+            );
+            parse_index(json.as_bytes()).map(|index| index[0].iso_codes.clone())
+        };
+        assert_eq!(codes(r#", "iso3166-1:alpha2": "AF""#).unwrap(), ["AF"]);
+        assert_eq!(codes(r#", "iso3166-1:alpha2": ["AF"]"#).unwrap(), ["AF"]);
+        assert_eq!(codes(r#", "iso3166-2": "US-GA""#).unwrap(), ["US-GA"]);
+        assert_eq!(codes(r#", "iso3166-2": ["US-GA"]"#).unwrap(), ["US-GA"]);
+        // Several countries in one extract.
+        for several in [r#""PS,IL""#, r#""PS, IL""#, r#"["PS", "IL"]"#] {
+            let properties = format!(r#", "iso3166-1:alpha2": {several}"#);
+            assert_eq!(codes(&properties).unwrap(), ["PS", "IL"]);
+        }
+        assert_eq!(
+            codes(r#", "iso3166-1:alpha2": "US", "iso3166-2": "US-PR""#).unwrap(),
+            ["US", "US-PR"]
+        );
+        for none in ["", r#", "iso3166-2": null"#, r#", "iso3166-2": """#] {
+            assert!(codes(none).unwrap().is_empty(), "{none}");
+        }
+        assert!(codes(r#", "iso3166-2": 12"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn finds_an_extract_of_several_countries_by_any_of_their_codes() {
+        let index = parse_index(
+            br#"{"features": [
+            {"properties": {"id": "israel-and-palestine", "name": "Israel and Palestine",
+              "iso3166-1:alpha2": "PS,IL",
+              "urls": {"pbf": "https://example.org/israel-and-palestine.osm.pbf"}}},
+            {"properties": {"id": "us/georgia", "name": "Georgia", "iso3166-2": "US-GA",
+              "urls": {"pbf": "https://example.org/georgia.osm.pbf"}}}]}"#,
+        )
+        .unwrap();
+        let id = |query| find_extract(&index, query).map(|extract| extract.id.as_str());
+        assert_eq!(id("PS"), Ok("israel-and-palestine"));
+        assert_eq!(id("il"), Ok("israel-and-palestine"));
+        assert_eq!(id("US-GA"), Ok("us/georgia"));
     }
 
     #[test]
