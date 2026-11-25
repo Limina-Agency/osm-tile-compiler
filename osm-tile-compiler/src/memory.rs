@@ -41,8 +41,26 @@ mod platform {
     /// The room left under this process's cgroup memory limit, from its
     /// `/proc/self/cgroup` lines; `None` when no limit applies. `read` reads
     /// a control file.
+    ///
+    /// The group's usage counts the page cache charged to it: every file the
+    /// group read or wrote, which the kernel drops as soon as the group needs
+    /// the room. Taken as used, it made a group that had just written a few
+    /// archives look full, and the sort buffers stayed at their floor. So the
+    /// file-backed pages (`active_file` and `inactive_file` in `memory.stat`)
+    /// are left out of the usage, as `MemAvailable` leaves them out of the
+    /// machine's.
     pub(super) fn cgroup_room(groups: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
-        let number = |path: String| read(&path)?.trim().parse::<u64>().ok();
+        let number = |path: &str| read(path)?.trim().parse::<u64>().ok();
+        // The bytes of the `memory.stat` keys `keys`, summed; 0 without the file.
+        let stat = |path: &str, keys: [&str; 2]| {
+            read(path).map_or(0, |stat| {
+                stat.lines()
+                    .filter_map(|line| line.split_once(' '))
+                    .filter(|(key, _)| keys.contains(key))
+                    .filter_map(|(_, value)| value.trim().parse::<u64>().ok())
+                    .fold(0u64, u64::saturating_add)
+            })
+        };
         for line in groups.lines() {
             let mut fields = line.splitn(3, ':');
             let (Some(id), Some(controllers), Some(path)) =
@@ -52,21 +70,36 @@ mod platform {
             };
             let path = path.trim_end_matches('/');
             if id == "0" && controllers.is_empty() {
-                // cgroup v2: "max" when unlimited, which fails to parse.
+                // cgroup v2: "max" when unlimited, which fails to parse. On a
+                // hybrid host the v2 group has no memory controller (no
+                // `memory.max`), and a v1 line may follow.
                 let base = format!("/sys/fs/cgroup{path}");
-                let limit = number(format!("{base}/memory.max"))?;
-                let used = number(format!("{base}/memory.current")).unwrap_or(0);
-                return Some(limit.saturating_sub(used));
+                let Some(limit) = read(&format!("{base}/memory.max")) else {
+                    continue;
+                };
+                let limit = limit.trim().parse::<u64>().ok()?;
+                let used = number(&format!("{base}/memory.current")).unwrap_or(0);
+                let cache = stat(
+                    &format!("{base}/memory.stat"),
+                    ["active_file", "inactive_file"],
+                );
+                return Some(limit.saturating_sub(used.saturating_sub(cache)));
             }
             if controllers.split(',').any(|c| c == "memory") {
                 // cgroup v1: an unlimited group reports a limit near 2^63.
                 let base = format!("/sys/fs/cgroup/memory{path}");
-                let limit = number(format!("{base}/memory.limit_in_bytes"))?;
+                let limit = number(&format!("{base}/memory.limit_in_bytes"))?;
                 if limit >= 1 << 60 {
                     return None;
                 }
-                let used = number(format!("{base}/memory.usage_in_bytes")).unwrap_or(0);
-                return Some(limit.saturating_sub(used));
+                let used = number(&format!("{base}/memory.usage_in_bytes")).unwrap_or(0);
+                // The `total_` keys include the group's descendants, as the
+                // usage does.
+                let cache = stat(
+                    &format!("{base}/memory.stat"),
+                    ["total_active_file", "total_inactive_file"],
+                );
+                return Some(limit.saturating_sub(used.saturating_sub(cache)));
             }
         }
         None
@@ -185,6 +218,37 @@ mod tests {
         assert_eq!(cgroup_room("4:memory:/v1\n1:cpu:/x\n", read), Some(1500));
         assert_eq!(cgroup_room("4:cpu,memory:/v1free\n", read), None);
         assert_eq!(cgroup_room("", read), None);
+        // Hybrid: the v2 line has no memory controller, the v1 line does.
+        assert_eq!(cgroup_room("0::/\n4:memory:/v1\n", read), Some(1500));
+    }
+
+    #[test]
+    fn leaves_page_cache_out_of_cgroup_usage() {
+        // A group at its limit, most of it files it read or wrote.
+        let files = HashMap::from([
+            ("/sys/fs/cgroup/job/memory.max", "1000\n"),
+            ("/sys/fs/cgroup/job/memory.current", "1000\n"),
+            (
+                "/sys/fs/cgroup/job/memory.stat",
+                "anon 300\nfile 700\nactive_anon 300\ninactive_file 500\nactive_file 150\n",
+            ),
+            ("/sys/fs/cgroup/memory/v1/memory.limit_in_bytes", "2000\n"),
+            ("/sys/fs/cgroup/memory/v1/memory.usage_in_bytes", "2000\n"),
+            (
+                "/sys/fs/cgroup/memory/v1/memory.stat",
+                "cache 1700\nrss 300\ninactive_file 10\ntotal_cache 1700\n\
+                 total_rss 300\ntotal_inactive_file 1200\ntotal_active_file 400\n",
+            ),
+            ("/sys/fs/cgroup/odd/memory.max", "100\n"),
+            ("/sys/fs/cgroup/odd/memory.current", "50\n"),
+            ("/sys/fs/cgroup/odd/memory.stat", "inactive_file 80\n"),
+        ]);
+        let read = |path: &str| files.get(path).map(|s| s.to_string());
+        assert_eq!(cgroup_room("0::/job\n", read), Some(650));
+        assert_eq!(cgroup_room("4:memory:/v1\n", read), Some(1600));
+        // More cache than usage (counters read at different moments): the
+        // whole limit, not more.
+        assert_eq!(cgroup_room("0::/odd\n", read), Some(100));
     }
 
     #[test]
