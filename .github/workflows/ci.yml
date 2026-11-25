@@ -10,9 +10,9 @@ on:
 # Actions are pinned by commit; the comment names the tag.
 jobs:
   test:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
-      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Installs the toolchain and components rust-toolchain.toml pins.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -52,8 +52,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: blacksmith-4vcpu-ubuntu-2404, python: "3.10", wheel: linux-x86_64 }
-          - { os: blacksmith-4vcpu-ubuntu-2404, python: "3.13" }
+          - { os: ubuntu-24.04, python: "3.10", wheel: linux-x86_64 }
+          - { os: ubuntu-24.04, python: "3.13" }
           - { os: macos-15, python: "3.10", wheel: macos-arm64 }
           - { os: windows-2025, python: "3.10", wheel: windows-x86_64 }
     runs-on: ${{ matrix.os }}
@@ -85,9 +85,9 @@ jobs:
   # scripts/check-mlt-conformance.sh and scripts/mlt-conformance/; the built
   # decoders are cached by version.
   mlt-conformance:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
-      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -104,9 +104,9 @@ jobs:
   # The oldest Rust the crate declares (`rust-version`); rust-toolchain.toml
   # pins a newer one for everything else.
   msrv:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
-      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.95 --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo +1.95 check --workspace --all-targets --locked
@@ -114,9 +114,9 @@ jobs:
   # Known vulnerabilities and unmaintained crates, licenses and sources
   # (deny.toml).
   deny:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
-      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         with:
           command: check
@@ -144,9 +144,9 @@ jobs:
   # for the ABIs phones and the emulator use. cargo-ndk points the C build scripts (SQLite, ring, zstd)
   # at the NDK's compilers.
   android:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
-      - uses: useblacksmith/checkout@75c49b6ed30ce59336e9252425796cfcfac155f8 # v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
         id: ndk
         with:
@@ -169,7 +169,7 @@ jobs:
   # version (RELEASING.md).
   semver:
     if: github.event_name == 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
