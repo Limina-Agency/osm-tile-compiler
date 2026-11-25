@@ -1,7 +1,7 @@
-//! Trees: a PMTiles archive of the trees mapped one by one (`natural=tree` nodes) or in rows
-//! (`natural=tree_row`) in an OSM extract, and of where its woods, scrub and orchards are, for
-//! renderers that stand a model at each tree and grow the rest. The OpenMapTiles schema has none
-//! of the first, and no leaf types of the second.
+//! Trees: a PMTiles archive of the trees mapped one by one (`natural=tree` nodes), the rows of
+//! trees (`natural=tree_row`) and hedges (`barrier=hedge`) in an OSM extract, and of where its
+//! woods, scrub and orchards are, for renderers that stand a model at each tree and grow the
+//! rest. The OpenMapTiles schema has none of the first, and no leaf types of the second.
 //!
 //! The archive is PMTiles v3 with tile type unknown, gzipped per tile, z14 only. Each tile is
 //! a little-endian `u32` count and then columns of that many values: `x`, `y` (the place in
@@ -12,10 +12,16 @@
 //! the extracts everyone publishes, rows after nodes. Then the stands: a `u8` count, each stand's
 //! `cover` (1 wood, 2 scrub, 3 orchard, 4 swamp, 5 grass, 6 heath, 7 field, 8 reeds, 9 lawn), `kind`, `genus` and height (metres), and,
 //! unless there are none, 512 x 512 `u8` cells by rows from the north-west, each 0 or a stand's
-//! number from 1 (`stands.rs`). A tile with neither trees nor stands is not written.
+//! number from 1 (`stands.rs`). Then, unless there are none, the lines: a `u32` count and columns
+//! of that many: `points` and `height` (decimetres) as `u16`, then `what` (1 a hedge, 2 a row of
+//! trees), `kind`, `genus` and `form` (a hedge's: 0 unknown, 1 clipped, 2 grown freely) as `u8`,
+//! and then every line's points, first their `x` and then their `y` as `u16`, in the trees' units.
+//! A line is cut where it leaves its tile, each piece in the tile it crosses. A tile with neither
+//! trees, stands nor lines is not written.
 //!
-//! Nothing is guessed but a row's spacing: a tree whose tags say nothing is a place alone, and
-//! a renderer decides what stands there.
+//! Nothing is guessed: a tree whose tags say nothing is a place alone, a line a line, and a
+//! renderer decides what stands there and how far apart. Version 1 had no lines, and a row's
+//! trees as trees 8 m apart, `source` 1.
 
 use crate::control::{CompileError, Control};
 use crate::omt::PartialArchive;
@@ -27,7 +33,7 @@ use osm_pbf_ingest::{
 };
 use pmtiles::{Compression, PmTilesWriter, TileCoord, TileId, TileType};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -35,15 +41,12 @@ use std::time::Instant;
 /// The tree archives' metadata `format`.
 pub const TREES_FORMAT: &str = "trees";
 /// Their metadata `version`. See `docs/formats.md` for when it changes.
-pub const TREES_VERSION: u32 = 1;
+pub const TREES_VERSION: u32 = 2;
 /// Spelled out so the bytes stay fixed; a test below checks it against the
 /// two constants above.
 const METADATA: &str =
-    r#"{"format":"trees","version":1,"attribution":"© OpenStreetMap contributors"}"#;
+    r#"{"format":"trees","version":2,"attribution":"© OpenStreetMap contributors"}"#;
 pub(crate) const ZOOM: u8 = 14;
-/// Metres between a row's trees, and from a mapped one within which a row has none.
-const ROW_SPACING: f64 = 8.0;
-const ROW_CLEAR: f64 = 5.0;
 const GZIP_LEVEL: u32 = 6;
 const MAX_LATITUDE: f64 = 85.051_128_779_806_59;
 
@@ -102,8 +105,23 @@ struct Tree {
     /// leafless), leaf cycle in the next two (1 deciduous, 2 evergreen, 3 between them).
     kind: u8,
     genus: u8,
-    /// 0: mapped as a node; 1: in a row.
+    /// 0: mapped as a node; 1: in a row (version 1 alone).
     source: u8,
+}
+
+/// A hedge's or a row's line in a tile, as the tile holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Line {
+    /// 1 a hedge, 2 a row of trees.
+    what: u8,
+    /// Decimetres, 0 unknown; `kind` and `genus` as a tree's.
+    height: u16,
+    kind: u8,
+    genus: u8,
+    /// A hedge's: 0 unknown, 1 clipped, 2 grown freely.
+    form: u8,
+    /// In the tile, as a tree's place.
+    points: Vec<[u16; 2]>,
 }
 
 /// What [`write_trees`] wrote.
@@ -112,8 +130,11 @@ struct Tree {
 pub struct TreesReport {
     pub tiles: u64,
     pub trees: u64,
-    /// Of them, trees of rows.
-    pub in_rows: u64,
+    /// Rows of trees and hedges, and their kilometres.
+    pub rows: u64,
+    pub row_km: f64,
+    pub hedges: u64,
+    pub hedge_km: f64,
     /// Trees whose tags give a leaf type, or a genus.
     pub with_kind: u64,
     /// Trees whose tags give a height.
@@ -185,7 +206,10 @@ fn write(
     let mut report = TreesReport {
         tiles: 0,
         trees: 0,
-        in_rows: 0,
+        rows: 0,
+        row_km: 0.0,
+        hedges: 0,
+        hedge_km: 0.0,
         with_kind: 0,
         with_height: 0,
         stand_tiles: 0,
@@ -210,8 +234,15 @@ fn write(
             cancelled,
         )?;
         control.check()?;
-        let rows = std::mem::take(&mut stands.rows);
-        sink.rows(&rows)?;
+        for row in std::mem::take(&mut stands.rows) {
+            let km = length(&row.line) / 1000.0;
+            if row.hedge {
+                (report.hedges, report.hedge_km) = (report.hedges + 1, report.hedge_km + km);
+            } else {
+                (report.rows, report.row_km) = (report.rows + 1, report.row_km + km);
+            }
+            sink.line(&row)?;
+        }
         report.incomplete = stands.incomplete_areas();
         let places = std::mem::take(&mut sink.places);
         stands.paint(places, || control.check())?
@@ -223,9 +254,9 @@ fn write(
         sink.reach(x, y);
         sink.stands.insert(TileId::from(coord).value(), p);
     }
-    if sink.tiles.is_empty() && sink.stands.is_empty() {
+    if sink.tiles.is_empty() && sink.stands.is_empty() && sink.lines.is_empty() {
         return Err(format!(
-            "{} has no trees, woods or orchards",
+            "{} has no trees, woods, orchards or hedges",
             input.display()
         ));
     }
@@ -245,6 +276,7 @@ fn write(
         .tiles
         .keys()
         .chain(sink.stands.keys())
+        .chain(sink.lines.keys())
         .copied()
         .collect();
     ids.sort_unstable();
@@ -257,7 +289,8 @@ fn write(
             .par_iter()
             .map(|id| {
                 let trees = sink.tiles.get(id).map_or(&[][..], Vec::as_slice);
-                let raw = encode_tile(trees, sink.stands.get(id));
+                let lines = sink.lines.get(id).map_or(&[][..], Vec::as_slice);
+                let raw = encode_tile(trees, sink.stands.get(id), lines);
                 let mut gz = GzEncoder::new(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
                 gz.write_all(&raw)
                     .and_then(|()| gz.finish())
@@ -269,7 +302,6 @@ fn write(
             let trees = sink.tiles.get(id).map_or(&[][..], Vec::as_slice);
             let count = |of: fn(&Tree) -> bool| trees.iter().filter(|t| of(t)).count() as u64;
             report.trees += trees.len() as u64;
-            report.in_rows += count(|t| t.source == 1);
             report.with_kind += count(|t| t.kind != 0 || t.genus != 0);
             report.with_height += count(|t| t.height != 0);
             report.raw_bytes += raw as u64;
@@ -309,6 +341,7 @@ impl Drop for Temp {
 struct Trees {
     tiles: BTreeMap<u64, Vec<Tree>>,
     stands: BTreeMap<u64, Painted>,
+    lines: BTreeMap<u64, Vec<Line>>,
     /// The mapped trees, in the stands' units.
     places: Vec<[i32; 2]>,
     bounds: [f64; 4],
@@ -319,6 +352,7 @@ impl Default for Trees {
         Self {
             tiles: BTreeMap::new(),
             stands: BTreeMap::new(),
+            lines: BTreeMap::new(),
             places: Vec::new(),
             bounds: [180.0, 90.0, -180.0, -90.0],
         }
@@ -382,56 +416,103 @@ impl Trees {
         self.hold([lon(x), lat(y + 1), lon(x + 1), lat(y)]);
     }
 
-    /// The rows' trees, but where one is mapped already.
-    fn rows(&mut self, rows: &[Row]) -> Result<(), String> {
-        const BUCKET: i32 = 64;
-        let mut mapped: HashMap<[i32; 2], Vec<[i32; 2]>> = HashMap::new();
-        for p in &self.places {
-            mapped
-                .entry(p.map(|c| c.div_euclid(BUCKET)))
+    /// A row's or a hedge's line, in each tile it crosses.
+    fn line(&mut self, row: &Row) -> Result<(), String> {
+        let t = tagged(&row.tags, 0);
+        let form = if row.hedge { form(&row.tags) } else { 0 };
+        for ((x, y), points) in clip(&row.line) {
+            let coord = TileCoord::new(ZOOM, x, y).map_err(|e| format!("No tile {x} {y}: {e}"))?;
+            self.lines
+                .entry(TileId::from(coord).value())
                 .or_default()
-                .push(*p);
+                .push(Line {
+                    what: if row.hedge { 1 } else { 2 },
+                    height: t.height,
+                    kind: t.kind,
+                    genus: t.genus,
+                    form,
+                    points,
+                });
+            self.reach(x, y);
         }
-        let mut places = std::mem::take(&mut self.places);
-        for row in rows {
-            let tree = tagged(&row.tags, 1);
-            let clear = stands::units(ROW_CLEAR, row.line[0][1]);
-            for p in along(&row.line, stands::units(ROW_SPACING, row.line[0][1])) {
-                let taken = (-1..=1)
-                    .flat_map(|i| (-1..=1).map(move |j| (i, j)))
-                    .filter_map(|(i, j)| {
-                        mapped.get(&[p[0].div_euclid(BUCKET) + i, p[1].div_euclid(BUCKET) + j])
-                    })
-                    .flatten()
-                    .any(|m| f64::from(m[0] - p[0]).hypot(f64::from(m[1] - p[1])) < clear);
-                if !taken {
-                    let [longitude, latitude] = stands::place(p);
-                    self.push(longitude, latitude, tree)?;
-                    places.push(p);
-                }
-            }
-        }
-        self.places = places;
         Ok(())
     }
 }
 
-/// Places `spacing` apart along a line, from half of it in.
-fn along(line: &[[i32; 2]], spacing: f64) -> Vec<[i32; 2]> {
-    let mut out = Vec::new();
-    let mut next = spacing * 0.5;
-    let mut gone = 0.0;
+/// A line's metres.
+fn length(line: &[[i32; 2]]) -> f64 {
+    line.windows(2)
+        .map(|e| {
+            let d = f64::from(e[1][0] - e[0][0]).hypot(f64::from(e[1][1] - e[0][1]));
+            d / stands::units(1.0, e[0][1] + (e[1][1] - e[0][1]) / 2)
+        })
+        .sum()
+}
+
+/// A hedge's form, where its tags say: clipped, or grown freely.
+fn form(tags: &osm_pbf_ingest::Tags) -> u8 {
+    match tags.get("hedge").or(tags.get("shape")) {
+        Some("clipped" | "trimmed" | "cut" | "box" | "topiary") => 1,
+        Some("hedge_bank" | "hedgerow" | "natural" | "untrimmed" | "unclipped" | "wild") => 2,
+        _ => 0,
+    }
+}
+
+/// A line's piece in a z14 tile: the tile's `(x, y)` and its points in the tile's 65536ths.
+type Piece = ((u32, u32), Vec<[u16; 2]>);
+
+/// A line's pieces in the z14 tiles it crosses.
+fn clip(line: &[[i32; 2]]) -> Vec<Piece> {
+    let side = f64::from(stands::TILE);
+    // by their tiles, in units
+    let mut pieces: Vec<(_, Vec<[f64; 2]>)> = Vec::new();
     for e in line.windows(2) {
         let [a, b] = [e[0], e[1]].map(|p| p.map(f64::from));
-        let long = (b[0] - a[0]).hypot(b[1] - a[1]);
-        while next < gone + long {
-            let t = (next - gone) / long;
-            out.push([0, 1].map(|c| (a[c] + (b[c] - a[c]) * t).round() as i32));
-            next += spacing;
+        // where it crosses a tile's edge
+        let mut ts = vec![0.0, 1.0];
+        for c in 0..2 {
+            let (lo, hi) = (a[c].min(b[c]), a[c].max(b[c]));
+            let mut k = (lo / side).floor() + 1.0;
+            while k * side < hi {
+                ts.push((k * side - a[c]) / (b[c] - a[c]));
+                k += 1.0;
+            }
         }
-        gone += long;
+        ts.sort_by(f64::total_cmp);
+        let at = |t: f64| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        for w in ts.windows(2) {
+            if w[1] <= w[0] {
+                continue;
+            }
+            let m = at((w[0] + w[1]) * 0.5);
+            let tile = ((m[0] / side).floor() as i64, (m[1] / side).floor() as i64);
+            let (p, q) = (at(w[0]), at(w[1]));
+            match pieces.last_mut() {
+                Some((t, points)) if *t == tile && points.last() == Some(&p) => points.push(q),
+                _ => pieces.push((tile, vec![p, q])),
+            }
+        }
     }
-    out
+    let tiles = 1i64 << ZOOM;
+    pieces
+        .into_iter()
+        .filter(|((x, y), _)| (0..tiles).contains(x) && (0..tiles).contains(y))
+        .filter_map(|((x, y), points)| {
+            let origin = [x as f64 * side, y as f64 * side];
+            let mut out: Vec<[u16; 2]> = points
+                .iter()
+                .map(|p| {
+                    [0, 1].map(|c| {
+                        ((p[c] - origin[c]) / side * 65536.0)
+                            .round()
+                            .clamp(0.0, 65535.0) as u16
+                    })
+                })
+                .collect();
+            out.dedup();
+            (out.len() > 1).then_some(((x as u32, y as u32), out))
+        })
+        .collect()
 }
 
 /// What a tree's, or its row's, tags say of it.
@@ -513,7 +594,7 @@ pub(crate) fn genus(name: &str) -> u8 {
         .map_or(0, |i| i as u8 + 1)
 }
 
-fn encode_tile(trees: &[Tree], stands: Option<&Painted>) -> Vec<u8> {
+fn encode_tile(trees: &[Tree], stands: Option<&Painted>, lines: &[Line]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + trees.len() * 10);
     out.extend((trees.len() as u32).to_le_bytes());
     for column in [|t: &Tree| t.x, |t: &Tree| t.y, |t: &Tree| t.height] {
@@ -530,6 +611,27 @@ fn encode_tile(trees: &[Tree], stands: Option<&Painted>) -> Vec<u8> {
     match stands {
         Some(s) => s.encode(&mut out),
         None => out.push(0),
+    }
+    if !lines.is_empty() {
+        out.extend((lines.len() as u32).to_le_bytes());
+        for column in [|l: &Line| l.points.len() as u16, |l: &Line| l.height] {
+            out.extend(lines.iter().flat_map(|l| column(l).to_le_bytes()));
+        }
+        for column in [
+            |l: &Line| l.what,
+            |l: &Line| l.kind,
+            |l: &Line| l.genus,
+            |l: &Line| l.form,
+        ] {
+            out.extend(lines.iter().map(column));
+        }
+        for c in 0..2 {
+            out.extend(
+                lines
+                    .iter()
+                    .flat_map(|l| l.points.iter().flat_map(move |p| p[c].to_le_bytes())),
+            );
+        }
     }
     out
 }
@@ -602,13 +704,105 @@ mod tests {
             genus: 7,
             source: 0,
         };
-        let bytes = encode_tile(&[t(0x0101), t(0x0202)], None);
+        let bytes = encode_tile(&[t(0x0101), t(0x0202)], None, &[]);
         assert_eq!(
             bytes,
             [
                 2, 0, 0, 0, 1, 1, 2, 2, 2, 0, 2, 0, 4, 3, 4, 3, 5, 5, 6, 6, 7, 7, 0, 0, 0
             ]
         );
+    }
+
+    #[test]
+    fn lines_follow_the_stands_as_columns_then_points() {
+        let hedge = Line {
+            what: 1,
+            height: 0x0203,
+            kind: 4,
+            genus: 5,
+            form: 2,
+            points: vec![[1, 2], [0x0304, 0x0506], [7, 8]],
+        };
+        let row = Line {
+            what: 2,
+            height: 0,
+            kind: 0,
+            genus: 0,
+            form: 0,
+            points: vec![[9, 10], [11, 12]],
+        };
+        let bytes = encode_tile(&[], None, &[hedge, row]);
+        assert_eq!(
+            bytes,
+            [
+                0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 2, 0, 3, 2, 0, 0, 1, 2, 4, 0, 5, 0, 2, 0, 1, 0, 4,
+                3, 7, 0, 9, 0, 11, 0, 2, 0, 6, 5, 8, 0, 10, 0, 12, 0
+            ]
+        );
+        // a tile without lines is as version 1's
+        assert_eq!(encode_tile(&[], None, &[]), [0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn lines_are_cut_at_their_tiles_edges() {
+        let side = stands::TILE;
+        let (x, y) = (9099 * side, 5552 * side);
+        // from a quarter into one tile to a quarter into the next east, and on south into a third
+        let line = [
+            [x + side / 4, y + side / 2],
+            [x + side + side / 4, y + side / 2],
+            [x + side + side / 4, y + side + side / 8],
+        ];
+        let pieces = clip(&line);
+        assert_eq!(
+            pieces,
+            [
+                ((9099, 5552), vec![[16384, 32768], [65535, 32768]]),
+                (
+                    (9100, 5552),
+                    vec![[0, 32768], [16384, 32768], [16384, 65535]]
+                ),
+                ((9100, 5553), vec![[16384, 0], [16384, 8192]]),
+            ]
+        );
+        // along an edge, a line is in one of its tiles alone
+        let along = clip(&[[x, y + 10], [x, y + 100]]);
+        assert_eq!(along.len(), 1);
+        assert!(clip(&[[x + 5, y + 5], [x + 5, y + 5]]).is_empty());
+    }
+
+    #[test]
+    fn hedges_say_how_they_are_kept_and_rows_their_trees() {
+        let mut tags = osm_pbf_ingest::Tags::new();
+        assert_eq!(form(&tags), 0);
+        tags.insert("hedge", "hedge_bank");
+        assert_eq!(form(&tags), 2);
+        let mut t = Trees::default();
+        tags.insert("height", "1.5");
+        tags.insert("leaf_type", "needleleaved");
+        let a = stands::unit(19.937_3, 50.061_7);
+        let line: std::sync::Arc<[[i32; 2]]> = std::sync::Arc::from([a, [a[0] + 400, a[1]]]);
+        assert!((length(&line) - 400.0 / stands::units(1.0, a[1])).abs() < 1e-6);
+        t.line(&Row {
+            tags,
+            line: line.clone(),
+            hedge: true,
+        })
+        .unwrap();
+        t.line(&Row {
+            tags: osm_pbf_ingest::Tags::new(),
+            line,
+            hedge: false,
+        })
+        .unwrap();
+        let lines: Vec<&Line> = t.lines.values().flatten().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            (lines[0].what, lines[0].height, lines[0].kind, lines[0].form),
+            (1, 15, 2, 2)
+        );
+        assert_eq!((lines[1].what, lines[1].height, lines[1].form), (2, 0, 0));
+        assert!(t.tiles.is_empty(), "no trees of rows");
     }
 
     /// Monaco's fixture: every tree once, and the same bytes for any number of threads.
@@ -620,10 +814,12 @@ mod tests {
         let report = write_trees(&input, &a, 1, || false).unwrap();
         let again = write_trees(&input, &b, 4, || false).unwrap();
         assert!(report.trees > 100, "{report:?}");
+        // its hedges and its row, as lines
+        assert!(report.hedges > 0 && report.rows > 0, "{report:?}");
         assert_eq!(report.trees, again.trees);
         assert_eq!(
-            (&report.in_rows, report.stand_tiles),
-            (&again.in_rows, again.stand_tiles)
+            (report.rows, report.hedges, report.stand_tiles),
+            (again.rows, again.hedges, again.stand_tiles)
         );
         assert!(
             report.stand_tiles > 0 && report.stand_km2 > 0.0,
@@ -634,26 +830,6 @@ mod tests {
             write_trees(&input, &a, 1, || false),
             Err(CompileError::InvalidRequest(_))
         ));
-    }
-
-    #[test]
-    fn rows_stand_their_trees_apart_and_clear_of_mapped_ones() {
-        let a = stands::unit(19.937_3, 50.061_7);
-        let spacing = stands::units(ROW_SPACING, a[1]);
-        let line = [a, [a[0] + (spacing * 10.0) as i32, a[1]]];
-        assert_eq!(along(&line, spacing).len(), 10);
-        let mut t = Trees::default();
-        // beside the third
-        t.places
-            .push([a[0] + (spacing * 2.5) as i32, a[1] + (spacing * 0.2) as i32]);
-        let row = Row {
-            tags: osm_pbf_ingest::Tags::new(),
-            line: std::sync::Arc::from(line),
-        };
-        t.rows(&[row]).unwrap();
-        assert_eq!(t.tiles.values().map(Vec::len).sum::<usize>(), 9);
-        assert!(t.tiles.values().flatten().all(|t| t.source == 1));
-        assert_eq!(t.places.len(), 10);
     }
 
     #[test]

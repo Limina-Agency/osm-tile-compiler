@@ -18,7 +18,7 @@ pub(crate) const SIDE: usize = 512;
 /// Fixed-point units along a cell's side.
 const CELL: i32 = 16;
 /// Units along a tile's side.
-const TILE: i32 = SIDE as i32 * CELL;
+pub(crate) const TILE: i32 = SIDE as i32 * CELL;
 /// Units round the world, at z14: 2^27.
 const WORLD: f64 = (1u32 << super::trees::ZOOM) as f64 * TILE as f64;
 const EARTH_METRES: f64 = 40_075_016.685_578_49;
@@ -173,12 +173,6 @@ pub(crate) fn units(metres: f64, y: i32) -> f64 {
     metres * WORLD / (EARTH_METRES * lat.cos())
 }
 
-/// Degrees east and north of a place in units.
-pub(crate) fn place(p: [i32; 2]) -> [f64; 2] {
-    let [u, v] = p.map(|c| f64::from(c) / WORLD);
-    [u * 360.0 - 180.0, super::trees::latitude(v)]
-}
-
 /// A cell's square metres in row `y` of tiles.
 pub(crate) fn cell_m2(y: u32) -> f64 {
     (f64::from(CELL) / units(1.0, (y as i32) * TILE + TILE / 2)).powi(2)
@@ -259,11 +253,16 @@ impl Gathered {
     }
 }
 
-/// A row of trees, a place a tree.
+/// A row of trees or a hedge, as a line.
 pub(crate) struct Row {
     pub tags: Tags,
     pub line: Arc<[[i32; 2]]>,
+    /// A hedge (`barrier=hedge`), not a row of trees.
+    pub hedge: bool,
 }
+
+/// Metres between the lines a hedge mapped as an area is planted along.
+const HEDGE_LINES: f64 = 1.0;
 
 /// The areas and lines of an extract that the grid is painted with.
 pub(crate) struct Stands {
@@ -368,7 +367,8 @@ impl Stands {
         let closed = closed_area(way);
         let what = what(|k| way.tags.get(k), closed);
         let row = way.tags.get("natural") == Some("tree_row");
-        if what.is_none() && !row {
+        let hedge = way.tags.get("barrier") == Some("hedge");
+        if what.is_none() && !row && !hedge {
             return;
         }
         let Some(line) = line.filter(|l| l.len() > 1) else {
@@ -379,7 +379,23 @@ impl Stands {
             self.rows.push(Row {
                 tags: way.tags.clone(),
                 line: line.clone(),
+                hedge: false,
             });
+        }
+        if hedge {
+            // a hedge mapped as an area is planted along lines across it, else along its way
+            let lines = if closed && way.tags.get("area") == Some("yes") {
+                across(&line, units(HEDGE_LINES, line[0][1]))
+            } else {
+                vec![line.clone()]
+            };
+            for line in lines {
+                self.rows.push(Row {
+                    tags: way.tags.clone(),
+                    line,
+                    hedge: true,
+                });
+            }
         }
         if let Some(what) = what {
             self.features.push(Feature::new(what, vec![line]));
@@ -451,9 +467,63 @@ impl Stands {
     }
 }
 
-/// Whether a way is an area, a line or a row of ours.
+/// Whether a way is an area, a line, a row or a hedge of ours.
 fn wanted(tags: &TagsRef<'_>) -> bool {
-    tags.get("natural") == Some("tree_row") || what(|k| tags.get(k), true).is_some()
+    tags.get("natural") == Some("tree_row")
+        || tags.get("barrier") == Some("hedge")
+        || what(|k| tags.get(k), true).is_some()
+}
+
+/// Lines `spacing` apart across a ring, along its longest edge, the middle one through its middle:
+/// one at least, down a ring narrower than `spacing`.
+fn across(ring: &[[i32; 2]], spacing: f64) -> Vec<Arc<[[i32; 2]]>> {
+    let longest = ring
+        .windows(2)
+        .map(|e| [f64::from(e[1][0] - e[0][0]), f64::from(e[1][1] - e[0][1])])
+        .max_by(|a, b| a[0].hypot(a[1]).total_cmp(&b[0].hypot(b[1])))
+        .unwrap_or([1.0, 0.0]);
+    let along = longest[0].hypot(longest[1]);
+    if along <= 0.0 || spacing <= 0.0 {
+        return Vec::new();
+    }
+    let (c, s) = (longest[0] / along, longest[1] / along);
+    // in axes along the edge (x) and across it (y)
+    let o = ring[0].map(f64::from);
+    let turned: Vec<[f64; 2]> = ring
+        .iter()
+        .map(|p| {
+            let [x, y] = [f64::from(p[0]) - o[0], f64::from(p[1]) - o[1]];
+            [x * c + y * s, y * c - x * s]
+        })
+        .collect();
+    let (lo, hi) = turned.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+        (lo.min(p[1]), hi.max(p[1]))
+    });
+    let n = ((hi - lo) / spacing).floor().max(1.0) as usize;
+    let first = lo + ((hi - lo) - (n - 1) as f64 * spacing) * 0.5;
+    let mut out = Vec::new();
+    for k in 0..n {
+        let y = first + k as f64 * spacing;
+        let mut xs: Vec<f64> = turned
+            .windows(2)
+            .filter(|e| (e[0][1] <= y) != (e[1][1] <= y))
+            .map(|e| e[0][0] + (y - e[0][1]) / (e[1][1] - e[0][1]) * (e[1][0] - e[0][0]))
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        for pair in xs.as_chunks::<2>().0 {
+            let back = |x: f64| {
+                [
+                    (o[0] + x * c - y * s).round() as i32,
+                    (o[1] + x * s + y * c).round() as i32,
+                ]
+            };
+            let (a, b) = (back(pair[0]), back(pair[1]));
+            if a != b {
+                out.push(Arc::from([a, b]));
+            }
+        }
+    }
+    out
 }
 
 impl Feature {
@@ -868,6 +938,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_hedges_area_is_lines_along_it() {
+        // 40 units long, 12 across: three lines 4 apart, the middle one through its middle
+        let ring = [[0, 0], [40, 0], [40, 12], [0, 12], [0, 0]];
+        let lines = across(&ring, 4.0);
+        assert_eq!(lines.len(), 3);
+        let mut ys: Vec<i32> = lines.iter().map(|l| l[0][1]).collect();
+        ys.sort_unstable();
+        assert_eq!(ys, [2, 6, 10]);
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.len() == 2 && l[0][1] == l[1][1] && (l[1][0] - l[0][0]).abs() == 40)
+        );
+        // narrower than the spacing: one, down its middle; turned, the same
+        assert_eq!(across(&ring, 20.0).len(), 1);
+        assert_eq!(across(&ring, 20.0)[0][0][1], 6);
+        let turned = [[0, 0], [0, 40], [-12, 40], [-12, 0], [0, 0]];
+        let lines = across(&turned, 4.0);
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| l[0][0] == l[1][0]));
     }
 
     #[test]

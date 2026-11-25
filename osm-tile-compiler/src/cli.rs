@@ -74,8 +74,8 @@ Usage:
 Commands:
   compile          Compile INPUT.pbf, or the Geofabrik extract of a region,
                    into a new PMTiles archive
-  trees            Write the mapped trees and the woods of an extract to a new
-                   archive, for renderers that stand a model at each tree
+  trees            Write the mapped trees, rows, hedges and woods of an extract
+                   to a new archive, for renderers that stand a model at each tree
   building-levels  Write the building levels of a compiled archive to a new
                    PMTiles archive: its buildings as boxes for far views
   fetch-sources    Download, or verify, the supplemental datasets into DIR:
@@ -1196,11 +1196,14 @@ fn trees(args: DeriveArgs) -> Result<(), String> {
             }
         })?;
     status.line(&format!(
-        "Wrote {} in {:.1} s: {} trees ({} in rows) and {:.0} km2 of stands in {} tiles, {} trees with a leaf type or genus, {} with a height, {} raw, {} gzipped",
+        "Wrote {} in {:.1} s: {} trees, {} rows of trees ({:.0} km), {} hedges ({:.0} km) and {:.0} km2 of stands in {} tiles, {} trees with a leaf type or genus, {} with a height, {} raw, {} gzipped",
         args.output.display(),
         report.seconds,
         report.trees,
-        report.in_rows,
+        report.rows,
+        report.row_km,
+        report.hedges,
+        report.hedge_km,
         report.stand_km2,
         report.tiles,
         report.with_kind,
