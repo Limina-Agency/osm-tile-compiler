@@ -1,9 +1,52 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-11-25)
+
+### Changed
+
+- MapLibre Tile (MLT) output (`--tile-format mlt`) is supported, no longer
+  experimental. It is read by MapLibre GL JS 5.12, MapLibre Native Android
+  13.4 and iOS 6.28 and later; [docs/mlt.md](docs/mlt.md) says what is
+  written and why older MapLibre Native draws polygon edges a few levels
+  off. `--search-index` and `--building-levels` now work with MLT: both read
+  the tiles through an MLT-to-MVT transcode, and on Berlin and Monaco the
+  side files are byte for byte those of the MVT basemap.
+- The `data-sources` feature (see below) is on by default, and the C ABI and
+  Python crates turn it on.
 
 ### New
 
+- `--max-zoom` goes up to 16, as Planetiler's `--maxzoom` does
+  (`ZoomRange::LIMIT`, `ZoomRange::up_to`, the C ABI's `zoom.max`, Python's
+  `max_zoom`). The default stays 14 (`ZoomRange::DEFAULT_MAX_ZOOM`) and its
+  output is byte for byte what it was. Above 14 the profile follows
+  Planetiler: features with an open zoom range reach the top, the max zoom
+  tolerance and minimum size apply at the top only, and lake labels without
+  a centerline go on to the top. `extract` without a max keeps what the
+  source holds.
+- Serving with Martin (experimental, [docs/martin.md](docs/martin.md)): the
+  new `martin-config` command (`martin::write_martin_config`) writes a
+  Martin config that serves the archives, watching the directories given,
+  and an OSM Bright style per archive pointing at Martin's TileJSON, with MLT
+  encoding and the `sar` layers where they apply.
+- `apply --in-place` (`archive::apply_in_place`) writes the new archive
+  beside the old one and renames it over the old one only after the delta's
+  signature and the result's SHA-256 are checked, so a tile server reading
+  the archive sees the old archive or the new one, never a mix.
+- `--tile-compression none` (`ArchiveOptions::tile_compression`,
+  `TileCompression`, `tileCompression` in the worker request) stores PMTiles
+  tiles uncompressed, for Martin 2.0.0-beta.7, which refuses gzipped MLT
+  archives. The tiles are the gzipped ones unzipped; on Berlin (MLT) the
+  archive is 54.4 MB against 33.3 MB gzipped. PMTiles only, and not with the
+  merge cache.
+- C ABI: `compile_basemap` and `write_style_pack` take `tileFormat`. Python's
+  `compile` takes `tile_format` and `search_index`, and returns the index's
+  path.
+- `scripts/check-mlt-conformance.sh` decodes an MLT compile's tiles with
+  mlt-core, @maplibre/mlt and MapLibre Native's decoder and compares them
+  with the features the tiles hold (CI runs it on Monaco), and
+  `scripts/check-mlt-spec.sh` checks the vendored MLT specification fixtures
+  (416 of them) against the specification's main branch (nightly).
 - Tile schemas besides OpenMapTiles ([docs/schemas.md](docs/schemas.md)):
   `compile --schema shortbread` writes Shortbread, from the `shortbread.yml`
   Planetiler 0.10.2 ships, and `--schema FILE.yml` a schema in Planetiler's
@@ -40,6 +83,21 @@
 - Crate features `flatgeobuf`, `geoparquet` and `reproject`, together the
   default `data-sources`. GeoJSON, CSV, Shapefile and GeoPackage in WGS84 or
   Web Mercator need none of them.
+- [docs/comparison.md](docs/comparison.md) compares osm-tile-compiler 0.4.0
+  with Planetiler, tilemaker, Tippecanoe, the OpenMapTiles tools and Martin.
+
+### Deprecated
+
+- `ZoomRange::MAX_ZOOM`: the highest zoom is no longer fixed. Use
+  `ZoomRange::DEFAULT_MAX_ZOOM`, or `ZoomRange::LIMIT` for the highest
+  allowed.
+
+### Fixed
+
+- `serve` accepts each connection at once. It used to sleep 100 ms whenever
+  no connection was waiting, so clients that open a connection per request
+  got about 80 tiles/s with 8 clients on Berlin; they now get 1,867 tiles/s,
+  as with Martin.
 
 ## 0.4.0 (2026-11-24)
 
