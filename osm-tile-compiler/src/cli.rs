@@ -1,4 +1,4 @@
-//! The human command line: `compile`, `building-levels`, `search-index`,
+//! The human command line: `compile`, `building-levels`, `hd-roads`, `search-index`,
 //! `search`, `fetch-sources`, `style`, `inspect`, `verify`, `extract`, `diff`,
 //! `apply`, `update`, `serve`, `martin-config`, `keygen`, `sign`, `verify-signature`,
 //! `completions`, `help`, `--version`.
@@ -18,7 +18,7 @@ use osm_tile_compiler::{
     archive::{self, ArchiveOptions, ArchiveReport, DeltaManifest, PublicKey, SecretKey},
     building_levels_path, compile_basemap, fetch_extract_from, fetch_sources as fetch_datasets,
     kib, maplibre_style, resolve_languages, update_extract, with_sar_layers,
-    write_building_levels_cancellable, write_style_pack,
+    write_building_levels_cancellable, write_hd_roads, write_style_pack,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -47,6 +47,7 @@ Usage:
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler search-index <INPUT.pmtiles> [--output <FILE.idx>] [--threads <N>] [--json]
   osm-tile-compiler search <FILE.idx|FILE.pmtiles> <QUERY>... [--near <LON LAT>] [OPTIONS]
+  osm-tile-compiler hd-roads <INPUT.pbf> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler schema verify <FILE.yml|shortbread> [--json]
   osm-tile-compiler schema layers <FILE.yml|shortbread|openmaptiles>
@@ -78,6 +79,7 @@ Usage:
   osm-tile-compiler building-levels <INPUT.pmtiles> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler search-index <INPUT.pmtiles> [--output <FILE.idx>] [--threads <N>] [--json]
   osm-tile-compiler search <FILE.idx|FILE.pmtiles> <QUERY>... [--near <LON LAT>] [OPTIONS]
+  osm-tile-compiler hd-roads <INPUT.pbf> <OUTPUT.pmtiles> [--threads <N>]
   osm-tile-compiler fetch-sources <DIR>
   osm-tile-compiler schema verify <FILE.yml|shortbread> [--json]
   osm-tile-compiler schema layers <FILE.yml|shortbread|openmaptiles>
@@ -110,6 +112,9 @@ Commands:
   search           Find names in a search index (or the one beside an
                    archive), ignoring case and diacritics; the last word
                    matches as a prefix
+  hd-roads         Experimental: write the roads of an extract at their true
+                   width, with their lane markings, to a new PMTiles archive
+                   of z16 vector tiles
   fetch-sources    Download, or verify, the supplemental datasets into DIR:
                    lake_centerline.shp.zip, natural_earth_vector.sqlite.zip and
                    water-polygons-split-3857.zip
@@ -580,6 +585,13 @@ struct BuildingLevelsArgs {
 }
 
 #[derive(Debug)]
+struct HdRoadsArgs {
+    input: PathBuf,
+    output: PathBuf,
+    threads: Option<usize>,
+}
+
+#[derive(Debug)]
 struct StyleArgs {
     archive: String,
     glyphs: Option<String>,
@@ -601,6 +613,7 @@ enum Command {
     BuildingLevels(BuildingLevelsArgs),
     SearchIndex(search::SearchIndexArgs),
     Search(search::SearchArgs),
+    HdRoads(HdRoadsArgs),
     FetchSources(PathBuf),
     SchemaVerify {
         schema: osm_tile_compiler::TileSchema,
@@ -706,6 +719,7 @@ pub fn main(args: Vec<OsString>) -> i32 {
         Command::BuildingLevels(args) => building_levels(args),
         Command::SearchIndex(args) => search::search_index(args),
         Command::Search(args) => search::search(args),
+        Command::HdRoads(args) => hd_roads(args),
         Command::FetchSources(directory) => fetch_sources(&directory),
         Command::SchemaVerify { schema, json } => schema_verify(&schema, json),
         Command::SchemaLayers(schema) => {
@@ -771,6 +785,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         Some("building-levels") => parse_building_levels(rest),
         Some("search-index") => search::parse_search_index(rest),
         Some("search") => search::parse_search(rest),
+        Some("hd-roads") => parse_hd_roads(rest),
         Some("fetch-sources") => parse_fetch_sources(rest),
         Some("schema") => parse_schema(rest),
         Some("style") => parse_style(rest),
@@ -1405,6 +1420,42 @@ fn parse_building_levels(args: &[OsString]) -> Result<Command, String> {
             extra.display()
         )),
         _ => Err("building-levels needs an input and an output archive".into()),
+    }
+}
+
+fn parse_hd_roads(args: &[OsString]) -> Result<Command, String> {
+    let mut paths = Vec::new();
+    let mut threads = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(flag) = option(arg) else {
+            paths.push(PathBuf::from(arg));
+            continue;
+        };
+        match flag.as_str() {
+            "--help" | "-h" => return Ok(Command::Help),
+            "--threads" => {
+                let count: usize = number(value(&mut args, &flag)?, &flag)?;
+                if count == 0 {
+                    return Err("--threads must be at least 1".into());
+                }
+                threads = Some(count);
+            }
+            _ => return Err(format!("unknown hd-roads option '{flag}'")),
+        }
+    }
+    let mut paths = paths.into_iter();
+    match (paths.next(), paths.next(), paths.next()) {
+        (Some(input), Some(output), None) => Ok(Command::HdRoads(HdRoadsArgs {
+            input,
+            output,
+            threads,
+        })),
+        (_, _, Some(extra)) => Err(format!(
+            "unexpected argument '{}': hd-roads takes an extract and an archive",
+            extra.display()
+        )),
+        _ => Err("hd-roads needs an input PBF and an output archive".into()),
     }
 }
 
@@ -2089,6 +2140,77 @@ fn building_levels(args: BuildingLevelsArgs) -> Result<(), String> {
     })?;
     report_levels(&mut status, &args.output, &report);
     write_profile(&mut status, args.profile.as_deref(), profile)
+}
+
+fn hd_roads(args: HdRoadsArgs) -> Result<(), String> {
+    let mut status = Status::new();
+    let threads = args
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    status.line(&format!(
+        "Writing the roads of {} into {} ({threads} threads)",
+        args.input.display(),
+        args.output.display()
+    ));
+    let mut temp = args.output.clone().into_os_string();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    let _cooperating = interrupt::cooperate();
+    let marker = claim_scratch(&temp, false, &mut status)?;
+    let _scratch_on_exit = interrupt::remove_on_exit(temp.clone());
+    let report = write_hd_roads(
+        &args.input,
+        &args.output,
+        &temp,
+        threads,
+        interrupt::requested,
+    );
+    let cleanup = release_scratch(&temp, marker);
+    let report = report.map_err(|error| match error {
+        CompileError::Cancelled => format!("cancelled; {} was not written", args.output.display()),
+        error => error.to_string(),
+    })?;
+    cleanup?;
+    status.line(&format!(
+        "Wrote {} in {:.1} s, {:.1} of them reading: {} ways and {} paths ({} incomplete left out), \
+         {} junctions ({} of more nodes than one), {} cross-sections",
+        args.output.display(),
+        report.seconds,
+        report.read_seconds,
+        report.ways,
+        report.paths,
+        report.incomplete_ways,
+        report.junctions,
+        report.clusters,
+        report.profiles
+    ));
+    status.line(&format!(
+        "  {} tiles, {} surfaces, {} markings ({} crossings, stops, arrows and other \
+         paint, {} areas, of them {} crossings' islands and {} carriageways), \
+         {} turning circles, {} roads fitted to paths, {} tracks, {} barriers, {} fences, {} things, {} pitches ({} with lines), \
+         {} bridge groups ({} pieces, {} crossings), {} raw, {} gzipped",
+        report.tiles,
+        report.surfaces,
+        report.markings,
+        report.details,
+        report.areas,
+        report.refuges,
+        report.carriageways,
+        report.turning_circles,
+        report.fitted,
+        report.tracks,
+        report.barriers,
+        report.fences,
+        report.things,
+        report.pitches,
+        report.lined,
+        report.groups,
+        report.pieces,
+        report.crossings,
+        megabytes(report.raw_bytes),
+        megabytes(report.gz_bytes)
+    ));
+    Ok(())
 }
 
 /// Downloads the Geofabrik extract `name` names into `directory`, or finds
