@@ -443,7 +443,7 @@ fn emit_shape(
                 .to_degrees(),
         });
     }
-    let mut tags = BTreeMap::new();
+    let mut tags = super::types::Tags::new();
     for (key, value) in record {
         use shapefile::dbase::FieldValue;
         let value = match value {
@@ -598,7 +598,7 @@ fn read_natural_earth(
             if !intersects_bounds(&geometry, bounds) {
                 continue;
             }
-            let mut tags = BTreeMap::new();
+            let mut tags = super::types::Tags::new();
             for (i, name) in names.iter().enumerate() {
                 if i == geometry_index {
                     continue;

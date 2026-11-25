@@ -1655,9 +1655,12 @@ mod tests {
                         osm_id: 1,
                         kind: SourceKind::Way,
                         source_layer: "osm".into(),
-                        tags: BTreeMap::from([("area".into(), area.into())]),
+                        tags: crate::omt::types::Tags::from([("area".into(), area.into())]),
                         geometry: Geometry::LineString(LineString::new(coords.clone())),
-                        relations: vec![BTreeMap::from([("_role".into(), "outer".into())])],
+                        relations: vec![crate::omt::types::Tags::from([(
+                            "_role".into(),
+                            "outer".into(),
+                        )])],
                     };
                     let polygon = closed && count >= 4 && area != "no";
                     let line = area != "yes" || !polygon;

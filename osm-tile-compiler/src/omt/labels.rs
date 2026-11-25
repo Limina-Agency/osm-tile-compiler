@@ -463,7 +463,7 @@ impl State {
                         name: source.tag("name").into(),
                         names: ["name", "namealt", "meganame", "name_en", "nameascii"]
                             .iter()
-                            .filter_map(|k| source.tags.get(*k))
+                            .filter_map(|k| source.tags.get(k))
                             .map(|s| s.to_lowercase())
                             .collect(),
                         wikidata: source.tag("wikidataid").into(),

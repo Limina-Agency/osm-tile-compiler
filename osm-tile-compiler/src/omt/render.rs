@@ -1292,7 +1292,6 @@ pub(super) fn emit_records(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     // The tile-local column of `groups` for the column of `rect`.
     fn column_of(groups: &[WorldRingGroup], rect: WorldRect, x: i32) -> Vec<ColumnGroup> {
         let bounds = groups
@@ -2069,7 +2068,7 @@ mod tests {
             osm_id: 331922,
             kind: super::super::types::SourceKind::Supplement,
             source_layer: "ne_110m_ocean".into(),
-            tags: BTreeMap::new(),
+            tags: crate::omt::types::Tags::new(),
             geometry: geometry.try_into().unwrap(),
             relations: vec![],
         };
@@ -2242,7 +2241,7 @@ mod tests {
             osm_id: 753058966,
             kind: super::super::types::SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("landuse".into(), "farmland".into())]),
+            tags: crate::omt::types::Tags::from([("landuse".into(), "farmland".into())]),
             geometry: Geometry::Polygon(Polygon::new(LineString::from(points), vec![])),
             relations: vec![],
         };
@@ -2300,7 +2299,7 @@ mod tests {
             osm_id: 780650215,
             kind: super::super::types::SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("landuse".into(), "farmland".into())]),
+            tags: crate::omt::types::Tags::from([("landuse".into(), "farmland".into())]),
             geometry: Geometry::Polygon(Polygon::new(LineString::from(points), vec![])),
             relations: vec![],
         };
@@ -2358,7 +2357,7 @@ mod tests {
             osm_id: 1375094601,
             kind: super::super::types::SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("landuse".into(), "farmland".into())]),
+            tags: crate::omt::types::Tags::from([("landuse".into(), "farmland".into())]),
             geometry: Geometry::Polygon(Polygon::new(LineString::from(points), vec![])),
             relations: vec![],
         };
@@ -2416,7 +2415,7 @@ mod tests {
             osm_id: 833626865,
             kind: super::super::types::SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("natural".into(), "water".into())]),
+            tags: crate::omt::types::Tags::from([("natural".into(), "water".into())]),
             geometry: Geometry::Polygon(Polygon::new(LineString::from(points), vec![])),
             relations: vec![],
         };
@@ -2644,7 +2643,7 @@ mod tests {
             osm_id: 423711810,
             kind: super::super::types::SourceKind::Way,
             source_layer: String::new(),
-            tags: BTreeMap::new(),
+            tags: crate::omt::types::Tags::new(),
             geometry: geometry.clone(),
             relations: vec![],
         };
@@ -2919,7 +2918,7 @@ mod tests {
                 osm_id: (id / 10) as i64,
                 kind: super::super::types::SourceKind::Node,
                 source_layer: String::new(),
-                tags: BTreeMap::new(),
+                tags: crate::omt::types::Tags::new(),
                 geometry: geometry.clone(),
                 relations: vec![],
             };
@@ -2980,7 +2979,7 @@ mod tests {
             osm_id: 217375755,
             kind: super::super::types::SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::new(),
+            tags: crate::omt::types::Tags::new(),
             geometry: geometry.clone(),
             relations: vec![],
         };
@@ -3060,7 +3059,7 @@ mod tests {
             osm_id: 1512258402,
             kind: super::super::types::SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("landuse".into(), "grass".into())]),
+            tags: crate::omt::types::Tags::from([("landuse".into(), "grass".into())]),
             geometry,
             relations: vec![],
         };
@@ -3174,7 +3173,7 @@ mod tests {
             osm_id: 288999590,
             kind: super::super::types::SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("natural".into(), "wood".into())]),
+            tags: crate::omt::types::Tags::from([("natural".into(), "wood".into())]),
             geometry,
             relations: vec![],
         };
@@ -3282,7 +3281,7 @@ mod tests {
             osm_id: 1529655825,
             kind: super::super::types::SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("landuse".into(), "farmland".into())]),
+            tags: crate::omt::types::Tags::from([("landuse".into(), "farmland".into())]),
             geometry,
             relations: vec![],
         };
@@ -3483,7 +3482,7 @@ mod tests {
             osm_id: 1525089255,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("landuse".into(), "meadow".into())]),
+            tags: crate::omt::types::Tags::from([("landuse".into(), "meadow".into())]),
             geometry: geo_types::Polygon::new(geo_types::LineString::from(coords), vec![]).into(),
             relations: vec![],
         };
@@ -3668,7 +3667,7 @@ mod tests {
             osm_id: 724352898,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("landuse".into(), "farmland".into())]),
+            tags: crate::omt::types::Tags::from([("landuse".into(), "farmland".into())]),
             geometry: geo_types::Polygon::new(geo_types::LineString::from(coords), vec![]).into(),
             relations: vec![],
         };
@@ -3710,7 +3709,7 @@ mod tests {
             osm_id: 1,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("route".into(), "ferry".into())]),
+            tags: crate::omt::types::Tags::from([("route".into(), "ferry".into())]),
             geometry: geo_types::LineString::from(vec![(19., 50.), (19.005, 50.)]).into(),
             relations: vec![],
         };

@@ -4,7 +4,9 @@
 //! Country-dependent GB/IE inferred networks and junction way preprocessing
 //! require supplied context; `_junction_highway` carries the latter.
 use super::java_hashmap::{grouping_by_long_order, hash_set_long_order};
-use super::types::{Feature, Source, SourceKind, TOP, add_names, parse_number, parse_profile_long};
+use super::types::{
+    Feature, Source, SourceKind, TOP, Tags, add_names, parse_number, parse_profile_long,
+};
 use geo_types::{Coord, Geometry};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -143,7 +145,7 @@ fn network(network: &str, reference: &str) -> Option<(&'static str, u8)> {
         _ => return None,
     })
 }
-fn relations(source: &Source) -> Vec<&BTreeMap<String, String>> {
+fn relations(source: &Source) -> Vec<&Tags> {
     let mut result = source
         .relations
         .iter()
@@ -173,7 +175,7 @@ fn relations(source: &Source) -> Vec<&BTreeMap<String, String>> {
     result.dedup();
     result
 }
-fn road_zoom(source: &Source, class: &str, relations: &[&BTreeMap<String, String>]) -> u8 {
+fn road_zoom(source: &Source, class: &str, relations: &[&Tags]) -> u8 {
     let base = class.trim_end_matches("_construction");
     let rank = relations
         .iter()
@@ -676,7 +678,7 @@ fn road_name(
     source: &Source,
     class: &str,
     road_min: u8,
-    relations: &[&BTreeMap<String, String>],
+    relations: &[&Tags],
     out: &mut Vec<Feature>,
 ) {
     let first = relations.iter().find(|r| {
@@ -792,7 +794,7 @@ fn road_name(
     out.push(f);
 }
 
-fn disputed(tags: &BTreeMap<String, String>) -> bool {
+fn disputed(tags: &Tags) -> bool {
     tags.get("disputed").is_some_and(|v| yes(v))
         || tags.get("dispute").is_some_and(|v| yes(v))
         || tags.get("border_status").is_some_and(|v| v == "dispute")
@@ -994,10 +996,10 @@ fn boundary(source: &Source, out: &mut Vec<Feature>, contribution: &mut Contribu
     });
 }
 
-fn relation_id(rel: &BTreeMap<String, String>) -> i64 {
+fn relation_id(rel: &Tags) -> i64 {
     rel.get("_id").and_then(|v| v.parse().ok()).unwrap_or(0)
 }
-fn relation_level(rel: &BTreeMap<String, String>) -> i64 {
+fn relation_level(rel: &Tags) -> i64 {
     rel.get("admin_level")
         .and_then(|v| parse_number(v))
         .map_or(i64::MAX, |v| v.round() as i64)
@@ -1300,7 +1302,7 @@ mod tests {
             osm_id: 367_626_534,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([
+            tags: crate::omt::types::Tags::from([
                 ("man_made".into(), "pier".into()),
                 ("name".into(), "Wypożyczalnia kajaków".into()),
                 ("name:en".into(), "Kayak rentals".into()),
@@ -1348,7 +1350,7 @@ mod tests {
                 osm_id,
                 kind: SourceKind::Way,
                 source_layer: "osm".into(),
-                tags: BTreeMap::from([
+                tags: crate::omt::types::Tags::from([
                     ("highway".into(), "steps".into()),
                     ("level".into(), raw.into()),
                 ]),
@@ -1376,7 +1378,7 @@ mod tests {
             osm_id: 403_552_134,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([
+            tags: crate::omt::types::Tags::from([
                 ("highway".into(), "steps".into()),
                 ("incline".into(), "down".into()),
                 ("indoor".into(), "yes".into()),
@@ -1401,7 +1403,7 @@ mod tests {
             osm_id: 232_980_390,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([
+            tags: crate::omt::types::Tags::from([
                 ("highway".into(), "service".into()),
                 ("public_transport".into(), "platform".into()),
                 ("bus".into(), "yes".into()),
@@ -1448,7 +1450,7 @@ mod tests {
                 osm_id,
                 kind: SourceKind::Way,
                 source_layer: "osm".into(),
-                tags: BTreeMap::from([
+                tags: crate::omt::types::Tags::from([
                     ("highway".into(), highway.into()),
                     ("name".into(), name.into()),
                     ("public_transport".into(), "platform".into()),
@@ -1469,7 +1471,7 @@ mod tests {
         // only by a duplicated pl:national/28 route_2, while pinned Java
         // merged them into one feature with route_1 only.
         let route = |id: &str| {
-            BTreeMap::from([
+            Tags::from([
                 ("_id".into(), id.into()),
                 ("type".into(), "route".into()),
                 ("route".into(), "road".into()),
@@ -1483,7 +1485,7 @@ mod tests {
             osm_id: 166_892_267,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([
+            tags: crate::omt::types::Tags::from([
                 ("highway".into(), "primary".into()),
                 ("name".into(), "Józefa Piłsudskiego".into()),
                 ("ref".into(), "28".into()),
@@ -1507,7 +1509,7 @@ mod tests {
         // UTF-16 units, so it sorts before "PM-1521y" (8); in UTF-8 bytes
         // both are 8 and "PM" would come first.
         let route = |id: &str, reference: &str, name: &str| {
-            BTreeMap::from([
+            Tags::from([
                 ("_id".into(), id.into()),
                 ("type".into(), "route".into()),
                 ("route".into(), "hiking".into()),
@@ -1521,7 +1523,7 @@ mod tests {
             osm_id: 268_775_422,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([
+            tags: crate::omt::types::Tags::from([
                 ("highway".into(), "path".into()),
                 ("name".into(), "Ścieżka".into()),
             ]),
@@ -1551,7 +1553,7 @@ mod tests {
             osm_id: 212_664_723,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([
+            tags: crate::omt::types::Tags::from([
                 ("highway".into(), "trunk".into()),
                 ("ref".into(), "7".into()),
             ]),
@@ -1569,7 +1571,7 @@ mod tests {
                 (19.6937763, 49.4795105),
             ])
             .into(),
-            relations: vec![BTreeMap::from([
+            relations: vec![crate::omt::types::Tags::from([
                 ("route".into(), "road".into()),
                 ("network".into(), "e-road".into()),
                 ("ref".into(), "E 77".into()),
@@ -1597,7 +1599,7 @@ mod tests {
     #[test]
     fn country_boundary_finish_uses_simple_feature_id_only_when_deferred() {
         let relation = |level: &str, code: Option<&str>| {
-            let mut tags = BTreeMap::from([
+            let mut tags = Tags::from([
                 ("type".into(), "boundary".into()),
                 ("boundary".into(), "administrative".into()),
                 ("admin_level".into(), level.into()),
@@ -1612,7 +1614,7 @@ mod tests {
             osm_id: 139_225_043,
             kind: SourceKind::Way,
             source_layer: String::new(),
-            tags: BTreeMap::new(),
+            tags: crate::omt::types::Tags::new(),
             geometry: geo_types::LineString::from(vec![(19., 50.), (20., 50.)]).into(),
             relations: vec![relation("2", Some("POL"))],
         };
@@ -1635,8 +1637,8 @@ mod tests {
         process(&source, &mut features);
         assert_eq!(features[0].id, 1_392_250_430);
     }
-    fn country(id: i64, code: &str) -> BTreeMap<String, String> {
-        BTreeMap::from([
+    fn country(id: i64, code: &str) -> Tags {
+        Tags::from([
             ("_id".into(), id.to_string()),
             ("type".into(), "boundary".into()),
             ("boundary".into(), "administrative".into()),
@@ -1648,16 +1650,15 @@ mod tests {
     #[test]
     fn country_border_finish_names_left_and_right_countries() {
         let (a, b) = (country(1, "AAA"), country(2, "BBB"));
-        let way =
-            |id: u64, points: Vec<(f64, f64)>, relations: Vec<BTreeMap<String, String>>| Source {
-                id: id * 10 + 2,
-                osm_id: id as i64,
-                kind: SourceKind::Way,
-                source_layer: "osm".into(),
-                tags: BTreeMap::new(),
-                geometry: geo_types::LineString::from(points).into(),
-                relations,
-            };
+        let way = |id: u64, points: Vec<(f64, f64)>, relations: Vec<Tags>| Source {
+            id: id * 10 + 2,
+            osm_id: id as i64,
+            kind: SourceKind::Way,
+            source_layer: "osm".into(),
+            tags: crate::omt::types::Tags::new(),
+            geometry: geo_types::LineString::from(points).into(),
+            relations,
+        };
         // AAA is west of lon 20 and BBB east of it; the shared way runs north.
         let ways = [
             way(1, vec![(20., 49.), (20., 50.)], vec![a.clone(), b.clone()]),
@@ -1742,7 +1743,7 @@ mod tests {
             osm_id: 753058771,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("man_made".into(), "bridge".into())]),
+            tags: crate::omt::types::Tags::from([("man_made".into(), "bridge".into())]),
             geometry: geo_types::LineString::from(vec![
                 (19., 50.),
                 (19.001, 50.),
@@ -1771,7 +1772,7 @@ mod tests {
             osm_id: 1,
             kind: SourceKind::Way,
             source_layer: String::new(),
-            tags: BTreeMap::from([
+            tags: crate::omt::types::Tags::from([
                 ("highway".into(), "primary".into()),
                 ("name".into(), "Main".into()),
                 ("bridge".into(), "yes".into()),
@@ -1806,7 +1807,7 @@ mod tests {
             osm_id: 1,
             kind: SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::new(),
+            tags: crate::omt::types::Tags::new(),
             geometry: geo_types::Geometry::LineString(geo_types::LineString::from(vec![
                 (0.0, 0.0),
                 (1.0, 1.0),
@@ -1906,7 +1907,7 @@ mod tests {
             osm_id: 1,
             kind: SourceKind::Node,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([
+            tags: crate::omt::types::Tags::from([
                 ("highway".into(), "motorway_junction".into()),
                 ("_junction_highway".into(), "motorway".into()),
                 ("ref".into(), "5".into()),

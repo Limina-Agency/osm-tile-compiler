@@ -281,7 +281,7 @@ mod tests {
             osm_id: 1,
             kind: super::super::types::SourceKind::Way,
             source_layer: String::new(),
-            tags: std::collections::BTreeMap::from([
+            tags: crate::omt::types::Tags::from([
                 ("building".into(), "yes".into()),
                 ("building:levels".into(), "3".into()),
                 ("building:material".into(), "brick".into()),
@@ -323,7 +323,7 @@ mod tests {
             osm_id: 1,
             kind: super::super::types::SourceKind::Way,
             source_layer: String::new(),
-            tags: std::collections::BTreeMap::from([("natural".into(), "wood".into())]),
+            tags: crate::omt::types::Tags::from([("natural".into(), "wood".into())]),
             geometry: geo_types::Geometry::Polygon(geo_types::Polygon::new(
                 geo_types::LineString::from(vec![(0., 0.), (1., 0.), (1., 1.), (0., 0.)]),
                 vec![],
@@ -356,7 +356,7 @@ mod tests {
                 osm_id: 1,
                 kind: super::super::types::SourceKind::Way,
                 source_layer: String::new(),
-                tags,
+                tags: tags.into(),
                 geometry: geo_types::Geometry::Polygon(geo_types::Polygon::new(
                     geo_types::LineString::from(vec![
                         (19.0, 50.0),

@@ -3,7 +3,131 @@ use geo_types::{Coord, Geometry, MultiLineString};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub type Tags = BTreeMap<String, String>;
+/// A feature's OSM tags, in key order like the `BTreeMap` they replace.
+///
+/// Features carry a handful of tags, and the profile looks up dozens of keys
+/// per feature, most of them absent. A sorted vector found by a linear scan
+/// that compares lengths before bytes rejects most keys without touching
+/// their bytes, and builds with one allocation instead of a tree's nodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tags(Vec<(String, String)>);
+
+// Above this many tags a lookup binary-searches instead of scanning.
+const SCAN_TAGS: usize = 16;
+
+impl Tags {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+    fn position(&self, key: &str) -> Result<usize, usize> {
+        if self.0.len() <= SCAN_TAGS {
+            for (index, (k, _)) in self.0.iter().enumerate() {
+                if k.len() == key.len() && k.as_bytes() == key.as_bytes() {
+                    return Ok(index);
+                }
+            }
+            // Only inserts need the slot, and they are rare.
+            return Err(self.0.partition_point(|(k, _)| k.as_str() < key));
+        }
+        self.0.binary_search_by(|(k, _)| k.as_str().cmp(key))
+    }
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.position(key).ok().map(|index| &self.0[index].1)
+    }
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.position(key).is_ok()
+    }
+    pub fn insert(&mut self, key: String, value: String) -> Option<String> {
+        match self.position(&key) {
+            Ok(index) => Some(std::mem::replace(&mut self.0[index].1, value)),
+            Err(index) => {
+                self.0.insert(index, (key, value));
+                None
+            }
+        }
+    }
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        self.position(key).ok().map(|index| self.0.remove(index).1)
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// The tags in key order.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&String, &String)> + Clone {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &String> + Clone {
+        self.0.iter().map(|(k, _)| k)
+    }
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &String> + Clone {
+        self.0.iter().map(|(_, v)| v)
+    }
+}
+
+impl FromIterator<(String, String)> for Tags {
+    /// Later pairs replace earlier ones with the same key, as in a map.
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(pairs: I) -> Self {
+        let mut tags: Vec<(String, String)> = pairs.into_iter().collect();
+        // Stable, so the last of equal keys stays last; keep it.
+        tags.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut unique: Vec<(String, String)> = Vec::with_capacity(tags.len());
+        for pair in tags {
+            match unique.last_mut() {
+                Some(last) if last.0 == pair.0 => *last = pair,
+                _ => unique.push(pair),
+            }
+        }
+        Self(unique)
+    }
+}
+
+impl Extend<(String, String)> for Tags {
+    fn extend<I: IntoIterator<Item = (String, String)>>(&mut self, pairs: I) {
+        for (key, value) in pairs {
+            self.insert(key, value);
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Tags {
+    type Item = (&'a String, &'a String);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (String, String)>,
+        fn(&'a (String, String)) -> (&'a String, &'a String),
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Tags {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let map = BTreeMap::<String, String>::deserialize(deserializer)?;
+        Ok(Self(map.into_iter().collect()))
+    }
+}
+
+impl std::ops::Index<&str> for Tags {
+    type Output = String;
+    fn index(&self, key: &str) -> &String {
+        self.get(key).expect("no such tag")
+    }
+}
+
+impl From<BTreeMap<String, String>> for Tags {
+    fn from(map: BTreeMap<String, String>) -> Self {
+        Self(map.into_iter().collect())
+    }
+}
+
+impl<const N: usize> From<[(String, String); N]> for Tags {
+    fn from(pairs: [(String, String); N]) -> Self {
+        pairs.into_iter().collect()
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     Node,
@@ -394,5 +518,40 @@ mod tests {
         );
         assert_eq!(java_meters("12 xyz"), None);
         assert_eq!(java_meters("241..4"), None);
+    }
+
+    #[test]
+    fn tags_behave_like_the_map_they_replace() {
+        let pairs = |n: usize| (0..n).map(move |i| (format!("k{:02}", (i * 7) % n), i.to_string()));
+        for n in [0, 3, super::SCAN_TAGS, super::SCAN_TAGS + 9] {
+            let map: BTreeMap<String, String> = pairs(n).collect();
+            let mut tags: Tags = pairs(n).collect();
+            assert!(tags.iter().eq(map.iter()), "{n} tags iterate in key order");
+            for key in map.keys() {
+                assert_eq!(tags.get(key), map.get(key));
+                assert!(tags.contains_key(key));
+            }
+            for absent in ["", "k", "k0", "k999", "zz", "a"] {
+                assert_eq!(tags.get(absent), None, "{absent}");
+            }
+            let mut map = map;
+            for (key, value) in [("k01", "x"), ("a", "y"), ("zz", "z"), ("k015", "w")] {
+                assert_eq!(
+                    tags.insert(key.into(), value.into()),
+                    map.insert(key.into(), value.into())
+                );
+            }
+            assert_eq!(tags.remove("a"), map.remove("a"));
+            assert_eq!(tags.remove("a"), None);
+            assert!(tags.iter().eq(map.iter()));
+            assert_eq!(tags.len(), map.len());
+        }
+        // A repeated key keeps its last value, as collecting into a map does.
+        let tags: Tags = [("a", "1"), ("b", "2"), ("a", "3")]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into_iter()
+            .collect();
+        assert_eq!(tags.get("a").map(String::as_str), Some("3"));
+        assert_eq!(tags.len(), 2);
     }
 }

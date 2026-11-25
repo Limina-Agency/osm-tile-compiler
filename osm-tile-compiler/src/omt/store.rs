@@ -3899,7 +3899,7 @@ mod tests {
             osm_id: 833626865,
             kind: super::super::types::SourceKind::Way,
             source_layer: "osm".into(),
-            tags: BTreeMap::from([("natural".into(), "water".into())]),
+            tags: crate::omt::types::Tags::from([("natural".into(), "water".into())]),
             geometry: Geometry::Polygon(Polygon::new(LineString::from(coordinates), vec![])),
             relations: vec![],
         };
@@ -5195,7 +5195,7 @@ mod tests {
             osm_id: 1,
             kind: SourceKind::Node,
             source_layer: "osm".into(),
-            tags: BTreeMap::new(),
+            tags: crate::omt::types::Tags::new(),
             geometry: geometry.clone(),
             relations: vec![],
         };
