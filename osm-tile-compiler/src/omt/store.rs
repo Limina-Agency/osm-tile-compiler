@@ -5793,6 +5793,33 @@ mod merge_replay {
         )
     }
 
+    #[test]
+    #[ignore]
+    fn merge_replay_single_ring_matches_build() {
+        let Some(groups) = groups() else { return };
+        let (mut members, mut applied, mut mismatched) = (0usize, 0usize, 0usize);
+        for (distance, geoms) in &groups {
+            if *distance <= 0. {
+                continue;
+            }
+            for g in geoms {
+                members += 1;
+                for d in [*distance, -*distance] {
+                    let (used, same) = super::super::jts_buffer::single_ring_check(g, d);
+                    applied += usize::from(used);
+                    if !same {
+                        mismatched += 1;
+                        if mismatched <= 3 {
+                            println!("mismatch at distance {d}: {g:?}");
+                        }
+                    }
+                }
+            }
+        }
+        println!("members {members}, fast path {applied}, mismatched {mismatched}");
+        assert_eq!(mismatched, 0);
+    }
+
     /// Every pair of members whose boxes come within the distance gets the
     /// same answer from `within_distance` as from geo's distance.
     #[test]

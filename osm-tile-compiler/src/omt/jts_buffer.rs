@@ -139,7 +139,54 @@ fn build_curves(
     if distance == 0.0 && !noding_valid(&noded)? {
         return None;
     }
+    if let Some(result) = single_ring(&noded) {
+        return Some(result);
+    }
     build(noded, Mode::Buffer)
+}
+
+/// What `build` makes of a buffer whose noding left one closed edge that
+/// touches nothing: the ring itself as the shell, in JTS shell order
+/// (clockwise, interior on the right), starting at the edge's start. `None`
+/// for anything else, which `build` handles.
+fn single_ring(noded: &[Noded]) -> Option<MultiPolygon<f64>> {
+    let [Noded { points, delta }] = noded else {
+        return None;
+    };
+    if points.len() < 4 || points.first() != points.last() || delta.abs() != 1 {
+        return None;
+    }
+    let area = signed_area(points);
+    // Crossing from right to left adds `delta`: the interior, at depth 1
+    // against the outside's 0, is on the left when `delta` is 1.
+    let ring: Vec<Point> = match (area > 0.0, *delta == 1) {
+        // Counter-clockwise with the interior on the left: reversed.
+        (true, true) => points.iter().rev().copied().collect(),
+        // Clockwise with the interior on the right: as it is.
+        (false, false) if area < 0.0 => points.clone(),
+        _ => return None,
+    };
+    let line = LineString::new(
+        ring.into_iter()
+            .map(|p| Coord { x: p[0], y: p[1] })
+            .collect(),
+    );
+    Some(MultiPolygon(vec![Polygon::new(line, vec![])]))
+}
+
+/// Counts of `single_ring` against `build` over buffered members, for the
+/// replay check: (applied, matched).
+#[cfg(test)]
+pub(super) fn single_ring_check(member: &MultiPolygon<f64>, distance: f64) -> (bool, bool) {
+    let curves = offset_curves(member, distance);
+    let Some(noded) = node_float(&curves) else {
+        return (false, true);
+    };
+    let Some(fast) = single_ring(&noded) else {
+        return (false, true);
+    };
+    let slow = build(noded, Mode::Buffer);
+    (true, slow.as_ref() == Some(&fast))
 }
 
 /// `FastNodingValidator.checkValid` on noded substrings: through
@@ -3214,5 +3261,50 @@ mod tests {
         assert!(signed_area(&clean(polygon.exterior())) < 0.);
         assert!(signed_area(&clean(&polygon.interiors()[0])) > 0.);
         assert!((merged.unsigned_area() - 33.).abs() < 1e-12);
+    }
+
+    #[test]
+    fn single_ring_matches_the_graph_build() {
+        let shapes = [
+            square(0.0, 0.0, 64.0),
+            MultiPolygon(vec![Polygon::new(
+                LineString::from(vec![(0.0, 0.0), (80.0, 0.0), (40.0, 50.0), (0.0, 0.0)]),
+                vec![],
+            )]),
+            // Clockwise input, and an L shape whose inward offset folds.
+            MultiPolygon(vec![Polygon::new(
+                LineString::from(vec![
+                    (0.0, 0.0),
+                    (0.0, 30.0),
+                    (30.0, 30.0),
+                    (30.0, 0.0),
+                    (0.0, 0.0),
+                ]),
+                vec![],
+            )]),
+            MultiPolygon(vec![Polygon::new(
+                LineString::from(vec![
+                    (0.0, 0.0),
+                    (60.0, 0.0),
+                    (60.0, 20.0),
+                    (20.0, 20.0),
+                    (20.0, 60.0),
+                    (0.0, 60.0),
+                    (0.0, 0.0),
+                ]),
+                vec![],
+            )]),
+        ];
+        let mut applied = 0;
+        for shape in &shapes {
+            for distance in [4.0, 12.0, -2.0, -6.0] {
+                let noded = node_float(&offset_curves(shape, distance)).unwrap();
+                if let Some(fast) = single_ring(&noded) {
+                    applied += 1;
+                    assert_eq!(build(noded, Mode::Buffer), Some(fast), "{distance}");
+                }
+            }
+        }
+        assert!(applied >= 8, "the fast path ran {applied} times");
     }
 }
